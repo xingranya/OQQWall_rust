@@ -1,4 +1,4 @@
-# rendering.md — OQQWall_RUST SVG 排版/渲染规范（参考原 gotohtml.sh，全量覆盖）
+# typesetting&render.md — OQQWall_RUST SVG 排版/渲染规范（参考原 gotohtml.sh，全量覆盖）
 
 > 目标：用 **Rust 生成纯 SVG**（默认产物），在不依赖浏览器排版引擎的情况下，尽可能复刻原版 `gotohtml.sh` 的页面结构、视觉样式与信息密度。  
 > 说明：原版 `gotohtml.sh` 生成 HTML + CSS + JS（含动态页高、水印、卡片、合并转发等），再交给外部渲染链路转成图片。  
@@ -22,7 +22,7 @@
   - `forward`：合并转发（支持嵌套 forward）
 - 二维码：对每个卡片的跳转 URL 生成 QR，并显示在卡片右侧
 - 水印：按配置的 `watermark_text` 平铺旋转水印（覆盖全页面内容区）
-- 匿名：`need_priv==true` 时，昵称显示为“匿名”、隐藏 UID、头像替换为匿名头像
+- 匿名：`Header.is_anonymous==true` 时，昵称显示为“匿名”、隐藏 UID、头像替换为匿名头像（归一化阶段填充）
 
 ### 0.2 非目标（暂不做/可降级）
 - 不做 AI、分段智能、（渲染只消费结构化输入），匿名需求识别只用regex
@@ -50,9 +50,10 @@ struct DocMeta {
 }
 
 struct Header {
-  nickname: String,         // need_priv 时为 "匿名"
-  user_id_show: Option<String>, // need_priv 时为 None
-  avatar: AvatarRef,        // need_priv 时使用匿名头像
+  is_anonymous: bool,       // 归一化阶段填充，渲染层不做推断
+  nickname: String,         // 匿名时已替换为 "匿名"
+  user_id_show: Option<String>, // 匿名时为 None
+  avatar: AvatarRef,        // 匿名时使用内置匿名头像
 }
 
 enum AvatarRef {
@@ -71,8 +72,16 @@ enum SegmentNode {
   Video { url: String },
   Poke,
   File { name: String, path_or_url: Option<String>, size_bytes: Option<u64> },
-  JsonCard { raw: String },          // OneBot json.data.data 原文
+  JsonCard { raw: String, card: Option<CardMeta> }, // 渲染层只消费 card，raw 仅用于调试/重建
   Forward { items: Vec<ForwardItem> } // 合并转发
+}
+
+struct CardMeta {
+  kind: String,             // contact/miniapp/news/generic
+  title: Option<String>,
+  desc: Option<String>,
+  thumb_url: Option<String>,
+  jump_url: Option<String>, // 用于 QR
 }
 
 struct ForwardItem {
@@ -80,7 +89,7 @@ struct ForwardItem {
   segments: Vec<SegmentNode>,
 }
 
-````
+```
 
 > 备注：原版 `gotohtml.sh` 对 `json.data.data` 会做 `&#44;` 与 `\\/` 处理再解析；Rust 版应在渲染层实现同样“宽容解析”。
 
@@ -203,7 +212,7 @@ cursor 更新：
 
 匿名规则：
 
-* need_priv 时：昵称=“匿名”，user_id_show=None，avatar=内置匿名头像
+* header.is_anonymous=true 时：昵称=“匿名”，user_id_show=None，avatar=内置匿名头像
 
 ---
 
@@ -373,7 +382,9 @@ cursor 更新：
 * 根据 `view` 与 `meta` 分支渲染不同样式
 * 如果能抽取到 `jumpUrl` 则显示 QR（48x48）
 
-#### 7.6.1 卡片 URL 抽取（必须对齐原版语义）
+Rust 版约定：OneBot json 段在归一化阶段解析为 `CardMeta` 并写入 `JsonCard.card`；渲染层不再解析 `raw`。
+
+#### 7.6.1 卡片 URL 抽取（归一化阶段，必须对齐原版语义）
 
 抽取函数（逻辑等价）：
 
@@ -392,7 +403,7 @@ cursor 更新：
 
   * 从 `meta` 的第一项里找 `.value.jumpUrl`（如果存在）
 
-> Rust 版：渲染前扫描整棵树（含 forward 内嵌）收集所有 URL，生成 QR cache（key=message_id）。
+> Rust 版：渲染前扫描 RenderDoc（含 forward 内嵌）收集 `card.jump_url`，生成 QR cache（key=message_id）。
 
 #### 7.6.2 contact 卡片布局（横向）
 
@@ -652,9 +663,3 @@ fn render_svg(doc: &RenderDoc, theme: &ThemeTokens, opt: &RenderOptions) -> Vec<
 * 原版 CSS 的 hover 效果（card:hover）在 SVG 中可忽略或用简单 filter 切换（非必须）
 
 ---
-
-```
-
-如果你希望我**再补一个“主题实现细节附录”**（把每个 node 的 bbox 计算公式写成更接近代码的伪代码，并给一套完整示例输入→示例 SVG 片段），我也可以继续补在这个文档后面。
-::contentReference[oaicite:0]{index=0}
-```

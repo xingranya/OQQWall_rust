@@ -1,6 +1,7 @@
 > 版本：v0.1（单机 MVP → 完整单机 → 未来集群预留）
 > 范围：**单机**实现 OQQWall 全功能链路；**不实现 AI/LLM**；“智能处理”全部用**时间驱动 if-else**（聚合/排程/重试/冷却）。
 > 约束：单 Rust 二进制；尽量避免外部服务；尽量避免硬盘读；硬盘主要用于 **append-only 日志/WAL 与产物备份**。
+> 定位：总体指导；具体落地细节见 `docs/engineering.md`。
 
 ---
 注：原版OQQWall仓库在～/data/OQQWall
@@ -32,7 +33,7 @@
 ## 1.1 单机版要完成的功能（覆盖 OQQWall 全链路）
 
 * 从 OneBot（NapCat）接收投稿（群/私聊）。
-* **按时间窗口聚合投稿**（`process_waittime` 语义）。
+* **按时间窗口聚合投稿**（`process_waittime_sec` 语义）。
 * 生成稿件（最小分段：按消息/空行/标点），不做 AI/内容识别。
 * 渲染稿件：**默认输出 SVG**；需要审核预览/最终发送时可按需输出 PNG。
 * 把预览发到审核群，并生成短码 `review_code`。
@@ -213,7 +214,7 @@
 
 * `OneBotMessage{ profile, chat, user, msg_id, ts, text, attachments }`
 * `TimerTick{ now_ms }`
-* （Driver 结果直接作为 Event 写入即可，不一定做成 Command）
+* Driver 产出 `EventEnvelope`，并通过 `Command::DriverEvent(EventEnvelope)` 送回引擎（Driver 不直接写 journal/改 state）
 
 ## 7.2 decide_on_onebot_message（纯）
 
@@ -362,7 +363,7 @@ data/
 触发条件：
 
 * 审核预览模式为 PNG（或 QQ 不适合看 SVG 链接）
-* 发空间必须图片模式
+* 若下游（QQ/空间接口）不接受 SVG，则转换为 PNG；若支持 SVG 可直接推送，无需生成 PNG
 
 执行原则：
 
@@ -476,7 +477,7 @@ data/
 * Draft 生成（最小分段）
 * SVG 渲染（内置主题）
 * 审核群发布（先只发文本 + link）
-* 指令解析（/ok /no）
+* 指令解析（是/否/等）
 * SendPlan + Sender（先用 fake sender 打日志）
 
 ## M2（完整单机）

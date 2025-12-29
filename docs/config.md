@@ -3,8 +3,7 @@
 > 本文面向：开发、运维、测试。  
 > 目标：**配置不硬编码**、以 **JSON 文件**为权威来源；同时兼容原版 OQQWall 的配置语义与字段（原版拆成 `oqqwall.config` + `AcountGroupcfg.json`，并在多处脚本/服务端读取）。  
 >
-> 你已上传了一份 `config.json` 示例（包含 `common` 与一个组配置），可直接作为初始模板使用：:contentReference[oaicite:0]{index=0}  
-> 下载：sandbox:/mnt/data/config.json
+> 配置示例可直接使用文末的 JSON 模板（common + 单组），或从现有部署的 `oqqwall.config` / `AcountGroupcfg.json` 导入。
 
 ---
 
@@ -13,14 +12,14 @@
 原版主要有两类配置源：
 
 1) **全局配置（KV 文件）**：`oqqwall.config`  
-- `serv.py` 读取 `oqqwall.config`（key=value + #注释），并要求必须有 `napcat_access_token`，且允许环境变量 `NAPCAT_ACCESS_TOKEN` 兜底 :contentReference[oaicite:1]{index=1}  
-- `sendcontrol.sh` 也固定把全局配置文件名写为 `oqqwall.config`，并从中读取 `max_attempts_qzone_autologin`、`at_unprived_sender`，且给出默认值与校验逻辑 :contentReference[oaicite:2]{index=2}
+- `serv.py` 读取 `oqqwall.config`（key=value + #注释），并要求必须有 `napcat_access_token`，且允许环境变量 `NAPCAT_ACCESS_TOKEN` 兜底  
+- `sendcontrol.sh` 也固定把全局配置文件名写为 `oqqwall.config`，并从中读取 `max_attempts_qzone_autologin`、`at_unprived_sender`，且给出默认值与校验逻辑
 
 2) **账号组配置（JSON 文件）**：`AcountGroupcfg.json`  
-- `serv.py` 会加载 `AcountGroupcfg.json`，建立 self_id→组名映射，并提取 `mangroupid` 作为受管群集合 :contentReference[oaicite:3]{index=3}  
-- `sendcontrol.sh` 会从 `AcountGroupcfg.json` 里按 receiver 找到组配置，并对 `max_post_stack`、`max_image_number_one_post` 做默认值/数字校验 :contentReference[oaicite:4]{index=4}  
-- `sendcontrol.sh` 的定时调度器会读取每个组的 `send_schedule`（HH:MM 列表），在对应分钟触发 `flush_staged_posts`，并保证“当日每个时间点只触发一次 + 同一分钟互斥锁” :contentReference[oaicite:5]{index=5}  
-- `preprocess.sh` 会读取全局 `process_waittime` 与 `force_chromium_no-sandbox`，并从组配置取 `individual_image_in_posts`，且缺省为 true :contentReference[oaicite:6]{index=6}  
+- `serv.py` 会加载 `AcountGroupcfg.json`，建立 self_id→组名映射，并提取 `mangroupid` 作为受管群集合  
+- `sendcontrol.sh` 会从 `AcountGroupcfg.json` 里按 receiver 找到组配置，并对 `max_post_stack`、`max_image_number_one_post` 做默认值/数字校验  
+- `sendcontrol.sh` 的定时调度器会读取每个组的 `send_schedule`（HH:MM 列表），在对应分钟触发 `flush_staged_posts`，并保证“当日每个时间点只触发一次 + 同一分钟互斥锁”  
+- `preprocess.sh` 会读取全局 `process_waittime` 与 `force_chromium_no-sandbox`，并从组配置取 `individual_image_in_posts`，且缺省为 true  
 
 > Rust 版：我们不复刻原版的“散落在脚本里 grep/jq”读取方式，而是统一用一个 JSON 作为权威配置；但字段语义、默认值与校验尽量对齐上面这些行为。
 
@@ -70,10 +69,11 @@
 
 * `http_serv_port` 兼容 `http-serv-port`（原版 `serv.py` 最后读取 `http-serv-port` 作为端口键）
 * `force_chromium_no_sandbox` 兼容 `force_chromium_no-sandbox`（原版 `preprocess.sh` 读取的是带 `-` 的 key）
+* `process_waittime_sec` 兼容 `process_waittime`（原版键名；冲突处理见下）
 
 实现建议（Rust / serde）：
 
-* 使用 `#[serde(alias="http-serv-port")]`、`#[serde(alias="force_chromium_no-sandbox")]`
+* 使用 `#[serde(alias="http-serv-port")]`、`#[serde(alias="force_chromium_no-sandbox")]`、`#[serde(alias="process_waittime")]`
 * 对布尔/数字做“宽松解析”：允许 `"false"`/`false`、`"3"`/`3`（你的样例里大量数值与 bool 是字符串）
 
 ---
@@ -90,6 +90,7 @@
 | napcat_access_token          | napcat_access_token          | string | **必填**（也可 env 覆盖） | `serv.py` 必须配置，否则报错；也支持 env `NAPCAT_ACCESS_TOKEN` 兜底  |
 | manage_napcat_internal       | manage_napcat_internal       |   bool |             false | 是否由系统内部管理 NapCat/QQ（原版有同名配置提示）                        |
 | renewcookies_use_napcat      | renewcookies_use_napcat      |   bool |              true | 续 cookies 逻辑使用 NapCat 版本/非 NapCat 版本（原版提示）            |
+| render_png | render_png | bool | false | 是否同时渲染 PNG；默认只产出 SVG（腾讯 QQ/空间接口可直接接受 SVG），开启后审核群可直接收到 PNG 图 |
 | max_attempts_qzone_autologin | max_attempts_qzone_autologin |    u32 |                 3 | sendcontrol 默认 3 次并校验数字                               |
 | at_unprived_sender           | at_unprived_sender           |   bool |             false | 通过时是否 @ 未公开空间的投稿人（sendcontrol 读取此 key）                |
 | friend_request_window_sec    | friend_request_window_sec    |    u32 |               300 | 好友请求/私聊抑制窗口（原版 TUI 提示）                                |
@@ -98,6 +99,11 @@
 | http_serv_port               | http-serv-port               |    u16 |              8000 | 原版 `serv.py` 最终用 `http-serv-port` 决定 HTTP 端口          |
 | process_waittime_sec         | process_waittime             |    u32 |                20 | 原版 `preprocess.sh` 读取 `process_waittime`（秒）           |
 | force_chromium_no_sandbox    | force_chromium_no-sandbox    |   bool |             false | 原版根据此 key 决定 Chrome 是否加 `--no-sandbox`                |
+
+关于 `process_waittime_sec` / `process_waittime`：
+
+* 若两者同时存在且值不一致：启动时报错退出（避免误配）
+* 若仅存在旧键：打印一次 warning，并在 `EffectiveConfig` 中归一化为 `_sec`
 
 > 目前你说 AI 不做，那么 `apikey/text_model/vision_model/...` 这些可以留在 schema 中但运行时忽略；原版仍在 TUI 中列出这些键 。
 
@@ -121,7 +127,7 @@
 | mainqq_http_port          |                 string/u16 | 必填               | 主账号对应 NapCat/OneBot HTTP 端口（原版多处取此字段）                           |
 | minorqqid                 |              array[string] | 可空               | 副账号 QQ 列表，注意长度可与端口数组不一致（原版 TUI 明确“按较短长度对齐”）                     |
 | minorqq_http_port         |          array[string/u16] | 可空               | 副账号端口数组，同上                                                      |
-| max_post_stack            |                        int | 默认 1；只允许正整数      | sendcontrol 对此字段做默认值与数字校验                                       |
+| max_post_stack            |                        int | 默认 1；只允许正整数（1 表示单条直接发送，>1 启用暂存堆栈） | sendcontrol 对此字段做默认值与数字校验                                       |
 | max_image_number_one_post |                        int | 默认 30；只允许正整数     | sendcontrol 同样校验并默认                                             |
 | individual_image_in_posts |                       bool | 默认 true          | preprocess 缺省为 true，决定是否把用户原图也拷贝到 prepost（组策略）                  |
 | send_schedule             |             array["HH:MM"] | 默认空（不启用定时 flush） | sendcontrol scheduler 从该字段读出 HH:MM 列表并按分钟触发 flush；同一时间点当日只触发一次  |

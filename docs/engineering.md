@@ -1,4 +1,4 @@
-下面是一份**可直接丢给开发组落地**的工程化文档（偏“怎么做、怎么组织代码、怎么跑起来、怎么测试、怎么交付”）。你可以把它复制成仓库里的 `docs/engineering.md` 或 `docs/architecture.md`。
+下面是一份工程化落地指南（偏“怎么做、怎么组织代码、怎么跑起来、怎么测试、怎么交付”）。它与 `docs/dev_guide.md` 的总体指导互补，本文件面向具体落地。
 
 ---
 
@@ -15,10 +15,10 @@
 ### 1.1 MVP（第一可运行版本）必须满足
 
 * ✅ OneBot 入站（群/私聊投稿）可接入
-* ✅ `(chat_id, user_id)` 维度按 `process_waittime` 聚合，超时自动成稿
+* ✅ `(chat_id, user_id)` 维度按 `process_waittime_sec` 聚合，超时自动成稿
 * ✅ 默认生成 SVG（不依赖浏览器/外部渲染器），可通过本地 Web URL 查看
 * ✅ 审核群发布（先文本+链接即可）
-* ✅ 审核指令：`/ok /no /delay /send /route /show` 至少实现 `/ok /no`
+* ✅ 审核指令：参考command.md,至少实现 是 否 等 删
 * ✅ 调度：发送窗口 + 最小间隔 + 队列上限 + 单写者发送（先用 fake sender 打日志也可）
 * ✅ 崩溃重启后：能从 snapshot + journal 恢复，继续处理未完成项
 
@@ -213,17 +213,17 @@ driver 不应依赖自己的内存去重，应该依赖 state 的 request 状态
 
 ## 7. 配置与 CLI（工程落地必须具备）
 
-### 7.1 配置格式（TOML）
+### 7.1 配置格式（JSON）
 
 建议 `config.json`：
-请参考./config.md
+请参考 `docs/config.md`
 
 
 ### 7.2 CLI 约定（建议）
 
-* `oqqwallrs run --config config.toml`
+* `oqqwallrs run --config config.json`
 * `oqqwallrs replay --data-dir ./data`（调试回放）
-* `oqqwallrs doctor --config config.toml`（检查 NapCat/端口/目录权限）
+* `oqqwallrs doctor --config config.json`（检查 NapCat/端口/目录权限）
 * `oqqwallrs export --post <id>`（导出某条稿件和产物用于排查）
 
 ---
@@ -259,11 +259,10 @@ driver 不应依赖自己的内存去重，应该依赖 state 的 request 状态
 7. 审核群消息 → `Command::OneBotMessage`
 8. decider 解析：
 
-   * `/ok code` → `ReviewApproved`
-   * `/no code ...` → `ReviewRejected`
-   * `/delay` → `ReviewDelayed`
-   * `/send` → `SendPlanCreated/Rescheduled`
-   * `/route` → `PostRouted`（可选同步 reschedule）
+   * `是` → `ReviewApproved`
+   * `否` → `ReviewRejected`
+   * `等` → `ReviewDelayed`
+   * `立即` → `SendPlanCreated/Rescheduled`
 
 ### 8.4 调度与发送（最复杂，后做但要一次写对）
 
@@ -345,7 +344,7 @@ retry_at = now + delay
 
 * reducer replay：给定 event 序列，最终 StateView 符合预期
 * decider tick：给定 StateView + now，输出事件集合正确且幂等
-* 指令解析：各种输入 /ok /no /delay 的解析稳定
+* 指令解析：各种输入 是/否/等 的解析稳定
 
 ### 10.2 属性测试（推荐）
 
@@ -399,7 +398,7 @@ retry_at = now + delay
 * [ ] core.decide：ingress 去重 + session 聚合 + tick close → PostDraftCreated
 * [ ] renderer：先实现 SVG 生成（简单模板）
 * [ ] audit：发布审核消息（先文本+link）
-* [ ] command parser：/ok /no
+* [ ] command parser：是/否/等
 * [ ] scheduler：ReviewApproved → SendPlanCreated（not_before 基础 if-else）
 * [ ] sender：fake 发送（日志），确保状态机完整
 
@@ -435,14 +434,14 @@ retry_at = now + delay
 
 ## 附：建议你要求开发组先交付的两份文档（用于对齐）
 
-* `docs/commands.md`：审核群指令语法、示例、边界行为（幂等规则）
+* `docs/command.md`：审核群指令语法、示例、边界行为（幂等规则）
 * `docs/runbook.md`：如何启动/停止/升级/备份/恢复/排障
 
 ---
 
 如果你愿意，我可以再补两样“更能直接开干”的东西（仍然是工程落地风格）：
 
-1. **一份可复制的 `docs/commands.md`**（含指令语法、示例消息、错误提示、权限模型）
+1. **一份可复制的 `docs/command.md`**（含指令语法、示例消息、错误提示、权限模型）
 2. **一份可复制的 `crates/app/src/engine.rs` 代码骨架**（带 channels、bus、journal、driver wiring 的完整结构）
 
 你希望先要哪一个？
