@@ -56,7 +56,7 @@
 建议使用 workspace 做内聚隔离（但最后 `crates/app` 编译成一个二进制）：
 
 ```
-oqqwallrs/
+OQQWall_RUST/
   Cargo.toml                # workspace
   crates/
     core/                   # 纯函数：Event/State/Reducer/Deciders
@@ -118,7 +118,7 @@ oqqwallrs/
 ```
 
 > 为什么用 workspace：让开发组可以并行（core/infra/drivers/app），并强制约束 core 不引入 IO 依赖。
-> 最终交付仍是一个 `oqqwallrs` 二进制（`crates/app`）。
+> 最终交付仍是一个 `OQQWall_RUST` 二进制（`crates/app`）。
 
 ---
 
@@ -221,10 +221,10 @@ driver 不应依赖自己的内存去重，应该依赖 state 的 request 状态
 
 ### 7.2 CLI 约定（建议）
 
-* `oqqwallrs run --config config.json`
-* `oqqwallrs replay --data-dir ./data`（调试回放）
-* `oqqwallrs doctor --config config.json`（检查 NapCat/端口/目录权限）
-* `oqqwallrs export --post <id>`（导出某条稿件和产物用于排查）
+* `OQQWall_RUST run --config config.json`
+* `OQQWall_RUST replay --data-dir ./data`（调试回放）
+* `OQQWall_RUST doctor --config config.json`（检查 NapCat/端口/目录权限）
+* `OQQWall_RUST export --post <id>`（导出某条稿件和产物用于排查）
 
 ---
 
@@ -260,7 +260,7 @@ driver 不应依赖自己的内存去重，应该依赖 state 的 request 状态
 8. decider 解析：
 
    * `是` → `ReviewApproved`
-   * `否` → `ReviewRejected`
+   * `否` → 标记已处理 + 外部编号+1 + 进入“人工发送”状态
    * `等` → `ReviewDelayed`
    * `立即` → `SendPlanCreated/Rescheduled`
 
@@ -382,7 +382,7 @@ retry_at = now + delay
 
 ### 11.3 故障排查入口
 
-* `oqqwallrs replay`：回放指定范围事件，复现 bug
+* `OQQWall_RUST replay`：回放指定范围事件，复现 bug
 * `admin web`：查看队列、查看 post 状态、查看 last_error
 
 ---

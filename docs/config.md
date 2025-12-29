@@ -29,7 +29,7 @@
 
 ### 2.1 文件名与位置
 - 默认：`./config.json`
-- CLI：`oqqwallrs run --config ./config.json`
+- CLI：`OQQWall_RUST run --config ./config.json`
 - 环境变量可覆盖：`OQQWALL_CONFIG=...`
 
 ### 2.2 顶层结构（推荐规范）
@@ -252,7 +252,7 @@ Rust 版落地建议：
 
 为了平滑迁移原版部署，建议提供命令：
 
-* `oqqwallrs config import --oqqwall-config ./oqqwall.config --group-config ./AcountGroupcfg.json -o ./config.json`
+* `OQQWall_RUST config import --oqqwall-config ./oqqwall.config --group-config ./AcountGroupcfg.json -o ./config.json`
 
 导入规则：
 

@@ -1,0 +1,6 @@
+[package]
+name = "oqqwall_rust_drivers"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
