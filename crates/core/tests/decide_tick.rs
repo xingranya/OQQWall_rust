@@ -31,6 +31,7 @@ fn tick_closes_session_and_creates_draft() {
         profile_id: "bot".to_string(),
         chat_id: "chat".to_string(),
         user_id: "user".to_string(),
+        sender_name: None,
         group_id: "group-a".to_string(),
         platform_msg_id: "msg-1".to_string(),
         message: IngressMessage {

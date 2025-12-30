@@ -1,7 +1,7 @@
 {
   "common": {
     "process_waittime_sec": 20,
-    "render_png": false,
+    "render_png": true,
     "tz_offset_minutes": 480
   },
   "groups": {

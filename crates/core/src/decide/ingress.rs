@@ -35,6 +35,7 @@ pub fn decide_ingress(state: &StateView, cmd: &IngressCommand, config: &CoreConf
         profile_id: cmd.profile_id.clone(),
         chat_id: cmd.chat_id.clone(),
         user_id: cmd.user_id.clone(),
+        sender_name: cmd.sender_name.clone(),
         group_id: cmd.group_id.clone(),
         platform_msg_id: cmd.platform_msg_id.clone(),
         received_at_ms: cmd.received_at_ms,
@@ -66,12 +67,14 @@ pub fn decide_ingress(state: &StateView, cmd: &IngressCommand, config: &CoreConf
     }
 
     for (idx, attachment) in cmd.message.attachments.iter().enumerate() {
-        if let MediaReference::RemoteUrl { .. } = attachment.reference {
-            events.push(Event::Media(MediaEvent::MediaFetchRequested {
-                ingress_id,
-                attachment_index: idx,
-                attempt: 1,
-            }));
+        if let MediaReference::RemoteUrl { url } = &attachment.reference {
+            if !url.starts_with("data:") {
+                events.push(Event::Media(MediaEvent::MediaFetchRequested {
+                    ingress_id,
+                    attachment_index: idx,
+                    attempt: 1,
+                }));
+            }
         }
     }
 

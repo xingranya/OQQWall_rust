@@ -1,16 +1,21 @@
 use std::collections::HashMap;
+use std::fs;
 use std::time::Duration;
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use oqqwall_rust_core::command::{
     GlobalAction, GlobalActionCommand, ReviewAction, ReviewActionCommand,
 };
 use oqqwall_rust_core::draft::{IngressAttachment, IngressMessage, MediaKind, MediaReference};
-use oqqwall_rust_core::event::{Event, ReviewEvent};
-use oqqwall_rust_core::ids::{ReviewCode, ReviewId};
-use oqqwall_rust_core::{Command, IngressCommand};
-use serde_json::Value;
+use oqqwall_rust_core::event::{DraftEvent, Event, IngressEvent, ReviewEvent};
+use oqqwall_rust_core::ids::{IngressId, PostId, ReviewCode, ReviewId};
+use oqqwall_rust_core::{derive_blob_id, Command, IngressCommand};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use serde_json::Value;
 
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::JoinHandle;
@@ -46,7 +51,21 @@ pub struct NapCatRuntimeConfig {
 #[derive(Debug, Clone)]
 struct ReviewInfo {
     review_code: ReviewCode,
-    post_id: oqqwall_rust_core::PostId,
+    post_id: PostId,
+}
+
+#[derive(Debug, Clone)]
+struct IngressSummary {
+    user_id: String,
+    sender_name: Option<String>,
+    text: String,
+    attachments: Vec<IngressAttachment>,
+}
+
+#[derive(Debug, Clone)]
+struct AuditMessage {
+    text: String,
+    images: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +85,9 @@ enum AuditCommand {
 #[derive(Default)]
 struct NapCatState {
     review_info: HashMap<ReviewId, ReviewInfo>,
+    review_by_code: HashMap<ReviewCode, ReviewId>,
+    ingress_summary: HashMap<IngressId, IngressSummary>,
+    post_ingress: HashMap<PostId, Vec<IngressId>>,
     audit_msg_to_review: HashMap<String, ReviewId>,
     pending: HashMap<String, PendingAction>,
     next_echo: u64,
@@ -295,6 +317,30 @@ async fn build_action_from_event(
     event: Event,
 ) -> Option<String> {
     match event {
+        Event::Ingress(IngressEvent::MessageAccepted {
+            ingress_id,
+            user_id,
+            sender_name,
+            message,
+            ..
+        }) => {
+            let mut guard = state.lock().await;
+            guard.ingress_summary.insert(
+                ingress_id,
+                IngressSummary {
+                    user_id,
+                    sender_name,
+                    text: message.text,
+                    attachments: message.attachments,
+                },
+            );
+            None
+        }
+        Event::Draft(DraftEvent::PostDraftCreated { post_id, ingress_ids, .. }) => {
+            let mut guard = state.lock().await;
+            guard.post_ingress.insert(post_id, ingress_ids);
+            None
+        }
         Event::Review(ReviewEvent::ReviewItemCreated {
             review_id,
             post_id,
@@ -314,6 +360,7 @@ async fn build_action_from_event(
                     post_id,
                 },
             );
+            guard.review_by_code.insert(review_code, review_id);
             None
         }
         Event::Review(ReviewEvent::ReviewPublished {
@@ -338,18 +385,40 @@ async fn build_action_from_event(
                 debug_log!("napcat review publish requested but missing review info");
                 return None;
             };
+            let ingress_ids = guard
+                .post_ingress
+                .get(&info.post_id)
+                .cloned()
+                .unwrap_or_default();
+            let preview = rendered_png_preview(info.post_id);
+            let summary = build_audit_message(
+                info.review_code,
+                info.post_id,
+                &ingress_ids,
+                &guard.ingress_summary,
+                preview,
+            );
             let echo = next_echo(&mut guard);
             guard.pending.insert(
                 echo.clone(),
                 PendingAction::SendAuditMessage { review_id },
             );
 
-            let text = format!("#{} post {}", info.review_code, info.post_id.0);
+            let mut message = vec![serde_json::json!({
+                "type": "text",
+                "data": { "text": summary.text }
+            })];
+            for image in summary.images {
+                message.push(serde_json::json!({
+                    "type": "image",
+                    "data": { "file": image }
+                }));
+            }
             let payload = serde_json::json!({
                 "action": "send_group_msg",
                 "params": {
                     "group_id": group_id,
-                    "message": [{"type": "text", "data": {"text": text}}]
+                    "message": message
                 },
                 "echo": echo
             });
@@ -411,6 +480,7 @@ async fn parse_inbound_event(
         value_opt_to_string(value.get("self_id")).unwrap_or_else(|| "napcat".to_string());
     let message_id =
         value_opt_to_string(value.get("message_id")).unwrap_or_else(|| "0".to_string());
+    let sender_name = extract_sender_name(value);
     let timestamp_ms = value
         .get("time")
         .and_then(|v| v.as_i64())
@@ -471,6 +541,7 @@ async fn parse_inbound_event(
             profile_id: self_id,
             chat_id: chat_group_id.clone(),
             user_id,
+            sender_name: sender_name.clone(),
             group_id: runtime.group_id.clone(),
             platform_msg_id: message_id,
             message: IngressMessage { text, attachments },
@@ -483,6 +554,7 @@ async fn parse_inbound_event(
             profile_id: self_id,
             chat_id: user_id.clone(),
             user_id,
+            sender_name,
             group_id: runtime.group_id.clone(),
             platform_msg_id: message_id,
             message: IngressMessage { text, attachments },
@@ -500,7 +572,7 @@ fn extract_message(value: Option<&Value>) -> (String, Vec<IngressAttachment>, Op
 
     match value {
         Some(Value::String(s)) => {
-            text.push_str(s);
+            text.push_str(&extract_cq_faces(s, &mut attachments));
         }
         Some(Value::Array(items)) => {
             for item in items {
@@ -518,6 +590,16 @@ fn extract_message(value: Option<&Value>) -> (String, Vec<IngressAttachment>, Op
                             .and_then(value_to_string)
                         {
                             reply_id = Some(id);
+                        }
+                    }
+                    "face" => {
+                        if let Some(id) = data
+                            .and_then(|d| d.get("id"))
+                            .and_then(value_to_string)
+                        {
+                            if !push_face_attachment(&id, &mut attachments) {
+                                text.push_str(&format!("[face:{}]", id));
+                            }
                         }
                     }
                     "image" | "video" | "file" | "record" => {
@@ -559,6 +641,90 @@ fn extract_reference(data: Option<&Value>) -> Option<MediaReference> {
     None
 }
 
+fn extract_cq_faces(message: &str, attachments: &mut Vec<IngressAttachment>) -> String {
+    let mut output = String::with_capacity(message.len());
+    let mut remaining = message;
+    loop {
+        let Some(start) = remaining.find("[CQ:face") else {
+            output.push_str(remaining);
+            break;
+        };
+        let (prefix, rest) = remaining.split_at(start);
+        output.push_str(prefix);
+
+        let Some(end) = rest.find(']') else {
+            output.push_str(rest);
+            break;
+        };
+        let segment = &rest[..=end];
+        if let Some(face_id) = parse_cq_face_id(segment) {
+            if push_face_attachment(&face_id, attachments) {
+                let after = &rest[end + 1..];
+                if needs_space(&output, after) {
+                    output.push(' ');
+                }
+                remaining = after;
+                continue;
+            }
+        }
+
+        output.push_str(segment);
+        remaining = &rest[end + 1..];
+    }
+    output
+}
+
+fn parse_cq_face_id(segment: &str) -> Option<String> {
+    let trimmed = segment
+        .strip_prefix('[')
+        .unwrap_or(segment)
+        .strip_suffix(']')
+        .unwrap_or(segment);
+    let params = trimmed.strip_prefix("CQ:face")?;
+    let params = params.strip_prefix(',').unwrap_or(params);
+    for part in params.split(',') {
+        if let Some(value) = part.strip_prefix("id=") {
+            if !value.trim().is_empty() {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+fn needs_space(prefix: &str, suffix: &str) -> bool {
+    let left_space = prefix.chars().last().map(|c| c.is_whitespace()).unwrap_or(false);
+    let right_space = suffix.chars().next().map(|c| c.is_whitespace()).unwrap_or(false);
+    !left_space && !right_space
+}
+
+fn push_face_attachment(face_id: &str, attachments: &mut Vec<IngressAttachment>) -> bool {
+    let Some(face_id) = normalize_face_id(face_id) else {
+        return false;
+    };
+    let path = Path::new("res").join("face").join(format!("{}.png", face_id));
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    let encoded = STANDARD.encode(bytes);
+    let url = format!("data:image/png;base64,{}", encoded);
+    attachments.push(IngressAttachment {
+        kind: MediaKind::Image,
+        name: Some(format!("face-{}.png", face_id)),
+        reference: MediaReference::RemoteUrl { url },
+    });
+    true
+}
+
+fn normalize_face_id(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || !trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
 async fn parse_review_command(
     runtime: &NapCatRuntimeConfig,
     state: &Arc<Mutex<NapCatState>>,
@@ -578,6 +744,19 @@ async fn parse_review_command(
         if let Some(mapped) = guard.audit_msg_to_review.get(&reply_id) {
             review_id = Some(*mapped);
             review_code = None;
+        }
+    }
+
+    if review_id.is_none() {
+        if let Some(code) = review_code {
+            let guard = state.lock().await;
+            if let Some(mapped) = guard.review_by_code.get(&code).copied() {
+                review_id = Some(mapped);
+                review_code = None;
+            } else {
+                send_group_text(out_tx, group_id, "找不到稿件").await;
+                return None;
+            }
         }
     }
 
@@ -751,6 +930,172 @@ fn parse_first_token(text: &str) -> Option<String> {
 
 fn parse_u64(text: &str) -> Option<u64> {
     text.split_whitespace().next()?.parse::<u64>().ok()
+}
+
+fn extract_sender_name(value: &Value) -> Option<String> {
+    let sender = value.get("sender")?;
+    let card = sender.get("card").and_then(|v| v.as_str()).map(|s| s.trim());
+    if let Some(card) = card {
+        if !card.is_empty() {
+            return Some(card.to_string());
+        }
+    }
+    let nickname = sender
+        .get("nickname")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim());
+    nickname.filter(|name| !name.is_empty()).map(|name| name.to_string())
+}
+
+const SUMMARY_LINE_MAX_CHARS: usize = 120;
+
+fn build_audit_message(
+    review_code: ReviewCode,
+    post_id: PostId,
+    ingress_ids: &[IngressId],
+    ingress_map: &HashMap<IngressId, IngressSummary>,
+    preview_image: Option<String>,
+) -> AuditMessage {
+    let mut images = Vec::new();
+    if let Some(preview) = preview_image {
+        images.push(preview);
+    }
+    if ingress_ids.is_empty() {
+        return AuditMessage {
+            text: format!("#{} post {}", review_code, post_id.0),
+            images,
+        };
+    }
+
+    let mut lines = Vec::new();
+    let mut user_id = None;
+    let mut sender_name = None;
+
+    for ingress_id in ingress_ids {
+        if let Some(summary) = ingress_map.get(ingress_id) {
+            if user_id.is_none() {
+                user_id = Some(summary.user_id.clone());
+                sender_name = summary
+                    .sender_name
+                    .clone()
+                    .filter(|name| !name.trim().is_empty());
+            }
+
+            if let Some(line) = sanitize_summary_line(&summary.text) {
+                lines.push(line);
+            }
+            for attachment in &summary.attachments {
+                lines.push(attachment_placeholder(attachment.kind).to_string());
+                if let Some(image) = image_source_from_attachment(attachment) {
+                    images.push(image);
+                }
+            }
+        }
+    }
+
+    let header = match user_id {
+        Some(user_id) => {
+            let display_name = sender_name.unwrap_or_else(|| user_id.clone());
+            format!("#{} 来自 {}({})", review_code, display_name, user_id)
+        }
+        None => format!("#{} post {}", review_code, post_id.0),
+    };
+
+    let mut text = String::new();
+    text.push_str(&header);
+    text.push('\n');
+    text.push_str("消息概览：");
+    if lines.is_empty() {
+        text.push('\n');
+        text.push_str(" （空）");
+    } else {
+        for line in lines {
+            text.push('\n');
+            text.push(' ');
+            text.push_str(&line);
+        }
+    }
+    if !images.is_empty() {
+        text.push('\n');
+        text.push_str("图片：");
+    }
+
+    AuditMessage { text, images }
+}
+
+fn sanitize_summary_line(text: &str) -> Option<String> {
+    let flattened = text.replace('\n', " ");
+    let normalized = flattened.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for (idx, ch) in trimmed.chars().enumerate() {
+        if idx >= SUMMARY_LINE_MAX_CHARS {
+            break;
+        }
+        out.push(ch);
+    }
+    if trimmed.chars().count() > SUMMARY_LINE_MAX_CHARS {
+        out.push_str("...");
+    }
+    Some(out)
+}
+
+fn attachment_placeholder(kind: MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Image => "[图片]",
+        MediaKind::Video => "[视频]",
+        MediaKind::File => "[文件]",
+        MediaKind::Audio => "[音频]",
+        MediaKind::Other => "[附件]",
+    }
+}
+
+fn image_source_from_attachment(attachment: &IngressAttachment) -> Option<String> {
+    if attachment.kind != MediaKind::Image {
+        return None;
+    }
+    match &attachment.reference {
+        MediaReference::RemoteUrl { url } => Some(url.clone()),
+        MediaReference::Blob { .. } => None,
+    }
+}
+
+fn rendered_png_preview(post_id: PostId) -> Option<String> {
+    let path = rendered_png_path(post_id);
+    if !path.exists() {
+        return None;
+    }
+    Some(file_uri_from_path(&path))
+}
+
+fn rendered_png_path(post_id: PostId) -> PathBuf {
+    let blob_id = derive_blob_id(&[&post_id.to_be_bytes(), b"png"]);
+    let filename = format!("{}.png", id128_hex(blob_id.0));
+    blob_root().join("png").join(filename)
+}
+
+fn blob_root() -> PathBuf {
+    std::env::var("OQQWALL_BLOB_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("data/blobs"))
+}
+
+fn file_uri_from_path(path: &Path) -> String {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    format!("file://{}", absolute.to_string_lossy())
+}
+
+fn id128_hex(value: u128) -> String {
+    format!("{:032x}", value)
 }
 
 fn is_digits(value: &str) -> bool {

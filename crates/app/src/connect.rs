@@ -1,3 +1,4 @@
+use oqqwall_rust_drivers::media_fetcher::{spawn_media_fetcher, MediaFetcherRuntimeConfig};
 use oqqwall_rust_drivers::napcat::{spawn_napcat_ws, NapCatRuntimeConfig};
 use oqqwall_rust_drivers::renderer::{spawn_renderer, RendererRuntimeConfig};
 use oqqwall_rust_drivers::qzone::{spawn_qzone_sender, QzoneRuntimeConfig};
@@ -42,6 +43,12 @@ pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) {
         let bus_rx = handle.subscribe();
         spawn_napcat_ws(handle.cmd_tx.clone(), bus_rx, runtime);
     }
+    debug_log!("spawn media fetcher");
+    spawn_media_fetcher(
+        handle.cmd_tx.clone(),
+        handle.subscribe(),
+        MediaFetcherRuntimeConfig::default(),
+    );
     debug_log!("spawn renderer");
     spawn_renderer(
         handle.cmd_tx.clone(),

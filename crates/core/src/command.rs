@@ -16,6 +16,7 @@ pub struct IngressCommand {
     pub profile_id: String,
     pub chat_id: String,
     pub user_id: String,
+    pub sender_name: Option<String>,
     pub group_id: GroupId,
     pub platform_msg_id: String,
     pub message: IngressMessage,

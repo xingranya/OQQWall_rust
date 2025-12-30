@@ -5,7 +5,7 @@ use crate::event::{
 use crate::ids::derive_review_id;
 use crate::state::StateView;
 
-pub fn decide_driver_event(state: &StateView, event: &Event, _config: &CoreConfig) -> Vec<Event> {
+pub fn decide_driver_event(state: &StateView, event: &Event, config: &CoreConfig) -> Vec<Event> {
     match event {
         Event::Render(RenderEvent::SvgReady { post_id, .. }) => {
             if !state.posts.contains_key(post_id) {
@@ -16,14 +16,42 @@ pub fn decide_driver_event(state: &StateView, event: &Event, _config: &CoreConfi
                 return Vec::new();
             }
             let review_code = state.next_review_code;
-            vec![
-                Event::Review(ReviewEvent::ReviewItemCreated {
+            let mut events = vec![Event::Review(ReviewEvent::ReviewItemCreated {
+                review_id,
+                post_id: *post_id,
+                review_code,
+            })];
+            if !config.render_png {
+                events.push(Event::Review(ReviewEvent::ReviewPublishRequested { review_id }));
+            }
+            events
+        }
+        Event::Render(RenderEvent::PngReady { post_id, .. }) => {
+            if !config.render_png {
+                return Vec::new();
+            }
+            if !state.posts.contains_key(post_id) {
+                return Vec::new();
+            }
+            let review_id = derive_review_id(&[&post_id.to_be_bytes()]);
+            let mut events = Vec::new();
+            if !state.reviews.contains_key(&review_id) {
+                let review_code = state.next_review_code;
+                events.push(Event::Review(ReviewEvent::ReviewItemCreated {
                     review_id,
                     post_id: *post_id,
                     review_code,
-                }),
-                Event::Review(ReviewEvent::ReviewPublishRequested { review_id }),
-            ]
+                }));
+            }
+            let already_published = state
+                .reviews
+                .get(&review_id)
+                .and_then(|meta| meta.audit_msg_id.as_ref())
+                .is_some();
+            if !already_published {
+                events.push(Event::Review(ReviewEvent::ReviewPublishRequested { review_id }));
+            }
+            events
         }
         Event::Send(SendEvent::SendFailed {
             post_id,

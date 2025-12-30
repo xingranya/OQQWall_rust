@@ -12,8 +12,8 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use oqqwall_rust_core::draft::{Draft, DraftBlock, MediaKind, MediaReference};
-use oqqwall_rust_core::event::{DraftEvent, Event, SendEvent};
-use oqqwall_rust_core::ids::{PostId, TimestampMs};
+use oqqwall_rust_core::event::{BlobEvent, DraftEvent, Event, SendEvent};
+use oqqwall_rust_core::ids::{BlobId, PostId, TimestampMs};
 use oqqwall_rust_core::Command;
 use reqwest::Client;
 #[cfg(debug_assertions)]
@@ -105,6 +105,7 @@ struct QzoneState {
     drafts: HashMap<PostId, Draft>,
     attempts: HashMap<PostId, u32>,
     cookie_cache: Option<CookieCache>,
+    blob_paths: HashMap<BlobId, String>,
 }
 
 struct CookieCache {
@@ -171,6 +172,15 @@ pub fn spawn_qzone_sender(
                     let mut guard = state.lock().await;
                     guard.drafts.insert(post_id, draft);
                 }
+                Event::Blob(BlobEvent::BlobPersisted { blob_id, path }) => {
+                    let mut guard = state.lock().await;
+                    guard.blob_paths.insert(blob_id, path);
+                }
+                Event::Blob(BlobEvent::BlobReleased { blob_id })
+                | Event::Blob(BlobEvent::BlobGcRequested { blob_id }) => {
+                    let mut guard = state.lock().await;
+                    guard.blob_paths.remove(&blob_id);
+                }
                 Event::Send(SendEvent::SendStarted {
                     post_id,
                     group_id,
@@ -202,9 +212,12 @@ pub fn spawn_qzone_sender(
                             let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
                             continue;
                         };
-                        let draft = {
+                        let (draft, blob_paths) = {
                             let guard = state.lock().await;
-                            guard.drafts.get(&post_id).cloned()
+                            (
+                                guard.drafts.get(&post_id).cloned(),
+                                guard.blob_paths.clone(),
+                            )
                         };
                         let Some(draft) = draft else {
                             debug_log!("emuqzone send failed: missing draft post_id={}", post_id.0);
@@ -222,7 +235,7 @@ pub fn spawn_qzone_sender(
                             continue;
                         };
                         let content = draft_to_text(&draft);
-                        let images = match collect_emuqzone_images(&draft) {
+                        let images = match collect_emuqzone_images(&draft, &blob_paths) {
                             Ok(images) => images,
                             Err(err) => {
                                 debug_log!(
@@ -330,9 +343,12 @@ pub fn spawn_qzone_sender(
                             continue;
                         }
                     };
-                    let draft = {
+                    let (draft, blob_paths) = {
                         let guard = state.lock().await;
-                        guard.drafts.get(&post_id).cloned()
+                        (
+                            guard.drafts.get(&post_id).cloned(),
+                            guard.blob_paths.clone(),
+                        )
                     };
                     let Some(draft) = draft else {
                         debug_log!("qzone send failed: missing draft post_id={}", post_id.0);
@@ -351,7 +367,7 @@ pub fn spawn_qzone_sender(
                     };
 
                     let content = draft_to_text(&draft);
-                    let images = match collect_images(&client, &draft).await {
+                    let images = match collect_images(&client, &draft, &blob_paths).await {
                         Ok(images) => images,
                         Err(err) => {
                             debug_log!(
@@ -687,7 +703,10 @@ fn draft_to_text(draft: &Draft) -> String {
 }
 
 #[cfg(debug_assertions)]
-fn collect_emuqzone_images(draft: &Draft) -> Result<Vec<String>, QzoneError> {
+fn collect_emuqzone_images(
+    draft: &Draft,
+    blob_paths: &HashMap<BlobId, String>,
+) -> Result<Vec<String>, QzoneError> {
     let mut images = Vec::new();
     for block in &draft.blocks {
         if let DraftBlock::Attachment {
@@ -697,10 +716,11 @@ fn collect_emuqzone_images(draft: &Draft) -> Result<Vec<String>, QzoneError> {
         {
             match reference {
                 MediaReference::RemoteUrl { url } => images.push(process_emuqzone_image(url)),
-                MediaReference::Blob { .. } => {
-                    return Err(QzoneError::unknown(
-                        "blob media not supported in emuqzone sender",
-                    ))
+                MediaReference::Blob { blob_id } => {
+                    let path = blob_paths
+                        .get(blob_id)
+                        .ok_or_else(|| QzoneError::unknown("missing blob path"))?;
+                    images.push(process_emuqzone_image(path));
                 }
             }
         }
@@ -742,18 +762,36 @@ fn process_emuqzone_image(source: &str) -> String {
     }
     if let Some(path) = source.strip_prefix("file://") {
         if let Ok(bytes) = fs::read(path) {
-            return format!("data:image/jpeg;base64,{}", STANDARD.encode(bytes));
+            let mime = mime_from_path(path).unwrap_or("image/jpeg");
+            return format!("data:{};base64,{}", mime, STANDARD.encode(bytes));
         }
     }
     if Path::new(source).exists() {
         if let Ok(bytes) = fs::read(source) {
-            return format!("data:image/jpeg;base64,{}", STANDARD.encode(bytes));
+            let mime = mime_from_path(source).unwrap_or("image/jpeg");
+            return format!("data:{};base64,{}", mime, STANDARD.encode(bytes));
         }
     }
     if STANDARD.decode(source).is_ok() {
         return format!("data:image/jpeg;base64,{}", source);
     }
     source.to_string()
+}
+
+#[cfg(debug_assertions)]
+fn mime_from_path(path: &str) -> Option<&'static str> {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())?;
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "svg" | "svgz" => Some("image/svg+xml"),
+        _ => None,
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -1114,7 +1152,11 @@ fn classify_text_error(message: &str) -> QzoneError {
     QzoneError::unknown(message)
 }
 
-async fn collect_images(client: &QzoneClient, draft: &Draft) -> Result<Vec<Vec<u8>>, QzoneError> {
+async fn collect_images(
+    client: &QzoneClient,
+    draft: &Draft,
+    blob_paths: &HashMap<BlobId, String>,
+) -> Result<Vec<Vec<u8>>, QzoneError> {
     let mut images = Vec::new();
     for block in &draft.blocks {
         if let DraftBlock::Attachment {
@@ -1127,9 +1169,12 @@ async fn collect_images(client: &QzoneClient, draft: &Draft) -> Result<Vec<Vec<u
                     debug_log!("qzone collect image: url={}", url);
                     client.fetch_image_bytes(url).await?
                 }
-                MediaReference::Blob { .. } => {
-                    debug_log!("qzone collect image: blob reference not supported");
-                    return Err(QzoneError::unknown("blob media not supported in qzone sender"))
+                MediaReference::Blob { blob_id } => {
+                    let path = blob_paths
+                        .get(blob_id)
+                        .ok_or_else(|| QzoneError::unknown("missing blob path"))?;
+                    debug_log!("qzone collect image: blob path={}", path);
+                    client.fetch_image_bytes(path).await?
                 }
             };
             images.push(bytes);

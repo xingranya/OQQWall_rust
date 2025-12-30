@@ -52,6 +52,7 @@ pub enum IngressEvent {
         profile_id: String,
         chat_id: String,
         user_id: String,
+        sender_name: Option<String>,
         group_id: GroupId,
         platform_msg_id: String,
         received_at_ms: TimestampMs,
