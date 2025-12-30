@@ -1,5 +1,9 @@
 use std::collections::HashMap;
 use std::fs;
+#[cfg(debug_assertions)]
+use std::io::{Read, Write};
+#[cfg(debug_assertions)]
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -12,6 +16,8 @@ use oqqwall_rust_core::event::{DraftEvent, Event, SendEvent};
 use oqqwall_rust_core::ids::{PostId, TimestampMs};
 use oqqwall_rust_core::Command;
 use reqwest::Client;
+#[cfg(debug_assertions)]
+use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::JoinHandle;
@@ -20,13 +26,32 @@ use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
 
 use crate::napcat::NapCatConfig;
 
+#[cfg(debug_assertions)]
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        eprintln!($($arg)*);
+    };
+}
+
+#[cfg(not(debug_assertions))]
+macro_rules! debug_log {
+    ($($arg:tt)*) => {};
+}
+
 const EMOTION_PUBLISH_URL: &str =
     "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_publish_v6";
 const UPLOAD_IMAGE_URL: &str = "https://up.qzone.qq.com/cgi-bin/upload/cgi_upload_image";
+#[cfg(debug_assertions)]
+const EMUQZONE_PORT: u16 = 18080;
+#[cfg(debug_assertions)]
+const EMUQZONE_MAX_POSTS: usize = 50;
 
 #[derive(Debug, Clone)]
 pub struct QzoneRuntimeConfig {
-    pub napcat: NapCatConfig,
+    pub napcat_by_group: HashMap<String, NapCatConfig>,
+    pub default_napcat: Option<NapCatConfig>,
+    #[cfg(debug_assertions)]
+    pub use_virt_qzone: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,12 +112,45 @@ struct CookieCache {
     fetched_at_ms: TimestampMs,
 }
 
+#[cfg(debug_assertions)]
+#[derive(Default)]
+struct EmuQzoneState {
+    posts: Vec<EmuQzonePost>,
+    next_id: u64,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, Serialize)]
+struct EmuQzonePost {
+    id: u64,
+    timestamp_ms: TimestampMs,
+    text: String,
+    images: Vec<String>,
+    image_count: usize,
+    status: String,
+}
+
 pub fn spawn_qzone_sender(
     cmd_tx: mpsc::Sender<Command>,
     bus_rx: broadcast::Receiver<oqqwall_rust_core::EventEnvelope>,
     runtime: QzoneRuntimeConfig,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        debug_log!(
+            "qzone sender start: groups={} default_napcat={}",
+            runtime.napcat_by_group.len(),
+            runtime.default_napcat.is_some()
+        );
+        #[cfg(debug_assertions)]
+        debug_log!("qzone sender mode: use_virt_qzone={}", runtime.use_virt_qzone);
+        #[cfg(debug_assertions)]
+        let emu_state = if runtime.use_virt_qzone {
+            let state = Arc::new(std::sync::Mutex::new(EmuQzoneState::default()));
+            spawn_emuqzone_server(state.clone());
+            Some(state)
+        } else {
+            None
+        };
         let state = Arc::new(Mutex::new(QzoneState::default()));
         let mut bus_rx = bus_rx;
 
@@ -105,18 +163,139 @@ pub fn spawn_qzone_sender(
 
             match env.event {
                 Event::Draft(DraftEvent::PostDraftCreated { post_id, draft, .. }) => {
+                    debug_log!(
+                        "qzone draft cached: post_id={} blocks={}",
+                        post_id.0,
+                        draft.blocks.len()
+                    );
                     let mut guard = state.lock().await;
                     guard.drafts.insert(post_id, draft);
                 }
                 Event::Send(SendEvent::SendStarted {
                     post_id,
+                    group_id,
                     account_id,
                     started_at_ms,
                     ..
                 }) => {
-                    let cookies = match get_cookies(&state, &runtime.napcat).await {
+                    debug_log!(
+                        "qzone send started: post_id={} group_id={} account_id={} started_at_ms={}",
+                        post_id.0,
+                        group_id,
+                        account_id,
+                        started_at_ms
+                    );
+                    #[cfg(debug_assertions)]
+                    if runtime.use_virt_qzone {
+                        let Some(emu_state) = emu_state.as_ref() else {
+                            debug_log!("emuqzone send failed: missing emulator state");
+                            let err = QzoneError::unknown("missing emuqzone state");
+                            let retry_at = started_at_ms
+                                .saturating_add(retry_delay_ms(err.kind, 1));
+                            let event = SendEvent::SendFailed {
+                                post_id,
+                                account_id,
+                                attempt: 1,
+                                retry_at_ms: retry_at,
+                                error: format!("[{:?}] {}", err.kind, err.message),
+                            };
+                            let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
+                            continue;
+                        };
+                        let draft = {
+                            let guard = state.lock().await;
+                            guard.drafts.get(&post_id).cloned()
+                        };
+                        let Some(draft) = draft else {
+                            debug_log!("emuqzone send failed: missing draft post_id={}", post_id.0);
+                            let err = QzoneError::unknown("missing draft");
+                            let retry_at = started_at_ms
+                                .saturating_add(retry_delay_ms(err.kind, 1));
+                            let event = SendEvent::SendFailed {
+                                post_id,
+                                account_id,
+                                attempt: 1,
+                                retry_at_ms: retry_at,
+                                error: format!("[{:?}] {}", err.kind, err.message),
+                            };
+                            let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
+                            continue;
+                        };
+                        let content = draft_to_text(&draft);
+                        let images = match collect_emuqzone_images(&draft) {
+                            Ok(images) => images,
+                            Err(err) => {
+                                debug_log!(
+                                    "emuqzone collect images failed: kind={:?} message={}",
+                                    err.kind,
+                                    err.message
+                                );
+                                let retry_at = started_at_ms
+                                    .saturating_add(retry_delay_ms(err.kind, 1));
+                                let event = SendEvent::SendFailed {
+                                    post_id,
+                                    account_id,
+                                    attempt: 1,
+                                    retry_at_ms: retry_at,
+                                    error: format!("[{:?}] {}", err.kind, err.message),
+                                };
+                                let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
+                                continue;
+                            }
+                        };
+                        let attempt = {
+                            let mut guard = state.lock().await;
+                            let entry = guard.attempts.entry(post_id).or_insert(0);
+                            *entry += 1;
+                            *entry
+                        };
+                        debug_log!(
+                            "emuqzone publish attempt: post_id={} attempt={} images={} content_len={}",
+                            post_id.0,
+                            attempt,
+                            images.len(),
+                            content.len()
+                        );
+                        append_emuqzone_post(emu_state, content, images);
+                        debug_log!("emuqzone publish success: post_id={}", post_id.0);
+                        let mut guard = state.lock().await;
+                        guard.attempts.remove(&post_id);
+                        let event = SendEvent::SendSucceeded {
+                            post_id,
+                            account_id,
+                            finished_at_ms: started_at_ms,
+                            remote_id: None,
+                        };
+                        let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
+                        continue;
+                    }
+                    let napcat = runtime
+                        .napcat_by_group
+                        .get(&group_id)
+                        .or_else(|| runtime.default_napcat.as_ref());
+                    let Some(napcat) = napcat else {
+                        debug_log!(
+                            "qzone send failed: missing napcat config for group_id={}",
+                            group_id
+                        );
+                        let event = SendEvent::SendFailed {
+                            post_id,
+                            account_id,
+                            attempt: 1,
+                            retry_at_ms: started_at_ms.saturating_add(30_000),
+                            error: "missing napcat config for group".to_string(),
+                        };
+                        let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
+                        continue;
+                    };
+                    let cookies = match get_cookies(&state, napcat).await {
                         Ok(cookies) => cookies,
                         Err(err) => {
+                            debug_log!(
+                                "qzone get cookies failed: kind={:?} message={}",
+                                err.kind,
+                                err.message
+                            );
                             let retry_at = started_at_ms
                                 .saturating_add(retry_delay_ms(err.kind, 1));
                             let event = SendEvent::SendFailed {
@@ -133,6 +312,11 @@ pub fn spawn_qzone_sender(
                     let client = match QzoneClient::from_cookie_map(cookies) {
                         Ok(client) => client,
                         Err(err) => {
+                            debug_log!(
+                                "qzone client init failed: kind={:?} message={}",
+                                err.kind,
+                                err.message
+                            );
                             let retry_at = started_at_ms
                                 .saturating_add(retry_delay_ms(err.kind, 1));
                             let event = SendEvent::SendFailed {
@@ -151,6 +335,7 @@ pub fn spawn_qzone_sender(
                         guard.drafts.get(&post_id).cloned()
                     };
                     let Some(draft) = draft else {
+                        debug_log!("qzone send failed: missing draft post_id={}", post_id.0);
                         let err = QzoneError::unknown("missing draft");
                         let retry_at = started_at_ms
                             .saturating_add(retry_delay_ms(err.kind, 1));
@@ -169,6 +354,11 @@ pub fn spawn_qzone_sender(
                     let images = match collect_images(&client, &draft).await {
                         Ok(images) => images,
                         Err(err) => {
+                            debug_log!(
+                                "qzone collect images failed: kind={:?} message={}",
+                                err.kind,
+                                err.message
+                            );
                             let retry_at = started_at_ms
                                 .saturating_add(retry_delay_ms(err.kind, 1));
                             let event = SendEvent::SendFailed {
@@ -188,9 +378,21 @@ pub fn spawn_qzone_sender(
                         *entry += 1;
                         *entry
                     };
+                    debug_log!(
+                        "qzone publish attempt: post_id={} attempt={} images={} content_len={}",
+                        post_id.0,
+                        attempt,
+                        images.len(),
+                        content.len()
+                    );
 
                     match client.publish_emotion(&content, &images).await {
                         Ok(tid) => {
+                            debug_log!(
+                                "qzone publish success: post_id={} tid={}",
+                                post_id.0,
+                                tid
+                            );
                             let mut guard = state.lock().await;
                             guard.attempts.remove(&post_id);
                             let event = SendEvent::SendSucceeded {
@@ -202,6 +404,13 @@ pub fn spawn_qzone_sender(
                             let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
                         }
                         Err(err) => {
+                            debug_log!(
+                                "qzone publish failed: post_id={} attempt={} kind={:?} message={}",
+                                post_id.0,
+                                attempt,
+                                err.kind,
+                                err.message
+                            );
                             let retry_at = started_at_ms
                                 .saturating_add(retry_delay_ms(err.kind, attempt));
                             let event = SendEvent::SendFailed {
@@ -231,6 +440,7 @@ struct QzoneClient {
 
 impl QzoneClient {
     fn from_cookie_map(cookies: HashMap<String, String>) -> Result<Self, QzoneError> {
+        debug_log!("qzone client init: cookie_count={}", cookies.len());
         let skey = cookies
             .get("p_skey")
             .or_else(|| cookies.get("skey"))
@@ -241,6 +451,7 @@ impl QzoneClient {
             .get("uin")
             .and_then(|value| value.trim().trim_start_matches('o').parse::<u64>().ok())
             .unwrap_or(0);
+        debug_log!("qzone client init: uin={}", uin);
         let client = Client::builder()
             .timeout(Duration::from_secs(20))
             .build()
@@ -258,6 +469,11 @@ impl QzoneClient {
         content: &str,
         images: &[Vec<u8>],
     ) -> Result<String, QzoneError> {
+        debug_log!(
+            "qzone publish request: content_len={} images={}",
+            content.len(),
+            images.len()
+        );
         let cookie_header = build_cookie_header(&self.cookies);
         let mut form: HashMap<&str, String> = HashMap::new();
         form.insert("syn_tweet_verson", "1".to_string());
@@ -324,6 +540,7 @@ impl QzoneClient {
     }
 
     async fn upload_image(&self, image: &[u8]) -> Result<Value, QzoneError> {
+        debug_log!("qzone upload image: size_bytes={}", image.len());
         let cookie_header = build_cookie_header(&self.cookies);
         let skey = self
             .cookies
@@ -402,16 +619,20 @@ impl QzoneClient {
     }
 
     async fn fetch_image_bytes(&self, source: &str) -> Result<Vec<u8>, QzoneError> {
+        debug_log!("qzone fetch image: source={}", source);
         if let Some(encoded) = source.strip_prefix("base64://") {
+            debug_log!("qzone fetch image: base64 payload");
             return STANDARD
                 .decode(encoded)
                 .map_err(|err| QzoneError::unknown(format!("invalid base64 image: {}", err)));
         }
         if let Some(path) = source.strip_prefix("file://") {
+            debug_log!("qzone fetch image: file path={}", path);
             return fs::read(path)
                 .map_err(|err| QzoneError::unknown(format!("read file failed: {}", err)));
         }
         if source.starts_with("http://") || source.starts_with("https://") {
+            debug_log!("qzone fetch image: http url");
             let res = self
                 .client
                 .get(source)
@@ -431,6 +652,7 @@ impl QzoneClient {
             return Ok(bytes.to_vec());
         }
         if Path::new(source).exists() {
+            debug_log!("qzone fetch image: local path={}", source);
             return fs::read(source)
                 .map_err(|err| QzoneError::unknown(format!("read file failed: {}", err)));
         }
@@ -462,6 +684,220 @@ fn draft_to_text(draft: &Draft) -> String {
         }
     }
     parts.join("\n\n")
+}
+
+#[cfg(debug_assertions)]
+fn collect_emuqzone_images(draft: &Draft) -> Result<Vec<String>, QzoneError> {
+    let mut images = Vec::new();
+    for block in &draft.blocks {
+        if let DraftBlock::Attachment {
+            kind: MediaKind::Image,
+            reference,
+        } = block
+        {
+            match reference {
+                MediaReference::RemoteUrl { url } => images.push(process_emuqzone_image(url)),
+                MediaReference::Blob { .. } => {
+                    return Err(QzoneError::unknown(
+                        "blob media not supported in emuqzone sender",
+                    ))
+                }
+            }
+        }
+    }
+    Ok(images)
+}
+
+#[cfg(debug_assertions)]
+fn append_emuqzone_post(
+    state: &Arc<std::sync::Mutex<EmuQzoneState>>,
+    text: String,
+    images: Vec<String>,
+) {
+    let timestamp_ms = now_ms();
+    let mut guard = state.lock().unwrap_or_else(|err| err.into_inner());
+    let post = EmuQzonePost {
+        id: guard.next_id,
+        timestamp_ms,
+        text,
+        image_count: images.len(),
+        images,
+        status: "success".to_string(),
+    };
+    guard.next_id = guard.next_id.saturating_add(1);
+    guard.posts.push(post);
+    if guard.posts.len() > EMUQZONE_MAX_POSTS {
+        let drain = guard.posts.len().saturating_sub(EMUQZONE_MAX_POSTS);
+        guard.posts.drain(0..drain);
+    }
+}
+
+#[cfg(debug_assertions)]
+fn process_emuqzone_image(source: &str) -> String {
+    if source.starts_with("http://")
+        || source.starts_with("https://")
+        || source.starts_with("data:image")
+    {
+        return source.to_string();
+    }
+    if let Some(path) = source.strip_prefix("file://") {
+        if let Ok(bytes) = fs::read(path) {
+            return format!("data:image/jpeg;base64,{}", STANDARD.encode(bytes));
+        }
+    }
+    if Path::new(source).exists() {
+        if let Ok(bytes) = fs::read(source) {
+            return format!("data:image/jpeg;base64,{}", STANDARD.encode(bytes));
+        }
+    }
+    if STANDARD.decode(source).is_ok() {
+        return format!("data:image/jpeg;base64,{}", source);
+    }
+    source.to_string()
+}
+
+#[cfg(debug_assertions)]
+fn spawn_emuqzone_server(state: Arc<std::sync::Mutex<EmuQzoneState>>) {
+    std::thread::spawn(move || {
+        let listener = match TcpListener::bind(("127.0.0.1", EMUQZONE_PORT)) {
+            Ok(listener) => listener,
+            Err(err) => {
+                debug_log!("emuqzone server bind failed: {}", err);
+                return;
+            }
+        };
+        debug_log!(
+            "emuqzone server listening: http://127.0.0.1:{}",
+            EMUQZONE_PORT
+        );
+        for stream in listener.incoming() {
+            let state = state.clone();
+            match stream {
+                Ok(stream) => {
+                    std::thread::spawn(move || {
+                        handle_emuqzone_conn(stream, state);
+                    });
+                }
+                Err(err) => {
+                    debug_log!("emuqzone accept failed: {}", err);
+                    break;
+                }
+            }
+        }
+    });
+}
+
+#[cfg(debug_assertions)]
+fn handle_emuqzone_conn(
+    mut stream: TcpStream,
+    state: Arc<std::sync::Mutex<EmuQzoneState>>,
+) {
+    let mut buffer = [0u8; 2048];
+    let Ok(size) = stream.read(&mut buffer) else {
+        return;
+    };
+    if size == 0 {
+        return;
+    }
+    let request = String::from_utf8_lossy(&buffer[..size]);
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("/");
+    match path {
+        "/" => {
+            let body = emuqzone_html();
+            write_http_response(&mut stream, 200, "text/html; charset=utf-8", body.as_bytes());
+        }
+        "/data" => {
+            let body = {
+                let guard = state.lock().unwrap_or_else(|err| err.into_inner());
+                serde_json::to_vec(&guard.posts).unwrap_or_else(|_| b"[]".to_vec())
+            };
+            write_http_response(&mut stream, 200, "application/json; charset=utf-8", &body);
+        }
+        _ => {
+            write_http_response(&mut stream, 404, "text/plain; charset=utf-8", b"Not Found");
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+fn write_http_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) {
+    let status_text = match status {
+        200 => "OK",
+        404 => "Not Found",
+        _ => "Error",
+    };
+    let header = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+        status,
+        status_text,
+        content_type,
+        body.len()
+    );
+    let _ = stream.write_all(header.as_bytes());
+    let _ = stream.write_all(body);
+    let _ = stream.flush();
+}
+
+#[cfg(debug_assertions)]
+fn emuqzone_html() -> String {
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>EmuQzone</title>
+<style>
+body {{ font-family: Arial, sans-serif; margin: 20px; }}
+.post {{ border: 1px solid #ddd; margin: 10px 0; padding: 15px; border-radius: 6px; }}
+.post-header {{ font-weight: bold; margin-bottom: 8px; }}
+.post-content {{ white-space: pre-wrap; margin-bottom: 8px; }}
+.post-images {{ display: flex; gap: 10px; flex-wrap: wrap; }}
+.post-image {{ max-width: 220px; max-height: 220px; border-radius: 4px; }}
+.refresh-btn {{ padding: 8px 14px; background: #1e88e5; color: white; border: none; border-radius: 4px; cursor: pointer; }}
+</style>
+</head>
+<body>
+<h1>EmuQzone</h1>
+<p>Listening on http://127.0.0.1:{}</p>
+<button class="refresh-btn" onclick="loadData()">Refresh</button>
+<div id="posts"></div>
+<script>
+function loadData() {{
+  fetch('/data')
+    .then(r => r.json())
+    .then(data => {{
+      const posts = document.getElementById('posts');
+      if (!data.length) {{
+        posts.innerHTML = '<p>No posts yet.</p>';
+        return;
+      }}
+      posts.innerHTML = data.map(post => `
+        <div class="post">
+          <div class="post-header">Post #${{post.id}} - ${{post.timestamp_ms}}</div>
+          <div class="post-content">${{post.text || ''}}</div>
+          ${{post.images && post.images.length ? `
+            <div class="post-images">
+              ${{post.images.map(img => `<img src="${{img}}" alt="image" class="post-image">`).join('')}}
+            </div>` : ''}}
+          <div>Status: ${{post.status}} | Images: ${{post.image_count || 0}}</div>
+        </div>
+      `).join('');
+    }})
+    .catch(() => {{
+      document.getElementById('posts').innerHTML = '<p>Failed to load data.</p>';
+    }});
+}}
+loadData();
+setInterval(loadData, 5000);
+</script>
+</body>
+</html>"#,
+        EMUQZONE_PORT
+    )
 }
 
 fn parse_cookie_string(cookie_header: &str) -> HashMap<String, String> {
@@ -516,10 +952,15 @@ async fn get_cookies(
     let now = now_ms();
     if let Some(cache) = state.lock().await.cookie_cache.as_ref() {
         if now.saturating_sub(cache.fetched_at_ms) < 300_000 {
+            debug_log!(
+                "qzone cookies cache hit: age_ms={}",
+                now.saturating_sub(cache.fetched_at_ms)
+            );
             return Ok(cache.cookies.clone());
         }
     }
 
+    debug_log!("qzone cookies cache miss: fetching via napcat ws");
     let cookies = fetch_cookies_ws(napcat).await?;
     let mut guard = state.lock().await;
     guard.cookie_cache = Some(CookieCache {
@@ -530,6 +971,11 @@ async fn get_cookies(
 }
 
 async fn fetch_cookies_ws(napcat: &NapCatConfig) -> Result<HashMap<String, String>, QzoneError> {
+    debug_log!(
+        "qzone fetch cookies ws: ws_url={} token_present={}",
+        ws_url_for_log(&napcat.ws_url),
+        napcat.access_token.is_some()
+    );
     let ws_url = build_ws_url(&napcat.ws_url, napcat.access_token.as_deref());
     let mut request = ws_url
         .into_client_request()
@@ -544,6 +990,7 @@ async fn fetch_cookies_ws(napcat: &NapCatConfig) -> Result<HashMap<String, Strin
     let (ws_stream, _) = connect_async(request)
         .await
         .map_err(|err| QzoneError::network(format!("napcat ws connect failed: {}", err)))?;
+    debug_log!("qzone fetch cookies ws connected");
     let (mut ws_write, mut ws_read) = ws_stream.split();
     let echo = format!("echo-{}", now_ms());
     let payload = serde_json::json!({
@@ -551,6 +998,7 @@ async fn fetch_cookies_ws(napcat: &NapCatConfig) -> Result<HashMap<String, Strin
         "params": { "domain": "qzone.qq.com" },
         "echo": echo,
     });
+    debug_log!("qzone fetch cookies ws send request: echo={}", echo);
     ws_write
         .send(tokio_tungstenite::tungstenite::Message::Text(
             payload.to_string(),
@@ -577,6 +1025,7 @@ async fn fetch_cookies_ws(napcat: &NapCatConfig) -> Result<HashMap<String, Strin
                 .and_then(|data| data.get("cookies"))
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| QzoneError::network("napcat response missing cookies"))?;
+            debug_log!("qzone fetch cookies ws received response");
             return Ok(cookie_str.to_string());
         }
         Err(QzoneError::network("napcat ws closed"))
@@ -597,6 +1046,11 @@ fn build_ws_url(base: &str, token: Option<&str>) -> String {
     } else {
         base.to_string()
     }
+}
+
+#[cfg(debug_assertions)]
+fn ws_url_for_log(url: &str) -> &str {
+    url.split('?').next().unwrap_or(url)
 }
 
 fn now_ms() -> i64 {
@@ -669,8 +1123,12 @@ async fn collect_images(client: &QzoneClient, draft: &Draft) -> Result<Vec<Vec<u
         } = block
         {
             let bytes = match reference {
-                MediaReference::RemoteUrl { url } => client.fetch_image_bytes(url).await?,
+                MediaReference::RemoteUrl { url } => {
+                    debug_log!("qzone collect image: url={}", url);
+                    client.fetch_image_bytes(url).await?
+                }
                 MediaReference::Blob { .. } => {
+                    debug_log!("qzone collect image: blob reference not supported");
                     return Err(QzoneError::unknown("blob media not supported in qzone sender"))
                 }
             };

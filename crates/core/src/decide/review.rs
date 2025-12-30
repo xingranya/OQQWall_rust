@@ -103,6 +103,15 @@ pub fn decide_review_action(
             }));
             events
         }
+        ReviewAction::ToggleAnonymous => vec![Event::Review(ReviewEvent::ReviewAnonToggled {
+            review_id,
+        })],
+        ReviewAction::ExpandAudit => vec![Event::Review(ReviewEvent::ReviewExpandRequested {
+            review_id,
+        })],
+        ReviewAction::Show => vec![Event::Review(ReviewEvent::ReviewDisplayRequested {
+            review_id,
+        })],
         ReviewAction::Comment { text } => vec![Event::Review(ReviewEvent::ReviewCommentAdded {
             review_id,
             text: text.clone(),
@@ -115,6 +124,12 @@ pub fn decide_review_action(
             review_id,
             reason: reason.clone(),
         })],
+        ReviewAction::QuickReply { key } => vec![Event::Review(
+            ReviewEvent::ReviewQuickReplyRequested {
+                review_id,
+                key: key.clone(),
+            },
+        )],
     }
 }
 

@@ -44,13 +44,35 @@ logs/                    # 可选：文件日志
 ### 2.2 配置文件
 - `config.json` 必须存在并可读
 - 必填字段检查：
-  - `common.napcat_access_token`（或环境变量 `NAPCAT_ACCESS_TOKEN`）
-  - 每个 group 的 `mangroupid / mainqqid / mainqq_http_port`
+  - 每个 group 的 `napcat_ws_url / napcat_access_token`
+  - 每个 group 的 `mangroupid / mainqqid`
 - 建议先用：
   - `OQQWall_RUST doctor --config ./config.json`（如果已实现）
   - 或临时增加一个 `--check-config` 子命令（推荐实现）
 
-### 2.3 NapCat 模式确认
+### 2.3 调试配置（仅 debug build 生效）
+
+`devconfig.json` 用于调试选项，**仅在 debug build 下读取**，release build 会忽略。
+
+最小示例：
+
+```json
+{
+  "use-virt-qzone": false
+}
+```
+
+字段说明：
+
+* `use-virt-qzone`：true 时启用虚拟 QQ 空间发送（不会真实发布）。
+
+虚拟发送使用内置模拟器（debug build 内置 HTTP 服务）：
+
+* 访问 `http://127.0.0.1:18080/` 查看发送记录
+* 数据接口：`http://127.0.0.1:18080/data`
+* 记录只保存在内存中（默认保留最近 50 条），重启后清空
+
+### 2.4 NapCat 模式确认
 两种模式任选其一：
 
 #### A) managed（推荐）
@@ -86,7 +108,7 @@ ExecStart=/opt/OQQWall_RUST/OQQWall_RUST run --config /opt/OQQWall_RUST/config.j
 Restart=always
 RestartSec=2
 # 可选：把 token 放 env，不写入 config.json
-Environment=NAPCAT_ACCESS_TOKEN=REDACTED
+Environment=OQQWALL_NAPCAT_TOKEN=REDACTED
 # 建议限制资源（按机器情况调整）
 # MemoryMax=2G
 # CPUQuota=200%
@@ -241,7 +263,7 @@ journalctl -u OQQWall_RUST -n 200 --no-pager
 排查步骤：
 
 1. 看日志是否出现 `OneBotConnected/Disconnected`（或类似）
-2. 检查 token：`NAPCAT_ACCESS_TOKEN` 与 config 是否一致
+2. 检查 token：`OQQWALL_NAPCAT_TOKEN` 与 config 是否一致
 3. external 模式下，用 curl 测 OneBot 端口
 4. managed 模式下，检查 NapCat 子进程是否被拉起（日志中有 pid）
 
@@ -358,7 +380,7 @@ journalctl -u OQQWall_RUST -n 200 --no-pager
 
 ## 10. 安全建议
 
-* `napcat_access_token` 建议用环境变量提供，避免落盘
+* `napcat_access_token` 建议用环境变量提供，避免落盘（`OQQWALL_NAPCAT_TOKEN`）
 * web review（admin web）只绑定内网（或加 basic auth）
 * 日志中避免打印 token、cookie、完整私密内容（做脱敏）
 

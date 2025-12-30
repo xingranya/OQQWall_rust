@@ -1,0 +1,20 @@
+{
+  "common": {
+    "process_waittime_sec": 20,
+    "render_png": false,
+    "tz_offset_minutes": 480
+  },
+  "groups": {
+    "default": {
+      "individual_image_in_posts": true,
+      "mainqqid": "3995477265",
+      "mangroupid": "993802974",
+      "max_image_number_one_post": 30,
+      "max_post_stack": 1,
+      "minorqqid": [],
+      "napcat_access_token": "admin147",
+      "napcat_ws_url": "ws://127.0.0.1:3001/ws"
+    }
+  },
+  "schema_version": 1
+}

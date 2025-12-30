@@ -7,6 +7,7 @@ pub enum Command {
     Ingress(IngressCommand),
     Tick(TickCommand),
     ReviewAction(ReviewActionCommand),
+    GlobalAction(GlobalActionCommand),
     DriverEvent(Event),
 }
 
@@ -47,7 +48,41 @@ pub enum ReviewAction {
     Refresh,
     Rerender,
     SelectAllMessages,
+    ToggleAnonymous,
+    ExpandAudit,
+    Show,
     Comment { text: String },
     Reply { text: String },
     Blacklist { reason: Option<String> },
+    QuickReply { key: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalActionCommand {
+    pub group_id: GroupId,
+    pub action: GlobalAction,
+    pub operator_id: String,
+    pub now_ms: TimestampMs,
+    pub tz_offset_minutes: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GlobalAction {
+    Help,
+    Recall { review_code: ReviewCode },
+    Info { review_code: ReviewCode },
+    ManualRelogin,
+    AutoRelogin,
+    PendingList,
+    PendingClear,
+    SendQueueClear,
+    SendQueueFlush,
+    BlacklistList,
+    BlacklistRemove { sender_id: String },
+    SetExternalNumber { value: u64 },
+    QuickReplyList,
+    QuickReplyAdd { key: String, text: String },
+    QuickReplyDelete { key: String },
+    SelfCheck,
+    SystemRepair,
 }

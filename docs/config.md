@@ -12,7 +12,7 @@
 原版主要有两类配置源：
 
 1) **全局配置（KV 文件）**：`oqqwall.config`  
-- `serv.py` 读取 `oqqwall.config`（key=value + #注释），并要求必须有 `napcat_access_token`，且允许环境变量 `NAPCAT_ACCESS_TOKEN` 兜底  
+- `serv.py` 读取 `oqqwall.config`（key=value + #注释），并要求必须有 `napcat_access_token`，原版允许 env 兜底；Rust 版改为每组配置 `napcat_access_token`，并支持 `OQQWALL_NAPCAT_TOKEN` 全局覆盖  
 - `sendcontrol.sh` 也固定把全局配置文件名写为 `oqqwall.config`，并从中读取 `max_attempts_qzone_autologin`、`at_unprived_sender`，且给出默认值与校验逻辑
 
 2) **账号组配置（JSON 文件）**：`AcountGroupcfg.json`  
@@ -63,17 +63,16 @@
 
 ## 3. 字段命名规范与“别名”兼容策略（非常重要）
 
-原版很多 key 用 `-`（例如 `force_chromium_no-sandbox`、`http-serv-port`），你当前 JSON 样例用 snake_case（例如 `force_chromium_no_sandbox`）。
+原版很多 key 用 `-`（例如 `force_chromium_no-sandbox`），你当前 JSON 样例用 snake_case（例如 `force_chromium_no_sandbox`）。
 
 **Rust 版规范：配置 JSON 内推荐统一 snake_case**，并通过 `alias` 兼容旧 key：
 
-* `http_serv_port` 兼容 `http-serv-port`（原版 `serv.py` 最后读取 `http-serv-port` 作为端口键）
 * `force_chromium_no_sandbox` 兼容 `force_chromium_no-sandbox`（原版 `preprocess.sh` 读取的是带 `-` 的 key）
 * `process_waittime_sec` 兼容 `process_waittime`（原版键名；冲突处理见下）
 
 实现建议（Rust / serde）：
 
-* 使用 `#[serde(alias="http-serv-port")]`、`#[serde(alias="force_chromium_no-sandbox")]`、`#[serde(alias="process_waittime")]`
+* 使用 `#[serde(alias="force_chromium_no-sandbox")]`、`#[serde(alias="process_waittime")]`
 * 对布尔/数字做“宽松解析”：允许 `"false"`/`false`、`"3"`/`3`（你的样例里大量数值与 bool 是字符串）
 
 ---
@@ -87,7 +86,6 @@
 
 | JSON Key (snake_case)        | 兼容别名                         |     类型 |                默认 | 原版语义/参考                                               |
 | ---------------------------- | ---------------------------- | -----: | ----------------: | ----------------------------------------------------- |
-| napcat_access_token          | napcat_access_token          | string | **必填**（也可 env 覆盖） | `serv.py` 必须配置，否则报错；也支持 env `NAPCAT_ACCESS_TOKEN` 兜底  |
 | manage_napcat_internal       | manage_napcat_internal       |   bool |             false | 是否由系统内部管理 NapCat/QQ（原版有同名配置提示）                        |
 | renewcookies_use_napcat      | renewcookies_use_napcat      |   bool |              true | 续 cookies 逻辑使用 NapCat 版本/非 NapCat 版本（原版提示）            |
 | render_png | render_png | bool | false | 是否同时渲染 PNG；默认只产出 SVG（腾讯 QQ/空间接口可直接接受 SVG），开启后审核群可直接收到 PNG 图 |
@@ -96,45 +94,38 @@
 | friend_request_window_sec    | friend_request_window_sec    |    u32 |               300 | 好友请求/私聊抑制窗口（原版 TUI 提示）                                |
 | use_web_review               | use_web_review               |   bool |             false | 是否启用网页审核面板（原版提示）                                      |
 | web_review_port              | web_review_port              |    u16 |             10923 | 网页审核监听端口（原版提示）                                        |
-| http_serv_port               | http-serv-port               |    u16 |              8000 | 原版 `serv.py` 最终用 `http-serv-port` 决定 HTTP 端口          |
 | process_waittime_sec         | process_waittime             |    u32 |                20 | 原版 `preprocess.sh` 读取 `process_waittime`（秒）           |
-| force_chromium_no_sandbox    | force_chromium_no-sandbox    |   bool |             false | 原版根据此 key 决定 Chrome 是否加 `--no-sandbox`                |
 
 关于 `process_waittime_sec` / `process_waittime`：
-
-* 若两者同时存在且值不一致：启动时报错退出（避免误配）
-* 若仅存在旧键：打印一次 warning，并在 `EffectiveConfig` 中归一化为 `_sec`
-
-> 目前你说 AI 不做，那么 `apikey/text_model/vision_model/...` 这些可以留在 schema 中但运行时忽略；原版仍在 TUI 中列出这些键 。
-
+强制只允许process_waittime_sec
 ### 4.2 环境变量覆盖优先级（推荐）
 
-* `NAPCAT_ACCESS_TOKEN` > `config.json.common.napcat_access_token`
-  理由：原版 `serv.py` 允许 `os.getenv('NAPCAT_ACCESS_TOKEN')` 兜底 。
+* `OQQWALL_NAPCAT_TOKEN` > `groups.<id>.napcat_access_token`（全局覆盖所有组）
+* `OQQWALL_NAPCAT_WS_URL` > `groups.<id>.napcat_ws_url`（全局覆盖所有组）
 
 ---
 
 ## 5. groups（账号组配置）字段说明
 
-> 原版 TUI 列出了组配置键顺序（GROUP_CONFIG_ORDER），覆盖了主要字段：mangroupid/mainqqid/端口/阈值/send_schedule/quick_replies/admins 。
+> 原版 TUI 列出了组配置键顺序（GROUP_CONFIG_ORDER），覆盖了主要字段：mangroupid/mainqqid/阈值/send_schedule/quick_replies/admins 。
 
 ### 5.1 字段表（每个 group 对象）
 
 | JSON Key                  |                         类型 | 默认/规则            | 原版行为/参考                                                         |
 | ------------------------- | -------------------------: | ---------------- | --------------------------------------------------------------- |
 | mangroupid                |                     string | 必填               | 用于识别/管理群（`serv.py` 把它加入受管群集合）                                   |
-| mainqqid                  |                     string | 必填               | 主账号 QQ 号，用于端口映射、组归属等                                            |
-| mainqq_http_port          |                 string/u16 | 必填               | 主账号对应 NapCat/OneBot HTTP 端口（原版多处取此字段）                           |
-| minorqqid                 |              array[string] | 可空               | 副账号 QQ 列表，注意长度可与端口数组不一致（原版 TUI 明确“按较短长度对齐”）                     |
-| minorqq_http_port         |          array[string/u16] | 可空               | 副账号端口数组，同上                                                      |
+| napcat_ws_url             |                     string | 必填               | 本组 NapCat OneBot WS 地址                                          |
+| napcat_access_token       |                     string | 必填（可 env 覆盖）   | 本组 NapCat token；可用 `OQQWALL_NAPCAT_TOKEN` 覆盖                 |
+| mainqqid                  |                     string | 必填               | 主账号 QQ 号，用于组归属等                                                 |
+| minorqqid                 |              array[string] | 可空               | 副账号 QQ 列表                                                       |
 | max_post_stack            |                        int | 默认 1；只允许正整数（1 表示单条直接发送，>1 启用暂存堆栈） | sendcontrol 对此字段做默认值与数字校验                                       |
 | max_image_number_one_post |                        int | 默认 30；只允许正整数     | sendcontrol 同样校验并默认                                             |
 | individual_image_in_posts |                       bool | 默认 true          | preprocess 缺省为 true，决定是否把用户原图也拷贝到 prepost（组策略）                  |
 | send_schedule             |             array["HH:MM"] | 默认空（不启用定时 flush） | sendcontrol scheduler 从该字段读出 HH:MM 列表并按分钟触发 flush；同一时间点当日只触发一次  |
-| watermark_text            |                     string | 默认 ""            | 原版用于渲染/展示（Rust 可保留用于 SVG 主题）                                    |
-| friend_add_message        |                     string | 默认 ""            | 原版用于自动通过好友申请后发送文本（你样例包含）                                        |
-| quick_replies             |     object{string->string} | 默认 {}            | 原版用于快捷回复，并在 processsend 做“快捷回复指令名冲突检测”                          |
-| admins                    | array[{username,password}] | 默认 []            | 原版用于 web_review 管理员（你样例包含）                                      |
+| watermark_text            |                     string | 默认 ""            | 用于渲染/展示（Rust 可保留用于 SVG 主题）                                    |
+| friend_add_message        |                     string | 默认 ""            | 用于自动通过好友申请后发送文本（你样例包含）                                        |
+| quick_replies             |     object{string->string} | 默认 {}            | 用于快捷回复              |
+| admins                    | array[{username,password}] | 默认 []            | 用于 web_review 管理员）                                      |
 
 ### 5.2 send_schedule 的语义（必须写清楚）
 
@@ -159,14 +150,12 @@ Rust 版落地建议：
 
 * 解析 bool：`"true"/"false"` 与 `true/false` 都接受
 * 解析 int：`"3"` 与 `3` 都接受（你的样例是字符串）
-* 解析端口：字符串/数字 → u16，范围校验 1..65535
 * 解析 `send_schedule`：`HH:MM` 校验并转换为 `minutes_of_day`（0..1439）
-* 对 `minorqqid` 与 `minorqq_http_port`：按较短长度对齐（原版 TUI 明确此规则）
 * 应用默认值（参考原版 defaults：sendcontrol 的默认 max_attempts/max_post_stack/max_image_number 等）
 
 ### 6.2 校验失败策略（建议）
 
-* **启动时**：关键字段缺失（如 napcat_access_token、mangroupid、mainqqid、端口）→ 直接报错退出
+* **启动时**：关键字段缺失（如 napcat_ws_url、napcat_access_token、mangroupid、mainqqid）→ 直接报错退出
 * **热更新时**：新配置解析失败 → 保留旧 `EffectiveConfig`，并发出告警/日志
 
 ---
@@ -210,7 +199,6 @@ Rust 版落地建议：
 {
   "schema_version": 1,
   "common": {
-    "napcat_access_token": "REDACTED",
     "manage_napcat_internal": false,
     "renewcookies_use_napcat": true,
     "max_attempts_qzone_autologin": 3,
@@ -219,16 +207,15 @@ Rust 版落地建议：
     "friend_request_window_sec": 300,
     "use_web_review": true,
     "web_review_port": 10923,
-    "process_waittime_sec": 20,
-    "http_serv_port": 8000
+    "process_waittime_sec": 20
   },
   "groups": {
     "MethGroup": {
       "mangroupid": "993802974",
+      "napcat_ws_url": "ws://127.0.0.1:8081",
+      "napcat_access_token": "REDACTED",
       "mainqqid": "3995477265",
-      "mainqq_http_port": 3000,
       "minorqqid": [],
-      "minorqq_http_port": [],
       "max_post_stack": 3,
       "max_image_number_one_post": 9,
       "individual_image_in_posts": false,
@@ -258,7 +245,7 @@ Rust 版落地建议：
 
 * 读取 KV（原版 `read_config` 语义：去掉 `#` 注释，按 `=` 分割）
 * 读取 `AcountGroupcfg.json` 作为 groups
-* 处理 key alias（`http-serv-port`→`http_serv_port`、`force_chromium_no-sandbox`→`force_chromium_no_sandbox`）
+* 处理 key alias（`force_chromium_no-sandbox`→`force_chromium_no_sandbox`）
 * 输出统一 JSON
 
 ---
@@ -268,8 +255,7 @@ Rust 版落地建议：
 * [ ] serde 结构：Raw + Effective 两层
 * [ ] 宽松解析：bool/int/string 兼容（样例里大量是 string）
 * [ ] schedule 解析：支持 `HH:MM`，并在 EffectiveConfig 中转成 minutes_of_day
-* [ ] minor id/port 对齐：按 min(len(ids),len(ports))（原版 TUI 规则）
-* [ ] env 覆盖：NAPCAT_ACCESS_TOKEN 优先（原版行为）
+* [ ] env 覆盖：OQQWALL_NAPCAT_TOKEN 优先（全组覆盖）
 * [ ] config 变更：ConfigApplied 事件 +（可选）config_blob 入 BlobStore
 * [ ] core 不直接读文件、不直接读 env（只接受 `&EffectiveConfig`）
 

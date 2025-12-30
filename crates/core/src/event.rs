@@ -194,9 +194,22 @@ pub enum ReviewEvent {
     ReviewSelectAllRequested {
         review_id: ReviewId,
     },
+    ReviewAnonToggled {
+        review_id: ReviewId,
+    },
+    ReviewExpandRequested {
+        review_id: ReviewId,
+    },
+    ReviewDisplayRequested {
+        review_id: ReviewId,
+    },
     ReviewBlacklistRequested {
         review_id: ReviewId,
         reason: Option<String>,
+    },
+    ReviewQuickReplyRequested {
+        review_id: ReviewId,
+        key: String,
     },
 }
 

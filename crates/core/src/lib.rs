@@ -7,7 +7,10 @@ pub mod ids;
 pub mod reduce;
 pub mod state;
 
-pub use command::{Command, IngressCommand, ReviewAction, ReviewActionCommand, TickCommand};
+pub use command::{
+    Command, GlobalAction, GlobalActionCommand, IngressCommand, ReviewAction, ReviewActionCommand,
+    TickCommand,
+};
 pub use config::{CoreConfig, GroupConfig, TimeWindow};
 pub use decide::builder::build_draft_from_messages;
 pub use draft::{

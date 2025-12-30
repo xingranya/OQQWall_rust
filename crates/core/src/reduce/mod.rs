@@ -304,7 +304,11 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
         | ReviewEvent::ReviewRefreshRequested { .. }
         | ReviewEvent::ReviewRerenderRequested { .. }
         | ReviewEvent::ReviewSelectAllRequested { .. }
-        | ReviewEvent::ReviewBlacklistRequested { .. } => {}
+        | ReviewEvent::ReviewAnonToggled { .. }
+        | ReviewEvent::ReviewExpandRequested { .. }
+        | ReviewEvent::ReviewDisplayRequested { .. }
+        | ReviewEvent::ReviewBlacklistRequested { .. }
+        | ReviewEvent::ReviewQuickReplyRequested { .. } => {}
     }
 }
 

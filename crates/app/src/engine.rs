@@ -4,6 +4,18 @@ use oqqwall_rust_core::decide::decide;
 use oqqwall_rust_core::{ActorId, Command, CoreConfig, Event, EventEnvelope, Id128, StateView};
 use tokio::sync::{broadcast, mpsc};
 
+#[cfg(debug_assertions)]
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        eprintln!($($arg)*);
+    };
+}
+
+#[cfg(not(debug_assertions))]
+macro_rules! debug_log {
+    ($($arg:tt)*) => {};
+}
+
 pub struct Engine {
     state: StateView,
     config: CoreConfig,
@@ -40,19 +52,34 @@ impl Engine {
             next_event_id: 1,
             actor: Id128(1),
         };
+        debug_log!("engine init: groups={}", engine.config.groups.len());
         (engine, handle)
     }
 
     pub async fn run(mut self) {
+        debug_log!("engine loop started");
         while let Some(cmd) = self.cmd_rx.recv().await {
+            if !matches!(cmd, Command::Tick(_)) {
+                debug_log!("engine cmd: {:?}", cmd);
+            }
             let events = decide(&self.state, &cmd, &self.config);
+            if !events.is_empty() {
+                debug_log!("engine produced {} event(s)", events.len());
+                for event in &events {
+                    debug_log!("engine event: {:?}", event);
+                }
+            }
             for event in events {
                 let env = self.envelope(event);
                 // TODO: journal append goes here.
                 self.state = self.state.reduce(&env);
-                let _ = self.bus.send(env);
+                let send_result = self.bus.send(env);
+                if send_result.is_err() {
+                    debug_log!("engine event bus send failed");
+                }
             }
         }
+        debug_log!("engine loop ended");
     }
 
     fn envelope(&mut self, event: Event) -> EventEnvelope {
