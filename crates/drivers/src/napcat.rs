@@ -1065,7 +1065,8 @@ fn image_source_from_attachment(attachment: &IngressAttachment) -> Option<String
 
 fn rendered_png_preview(post_id: PostId) -> Option<String> {
     let path = rendered_png_path(post_id);
-    if !path.exists() {
+    let meta = fs::metadata(&path).ok()?;
+    if meta.len() == 0 {
         return None;
     }
     Some(file_uri_from_path(&path))

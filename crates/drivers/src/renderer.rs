@@ -880,7 +880,18 @@ fn persist_blob(
         .map_err(|err| format!("create blob dir failed: {}", err))?;
     let filename = format!("{}.{}", id128_hex(blob_id.0), ext);
     let path = dir.join(filename);
-    fs::write(&path, bytes).map_err(|err| format!("write blob failed: {}", err))?;
+    let tmp_path = dir.join(format!("{}.{}.tmp", id128_hex(blob_id.0), ext));
+    fs::write(&tmp_path, bytes).map_err(|err| format!("write blob failed: {}", err))?;
+    if let Err(err) = fs::rename(&tmp_path, &path) {
+        if err.kind() == std::io::ErrorKind::AlreadyExists {
+            fs::remove_file(&path)
+                .map_err(|err| format!("cleanup blob failed: {}", err))?;
+            fs::rename(&tmp_path, &path)
+                .map_err(|err| format!("rename blob failed: {}", err))?;
+        } else {
+            return Err(format!("rename blob failed: {}", err));
+        }
+    }
     let size_bytes = bytes.len() as u64;
     Ok((path.to_string_lossy().to_string(), size_bytes))
 }

@@ -4,17 +4,22 @@ use std::fs;
 use std::io::{Read, Write};
 #[cfg(debug_assertions)]
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
-use oqqwall_rust_core::draft::{Draft, DraftBlock, MediaKind, MediaReference};
-use oqqwall_rust_core::event::{BlobEvent, DraftEvent, Event, SendEvent};
-use oqqwall_rust_core::ids::{BlobId, PostId, TimestampMs};
-use oqqwall_rust_core::Command;
+use oqqwall_rust_core::draft::{
+    Draft, DraftBlock, IngressMessage, MediaKind, MediaReference,
+};
+use oqqwall_rust_core::event::{
+    BlobEvent, DraftEvent, Event, IngressEvent, MediaEvent, RenderEvent,
+    RenderFormat, SendEvent,
+};
+use oqqwall_rust_core::ids::{BlobId, IngressId, PostId, TimestampMs};
+use oqqwall_rust_core::{build_draft_from_messages, derive_blob_id, Command};
 use reqwest::Client;
 #[cfg(debug_assertions)]
 use serde::Serialize;
@@ -106,11 +111,30 @@ struct QzoneState {
     attempts: HashMap<PostId, u32>,
     cookie_cache: Option<CookieCache>,
     blob_paths: HashMap<BlobId, String>,
+    ingress_messages: HashMap<IngressId, IngressMessage>,
+    post_ingress: HashMap<PostId, Vec<IngressId>>,
+    render_blobs: HashMap<PostId, RenderBlobs>,
+}
+
+impl QzoneState {
+    fn register_media_reference(&mut self, ingress_id: IngressId, idx: usize, blob_id: BlobId) {
+        if let Some(message) = self.ingress_messages.get_mut(&ingress_id) {
+            if let Some(attachment) = message.attachments.get_mut(idx) {
+                attachment.reference = MediaReference::Blob { blob_id };
+            }
+        }
+    }
 }
 
 struct CookieCache {
     cookies: HashMap<String, String>,
     fetched_at_ms: TimestampMs,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct RenderBlobs {
+    svg: Option<BlobId>,
+    png: Option<BlobId>,
 }
 
 #[cfg(debug_assertions)]
@@ -163,7 +187,30 @@ pub fn spawn_qzone_sender(
             };
 
             match env.event {
-                Event::Draft(DraftEvent::PostDraftCreated { post_id, draft, .. }) => {
+                Event::Ingress(IngressEvent::MessageAccepted {
+                    ingress_id, message, ..
+                }) => {
+                    let mut guard = state.lock().await;
+                    guard.ingress_messages.insert(ingress_id, message);
+                }
+                Event::Ingress(IngressEvent::MessageIgnored { ingress_id, .. }) => {
+                    let mut guard = state.lock().await;
+                    guard.ingress_messages.remove(&ingress_id);
+                }
+                Event::Media(MediaEvent::MediaFetchSucceeded {
+                    ingress_id,
+                    attachment_index,
+                    blob_id,
+                }) => {
+                    let mut guard = state.lock().await;
+                    guard.register_media_reference(ingress_id, attachment_index, blob_id);
+                }
+                Event::Draft(DraftEvent::PostDraftCreated {
+                    post_id,
+                    draft,
+                    ingress_ids,
+                    ..
+                }) => {
                     debug_log!(
                         "qzone draft cached: post_id={} blocks={}",
                         post_id.0,
@@ -171,6 +218,7 @@ pub fn spawn_qzone_sender(
                     );
                     let mut guard = state.lock().await;
                     guard.drafts.insert(post_id, draft);
+                    guard.post_ingress.insert(post_id, ingress_ids);
                 }
                 Event::Blob(BlobEvent::BlobPersisted { blob_id, path }) => {
                     let mut guard = state.lock().await;
@@ -180,6 +228,26 @@ pub fn spawn_qzone_sender(
                 | Event::Blob(BlobEvent::BlobGcRequested { blob_id }) => {
                     let mut guard = state.lock().await;
                     guard.blob_paths.remove(&blob_id);
+                }
+                Event::Render(RenderEvent::SvgReady { post_id, blob_id }) => {
+                    let mut guard = state.lock().await;
+                    let entry = guard.render_blobs.entry(post_id).or_default();
+                    entry.svg = Some(blob_id);
+                }
+                Event::Render(RenderEvent::PngReady { post_id, blob_id }) => {
+                    let mut guard = state.lock().await;
+                    let entry = guard.render_blobs.entry(post_id).or_default();
+                    entry.png = Some(blob_id);
+                }
+                Event::Render(RenderEvent::RenderFailed {
+                    post_id, format, ..
+                }) => {
+                    let mut guard = state.lock().await;
+                    let entry = guard.render_blobs.entry(post_id).or_default();
+                    match format {
+                        RenderFormat::Svg => entry.svg = None,
+                        RenderFormat::Png => entry.png = None,
+                    }
                 }
                 Event::Send(SendEvent::SendStarted {
                     post_id,
@@ -212,11 +280,12 @@ pub fn spawn_qzone_sender(
                             let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
                             continue;
                         };
-                        let (draft, blob_paths) = {
+                        let (draft, blob_paths, preview_blobs) = {
                             let guard = state.lock().await;
                             (
-                                guard.drafts.get(&post_id).cloned(),
+                                resolve_draft_for_send(&guard, post_id),
                                 guard.blob_paths.clone(),
+                                render_preview_blobs(&guard, post_id),
                             )
                         };
                         let Some(draft) = draft else {
@@ -234,8 +303,27 @@ pub fn spawn_qzone_sender(
                             let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
                             continue;
                         };
+                        if preview_blobs.is_empty() {
+                            debug_log!(
+                                "emuqzone send failed: missing render preview post_id={}",
+                                post_id.0
+                            );
+                            let err = QzoneError::unknown("missing render preview");
+                            let retry_at = started_at_ms
+                                .saturating_add(retry_delay_ms(err.kind, 1));
+                            let event = SendEvent::SendFailed {
+                                post_id,
+                                account_id,
+                                attempt: 1,
+                                retry_at_ms: retry_at,
+                                error: format!("[{:?}] {}", err.kind, err.message),
+                            };
+                            let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
+                            continue;
+                        }
                         let content = draft_to_text(&draft);
-                        let images = match collect_emuqzone_images(&draft, &blob_paths) {
+                        let images =
+                            match collect_emuqzone_images(&draft, &blob_paths, &preview_blobs) {
                             Ok(images) => images,
                             Err(err) => {
                                 debug_log!(
@@ -343,11 +431,12 @@ pub fn spawn_qzone_sender(
                             continue;
                         }
                     };
-                    let (draft, blob_paths) = {
+                    let (draft, blob_paths, preview_blobs) = {
                         let guard = state.lock().await;
                         (
-                            guard.drafts.get(&post_id).cloned(),
+                            resolve_draft_for_send(&guard, post_id),
                             guard.blob_paths.clone(),
+                            render_preview_blobs(&guard, post_id),
                         )
                     };
                     let Some(draft) = draft else {
@@ -365,9 +454,29 @@ pub fn spawn_qzone_sender(
                         let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
                         continue;
                     };
+                    if preview_blobs.is_empty() {
+                        debug_log!(
+                            "qzone send failed: missing render preview post_id={}",
+                            post_id.0
+                        );
+                        let err = QzoneError::unknown("missing render preview");
+                        let retry_at =
+                            started_at_ms.saturating_add(retry_delay_ms(err.kind, 1));
+                        let event = SendEvent::SendFailed {
+                            post_id,
+                            account_id,
+                            attempt: 1,
+                            retry_at_ms: retry_at,
+                            error: format!("[{:?}] {}", err.kind, err.message),
+                        };
+                        let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
+                        continue;
+                    }
 
                     let content = draft_to_text(&draft);
-                    let images = match collect_images(&client, &draft, &blob_paths).await {
+                    let images =
+                        match collect_images(&draft, &blob_paths, &preview_blobs).await
+                        {
                         Ok(images) => images,
                         Err(err) => {
                             debug_log!(
@@ -634,46 +743,6 @@ impl QzoneClient {
         Ok(json)
     }
 
-    async fn fetch_image_bytes(&self, source: &str) -> Result<Vec<u8>, QzoneError> {
-        debug_log!("qzone fetch image: source={}", source);
-        if let Some(encoded) = source.strip_prefix("base64://") {
-            debug_log!("qzone fetch image: base64 payload");
-            return STANDARD
-                .decode(encoded)
-                .map_err(|err| QzoneError::unknown(format!("invalid base64 image: {}", err)));
-        }
-        if let Some(path) = source.strip_prefix("file://") {
-            debug_log!("qzone fetch image: file path={}", path);
-            return fs::read(path)
-                .map_err(|err| QzoneError::unknown(format!("read file failed: {}", err)));
-        }
-        if source.starts_with("http://") || source.starts_with("https://") {
-            debug_log!("qzone fetch image: http url");
-            let res = self
-                .client
-                .get(source)
-                .send()
-                .await
-                .map_err(|err| classify_reqwest_error("download image", err))?;
-            if !res.status().is_success() {
-                return Err(classify_http_status(
-                    "download image http status",
-                    res.status().as_u16(),
-                ));
-            }
-            let bytes = res
-                .bytes()
-                .await
-                .map_err(|err| classify_reqwest_error("read image bytes", err))?;
-            return Ok(bytes.to_vec());
-        }
-        if Path::new(source).exists() {
-            debug_log!("qzone fetch image: local path={}", source);
-            return fs::read(source)
-                .map_err(|err| QzoneError::unknown(format!("read file failed: {}", err)));
-        }
-        Err(QzoneError::unknown("unsupported image source"))
-    }
 }
 
 fn draft_to_text(draft: &Draft) -> String {
@@ -702,27 +771,177 @@ fn draft_to_text(draft: &Draft) -> String {
     parts.join("\n\n")
 }
 
+fn resolve_draft_for_send(state: &QzoneState, post_id: PostId) -> Option<Draft> {
+    if let Some(ingress_ids) = state.post_ingress.get(&post_id) {
+        let mut messages = Vec::new();
+        for ingress_id in ingress_ids {
+            let Some(message) = state.ingress_messages.get(ingress_id) else {
+                return state.drafts.get(&post_id).cloned();
+            };
+            messages.push(message.clone());
+        }
+        if !messages.is_empty() {
+            return Some(build_draft_from_messages(&messages));
+        }
+    }
+    state.drafts.get(&post_id).cloned()
+}
+
+fn render_preview_blobs(state: &QzoneState, post_id: PostId) -> Vec<BlobId> {
+    let Some(render) = state.render_blobs.get(&post_id) else {
+        return Vec::new();
+    };
+    if let Some(png) = render.png {
+        return vec![png];
+    }
+    if let Some(svg) = render.svg {
+        return vec![svg];
+    }
+    Vec::new()
+}
+
+fn resolve_blob_path(
+    blob_paths: &HashMap<BlobId, String>,
+    blob_id: BlobId,
+) -> Result<String, QzoneError> {
+    blob_paths
+        .get(&blob_id)
+        .cloned()
+        .ok_or_else(|| QzoneError::unknown("missing blob path"))
+}
+
+fn resolve_local_image_path(
+    kind: MediaKind,
+    reference: &MediaReference,
+    blob_paths: &HashMap<BlobId, String>,
+) -> Result<String, QzoneError> {
+    match reference {
+        MediaReference::Blob { blob_id } => resolve_blob_path(blob_paths, *blob_id),
+        MediaReference::RemoteUrl { url } => resolve_remote_image_path(kind, url),
+    }
+}
+
+fn resolve_remote_image_path(kind: MediaKind, source: &str) -> Result<String, QzoneError> {
+    if let Some(path) = source.strip_prefix("file://") {
+        return Ok(path.to_string());
+    }
+    if Path::new(source).exists() {
+        return Ok(source.to_string());
+    }
+    if let Some((mime, bytes)) = decode_inline_source(source)? {
+        let ext = mime
+            .as_deref()
+            .and_then(ext_from_content_type)
+            .unwrap_or_else(|| default_ext_for_kind(kind));
+        return cache_inline_bytes(&bytes, ext);
+    }
+    if source.starts_with("http://") || source.starts_with("https://") {
+        return Err(QzoneError::unknown(
+            "remote http image url not allowed; require local file",
+        ));
+    }
+    Err(QzoneError::unknown("unsupported image source"))
+}
+
+fn decode_inline_source(source: &str) -> Result<Option<(Option<String>, Vec<u8>)>, QzoneError> {
+    if let Some(payload) = source.strip_prefix("data:") {
+        let (meta, data) = payload
+            .split_once(',')
+            .ok_or_else(|| QzoneError::unknown("invalid data url"))?;
+        let mime = meta
+            .split(';')
+            .next()
+            .and_then(|value| (!value.is_empty()).then_some(value.to_string()));
+        let bytes = if meta.contains(";base64") {
+            STANDARD
+                .decode(data)
+                .map_err(|err| QzoneError::unknown(format!("invalid data url base64: {}", err)))?
+        } else {
+            data.as_bytes().to_vec()
+        };
+        return Ok(Some((mime, bytes)));
+    }
+    if let Some(encoded) = source.strip_prefix("base64://") {
+        let bytes = STANDARD
+            .decode(encoded)
+            .map_err(|err| QzoneError::unknown(format!("invalid base64 image: {}", err)))?;
+        return Ok(Some((None, bytes)));
+    }
+    Ok(None)
+}
+
+fn ext_from_content_type(content_type: &str) -> Option<&'static str> {
+    let base = content_type.split(';').next()?.trim().to_ascii_lowercase();
+    match base.as_str() {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
+        "image/svg+xml" => Some("svg"),
+        _ => None,
+    }
+}
+
+fn default_ext_for_kind(kind: MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Image => "png",
+        MediaKind::Video => "mp4",
+        MediaKind::Audio => "mp3",
+        MediaKind::File | MediaKind::Other => "bin",
+    }
+}
+
+fn cache_inline_bytes(bytes: &[u8], ext: &str) -> Result<String, QzoneError> {
+    let ext = ext.trim_start_matches('.');
+    let parts: Vec<&[u8]> = vec![bytes, ext.as_bytes()];
+    let blob_id = derive_blob_id(&parts);
+    let dir = inline_cache_root();
+    fs::create_dir_all(&dir)
+        .map_err(|err| QzoneError::unknown(format!("create inline dir failed: {}", err)))?;
+    let filename = format!("{}.{}", id128_hex(blob_id.0), ext);
+    let path = dir.join(filename);
+    if !path.exists() {
+        fs::write(&path, bytes)
+            .map_err(|err| QzoneError::unknown(format!("write inline image failed: {}", err)))?;
+    }
+    Ok(path.to_string_lossy().to_string())
+}
+
+fn inline_cache_root() -> PathBuf {
+    std::env::var("OQQWALL_BLOB_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("data/blobs"))
+        .join("inline")
+}
+
+fn read_local_image_bytes(path: &str) -> Result<Vec<u8>, QzoneError> {
+    let path = path.strip_prefix("file://").unwrap_or(path);
+    fs::read(path).map_err(|err| QzoneError::unknown(format!("read file failed: {}", err)))
+}
+
+fn id128_hex(value: u128) -> String {
+    format!("{:032x}", value)
+}
+
 #[cfg(debug_assertions)]
 fn collect_emuqzone_images(
     draft: &Draft,
     blob_paths: &HashMap<BlobId, String>,
+    preview_blobs: &[BlobId],
 ) -> Result<Vec<String>, QzoneError> {
     let mut images = Vec::new();
+    for blob_id in preview_blobs {
+        let path = resolve_blob_path(blob_paths, *blob_id)?;
+        images.push(process_emuqzone_image(&path));
+    }
     for block in &draft.blocks {
         if let DraftBlock::Attachment {
             kind: MediaKind::Image,
             reference,
         } = block
         {
-            match reference {
-                MediaReference::RemoteUrl { url } => images.push(process_emuqzone_image(url)),
-                MediaReference::Blob { blob_id } => {
-                    let path = blob_paths
-                        .get(blob_id)
-                        .ok_or_else(|| QzoneError::unknown("missing blob path"))?;
-                    images.push(process_emuqzone_image(path));
-                }
-            }
+            let path = resolve_local_image_path(MediaKind::Image, reference, blob_paths)?;
+            images.push(process_emuqzone_image(&path));
         }
     }
     Ok(images)
@@ -1153,32 +1372,32 @@ fn classify_text_error(message: &str) -> QzoneError {
 }
 
 async fn collect_images(
-    client: &QzoneClient,
     draft: &Draft,
     blob_paths: &HashMap<BlobId, String>,
+    preview_blobs: &[BlobId],
 ) -> Result<Vec<Vec<u8>>, QzoneError> {
-    let mut images = Vec::new();
+    let mut sources = Vec::new();
+    for blob_id in preview_blobs {
+        sources.push(resolve_blob_path(blob_paths, *blob_id)?);
+    }
     for block in &draft.blocks {
         if let DraftBlock::Attachment {
             kind: MediaKind::Image,
             reference,
         } = block
         {
-            let bytes = match reference {
-                MediaReference::RemoteUrl { url } => {
-                    debug_log!("qzone collect image: url={}", url);
-                    client.fetch_image_bytes(url).await?
-                }
-                MediaReference::Blob { blob_id } => {
-                    let path = blob_paths
-                        .get(blob_id)
-                        .ok_or_else(|| QzoneError::unknown("missing blob path"))?;
-                    debug_log!("qzone collect image: blob path={}", path);
-                    client.fetch_image_bytes(path).await?
-                }
-            };
-            images.push(bytes);
+            sources.push(resolve_local_image_path(
+                MediaKind::Image,
+                reference,
+                blob_paths,
+            )?);
         }
+    }
+
+    let mut images = Vec::new();
+    for source in sources {
+        debug_log!("qzone collect image: file={}", source);
+        images.push(read_local_image_bytes(&source)?);
     }
     Ok(images)
 }
