@@ -1,8 +1,8 @@
-# typesetting&render.md — OQQWall_RUST SVG 排版/渲染规范（参考原 gotohtml.sh，全量覆盖）
+# typesetting&render.md — OQQWall_RUST PNG 排版/渲染规范（内部使用 SVG 作为中间表示）
 
-> 目标：用 **Rust 生成纯 SVG**（默认产物），在不依赖浏览器排版引擎的情况下，尽可能复刻原版 `gotohtml.sh` 的页面结构、视觉样式与信息密度。  
+> 目标：用 **Rust 直接输出 PNG**，内部使用 SVG 作为排版/渲染中间表示，在不依赖浏览器排版引擎的情况下，尽可能复刻原版 `gotohtml.sh` 的页面结构、视觉样式与信息密度。  
 > 说明：原版 `gotohtml.sh` 生成 HTML + CSS + JS（含动态页高、水印、卡片、合并转发等），再交给外部渲染链路转成图片。  
-> Rust 版：**直接输出 SVG**（可选再转 PNG，但默认不转），并保证：可复现、可回放、可落地为单二进制内置资源。
+> Rust 版：**直接输出 PNG**（SVG 仅作为内部中间表示），并保证：可复现、可回放、可落地为单二进制内置资源。
 
 ---
 
@@ -26,7 +26,7 @@
 
 ### 0.2 非目标（暂不做/可降级）
 - 不做 AI、分段智能、（渲染只消费结构化输入），匿名需求识别只用regex
-- 不保证 SVG 在所有 QQ 客户端内直接预览（发文本预览或推荐审核用 Web 或转 PNG）
+- 输出为 PNG，不依赖 QQ 客户端 SVG 预览能力
 - emoji/彩色字体若缺字体可降级（见字体策略）
 ---
 
@@ -178,7 +178,7 @@ SVG 没有自动布局引擎；必须手写布局。
 * 所有坐标尽量用整数 px（避免浮点差异导致“同输入不同输出”）
 * 行高用整数：例如 `font_size_md=14`，line-height=1.5 → 行高=21px
 
-### 4.2 Paint Pass（输出 SVG）
+### 4.2 Paint Pass（生成中间 SVG）
 
 读取 LayoutTree，把节点画成：
 
@@ -501,7 +501,7 @@ SVG 复刻规则：
 
 > stampW/stampH 的测量：可用“近似估计”或用字体度量（建议用同一套 font metrics）。
 
-### 8.3 SVG 实现方式
+### 8.3 内部 SVG 实现方式
 
 两种方式：
 
@@ -510,7 +510,7 @@ SVG 复刻规则：
 
 ---
 
-## 9. QR Code 生成与缓存策略（SVG 优先）
+## 9. QR Code 生成与缓存策略（渲染器优先）
 
 ### 9.1 生成方式
 
@@ -530,7 +530,7 @@ SVG 复刻规则：
 
 ---
 
-## 10. 字体与文本度量（SVG 断行的关键）
+## 10. 字体与文本度量（断行关键）
 
 SVG 不会自动换行；必须断行 + 度量。
 
@@ -571,7 +571,7 @@ Rust SVG 建议：
 * 可配置 `max_height_px`（默认 2304）
 * 超过则分页输出：
 
-  * `post_id_p1.svg`, `post_id_p2.svg`…
+  * `post_id_p1.png`, `post_id_p2.png`…
 
 ---
 
@@ -604,7 +604,7 @@ SVG 是 XML，所有用户文本必须：
 
 ### 14.1 推荐 crate
 
-* SVG 构建：`svg`（DOM 风格）或手写字符串 builder（更快）
+* 内部 SVG 构建：`svg`（DOM 风格）或手写字符串 builder（更快）
 * QR：`qrcode` / `qrcodegen`
 * base64：`base64`
 * unicode 分词/换行：`unicode-segmentation`

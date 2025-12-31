@@ -1,9 +1,27 @@
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::pin::Pin;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use oqqwall_rust_core::event::{BlobEvent, Event, RenderEvent, RenderFormat};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use crate::napcat::{extract_message_lite, NapCatConfig};
+use oqqwall_rust_core::event::{BlobEvent, Event, RenderEvent};
 use oqqwall_rust_core::{derive_blob_id, Command, Draft, DraftBlock, PostId, StateView};
+use reqwest::header::CONTENT_TYPE;
+use reqwest::Client;
+use serde_json::{json, Value};
+use skia_safe::canvas::SrcRectConstraint;
+use skia_safe::textlayout::{
+    FontCollection, Paragraph, ParagraphBuilder, ParagraphStyle, TextStyle, TypefaceFontProvider,
+};
+use skia_safe::font_style::{Slant, Weight, Width};
+use skia_safe::{
+    image_filters, Canvas, ClipOp, Color4f, Data, EncodedImageFormat, FontStyle, Image, Paint,
+    PathBuilder, Rect, RRect, SamplingOptions,
+};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::sync::broadcast::error::RecvError;
@@ -20,11 +38,25 @@ macro_rules! debug_log {
     ($($arg:tt)*) => {};
 }
 
+const FORWARD_PREFIX: &str = "[合并转发:";
+const MAX_FORWARD_DEPTH: u32 = 4;
+const MEASURE_MAX_WIDTH: f32 = 10_000.0;
+const FONT_FAMILIES: [&str; 6] = [
+    "PingFang SC",
+    "Apple Color Emoji",
+    "Noto Color Emoji",
+    "Noto Emoji",
+    "Segoe UI Emoji",
+    "sans-serif",
+];
+
 #[derive(Debug, Clone)]
 pub struct RendererRuntimeConfig {
     pub blob_root: PathBuf,
     pub canvas_width_px: u32,
     pub max_height_px: u32,
+    pub napcat_by_group: HashMap<String, NapCatConfig>,
+    pub default_napcat: Option<NapCatConfig>,
 }
 
 impl Default for RendererRuntimeConfig {
@@ -36,6 +68,8 @@ impl Default for RendererRuntimeConfig {
             blob_root,
             canvas_width_px: 384,
             max_height_px: 2304,
+            napcat_by_group: HashMap::new(),
+            default_napcat: None,
         }
     }
 }
@@ -45,12 +79,13 @@ struct HeaderInfo {
     group_id: String,
     user_id: String,
     post_id_hex: String,
+    sender_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 enum BlockKind {
-    Text { lines: Vec<String> },
-    Image { href: Option<String>, clip_id: String },
+    Text { lines: Vec<InlineLine> },
+    Image { image: Option<ResolvedImage> },
     MediaCard {
         lines: Vec<String>,
         icon_text: String,
@@ -64,6 +99,24 @@ enum BlockKind {
 }
 
 #[derive(Debug, Clone)]
+struct InlineLine {
+    runs: Vec<InlineRun>,
+    width: u32,
+}
+
+#[derive(Debug, Clone)]
+enum InlineRun {
+    Text(String),
+    Face { id: String },
+}
+
+#[derive(Debug, Clone)]
+enum InlineAtom {
+    Char(char),
+    Face(String),
+}
+
+#[derive(Debug, Clone)]
 struct BlockLayout {
     x: u32,
     y: u32,
@@ -71,6 +124,83 @@ struct BlockLayout {
     height: u32,
     kind: BlockKind,
 }
+
+#[derive(Debug, Clone)]
+struct ResolvedImage {
+    bytes: Option<Vec<u8>>,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct RenderImageSources {
+    avatar: Option<ResolvedImage>,
+    block_images: Vec<Option<ResolvedImage>>,
+    block_labels: Vec<Option<String>>,
+}
+
+#[derive(Debug, Hash, PartialEq, Eq)]
+struct TextMeasureKey {
+    font_size: u32,
+    font_weight: u32,
+    text: String,
+}
+
+#[derive(Debug)]
+struct TextMeasurer {
+    font_collection: FontCollection,
+    cache: HashMap<TextMeasureKey, u32>,
+}
+
+impl ResolvedImage {
+    fn from_bytes(bytes: Vec<u8>) -> Self {
+        let size = image_size_from_bytes(&bytes);
+        let (width, height) = size.map_or((None, None), |(w, h)| (Some(w), Some(h)));
+        Self {
+            bytes: Some(bytes),
+            width,
+            height,
+        }
+    }
+
+    fn has_bytes(&self) -> bool {
+        self.bytes.as_ref().map(|b| !b.is_empty()).unwrap_or(false)
+    }
+}
+
+impl TextMeasurer {
+    fn new(font_collection: FontCollection) -> Self {
+        Self {
+            font_collection,
+            cache: HashMap::new(),
+        }
+    }
+
+    fn measure_text_width(&mut self, text: &str, font_size: u32, font_weight: u32) -> u32 {
+        if text.is_empty() {
+            return 0;
+        }
+        let key = TextMeasureKey {
+            font_size,
+            font_weight,
+            text: text.to_string(),
+        };
+        if let Some(width) = self.cache.get(&key) {
+            return *width;
+        }
+        let mut ps = ParagraphStyle::new();
+        let ts = build_text_style(font_size, font_weight, Color4f::new(0.0, 0.0, 0.0, 1.0));
+        ps.set_text_style(&ts);
+        let mut builder = ParagraphBuilder::new(&ps, self.font_collection.clone());
+        builder.add_text(text);
+        let mut paragraph = builder.build();
+        paragraph.layout(MEASURE_MAX_WIDTH);
+        let width_px = paragraph.max_intrinsic_width().ceil().max(0.0) as u32;
+        self.cache.insert(key, width_px);
+        width_px
+    }
+}
+
 
 pub fn spawn_renderer(
     cmd_tx: mpsc::Sender<Command>,
@@ -98,14 +228,12 @@ pub fn spawn_renderer(
 
             if let Event::Render(RenderEvent::RenderRequested {
                 post_id,
-                format,
                 attempt,
                 ..
             }) = env.event
             {
                 if let Err(err) =
-                    handle_render_request(&cmd_tx, &state, post_id, format, attempt, &config)
-                        .await
+                    handle_render_request(&cmd_tx, &state, post_id, attempt, &config).await
                 {
                     debug_log!("render failed: post_id={} err={}", post_id.0, err);
                 }
@@ -120,7 +248,6 @@ async fn handle_render_request(
     cmd_tx: &mpsc::Sender<Command>,
     state: &StateView,
     post_id: PostId,
-    format: RenderFormat,
     attempt: u32,
     config: &RendererRuntimeConfig,
 ) -> Result<(), String> {
@@ -130,7 +257,6 @@ async fn handle_render_request(
             return send_render_failed(
                 cmd_tx,
                 post_id,
-                format,
                 attempt,
                 "missing draft for render".to_string(),
             )
@@ -139,24 +265,17 @@ async fn handle_render_request(
     };
 
     let header = extract_header(state, post_id);
-    let svg = render_svg(&draft, &header, config);
-
-    let bytes = match format {
-        RenderFormat::Svg => svg.into_bytes(),
-        RenderFormat::Png => match render_png_async(svg).await {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                return send_render_failed(cmd_tx, post_id, format, attempt, err).await;
-            }
-        },
+    let draft = resolve_forward_draft(&draft, &header, config).await;
+    let image_sources = resolve_image_sources(state, &draft, &header).await;
+    let bytes = match render_png_async(&draft, &header, &image_sources, config).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return send_render_failed(cmd_tx, post_id, attempt, err).await;
+        }
     };
 
-    let blob_id = render_blob_id(post_id, format);
-    let (kind_dir, ext) = match format {
-        RenderFormat::Svg => ("svg", "svg"),
-        RenderFormat::Png => ("png", "png"),
-    };
-    let (path, size_bytes) = persist_blob(&config.blob_root, kind_dir, ext, blob_id, &bytes)?;
+    let blob_id = render_blob_id(post_id);
+    let (path, size_bytes) = persist_blob(&config.blob_root, "png", "png", blob_id, &bytes)?;
 
     send_event(
         cmd_tx,
@@ -175,23 +294,247 @@ async fn handle_render_request(
     )
     .await?;
 
-    let render_event = match format {
-        RenderFormat::Svg => RenderEvent::SvgReady { post_id, blob_id },
-        RenderFormat::Png => RenderEvent::PngReady { post_id, blob_id },
-    };
-    send_event(cmd_tx, Event::Render(render_event)).await?;
+    send_event(cmd_tx, Event::Render(RenderEvent::PngReady { post_id, blob_id })).await?;
 
     Ok(())
+}
+
+struct ForwardContext {
+    client: Client,
+    api_base: String,
+    token: Option<String>,
+    cache: HashMap<String, Vec<DraftBlock>>,
+    seen: HashSet<String>,
+}
+
+async fn resolve_forward_draft(
+    draft: &Draft,
+    header: &HeaderInfo,
+    config: &RendererRuntimeConfig,
+) -> Draft {
+    if !draft_has_forward(draft) {
+        return draft.clone();
+    }
+
+    let Some(napcat) = napcat_config_for_group(config, &header.group_id) else {
+        return draft.clone();
+    };
+    let Some(api_base) = napcat_http_base(&napcat.ws_url) else {
+        return draft.clone();
+    };
+    let client = match Client::builder().timeout(Duration::from_secs(6)).build() {
+        Ok(client) => client,
+        Err(_) => return draft.clone(),
+    };
+
+    let mut context = ForwardContext {
+        client,
+        api_base,
+        token: napcat.access_token.clone(),
+        cache: HashMap::new(),
+        seen: HashSet::new(),
+    };
+
+    let mut blocks = Vec::new();
+    for block in &draft.blocks {
+        match block {
+            DraftBlock::Paragraph { text } => {
+                let mut expanded = expand_forward_in_text(text, &mut context, 0).await;
+                blocks.append(&mut expanded);
+            }
+            DraftBlock::Attachment { .. } => blocks.push(block.clone()),
+        }
+    }
+    Draft { blocks }
+}
+
+fn draft_has_forward(draft: &Draft) -> bool {
+    draft.blocks.iter().any(|block| match block {
+        DraftBlock::Paragraph { text } => text.contains(FORWARD_PREFIX),
+        _ => false,
+    })
+}
+
+fn napcat_config_for_group<'a>(
+    config: &'a RendererRuntimeConfig,
+    group_id: &str,
+) -> Option<&'a NapCatConfig> {
+    config
+        .napcat_by_group
+        .get(group_id)
+        .or_else(|| config.default_napcat.as_ref())
+}
+
+fn napcat_http_base(ws_url: &str) -> Option<String> {
+    let trimmed = ws_url.split('?').next().unwrap_or(ws_url);
+    if let Some(rest) = trimmed.strip_prefix("ws://") {
+        let mut base = format!("http://{}", rest.trim_end_matches('/'));
+        if base.ends_with("/ws") {
+            base = base.trim_end_matches("/ws").trim_end_matches('/').to_string();
+        }
+        return Some(base);
+    }
+    if let Some(rest) = trimmed.strip_prefix("wss://") {
+        let mut base = format!("https://{}", rest.trim_end_matches('/'));
+        if base.ends_with("/ws") {
+            base = base.trim_end_matches("/ws").trim_end_matches('/').to_string();
+        }
+        return Some(base);
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        let mut base = trimmed.trim_end_matches('/').to_string();
+        if base.ends_with("/ws") {
+            base = base.trim_end_matches("/ws").trim_end_matches('/').to_string();
+        }
+        return Some(base);
+    }
+    None
+}
+
+fn forward_placeholder(id: &str) -> String {
+    if id.is_empty() {
+        "[合并转发]".to_string()
+    } else {
+        format!("[合并转发:{}]", id)
+    }
+}
+
+fn push_text_block(blocks: &mut Vec<DraftBlock>, text: &str) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    blocks.push(DraftBlock::Paragraph {
+        text: trimmed.to_string(),
+    });
+}
+
+fn expand_forward_in_text<'a>(
+    text: &'a str,
+    context: &'a mut ForwardContext,
+    depth: u32,
+) -> Pin<Box<dyn Future<Output = Vec<DraftBlock>> + Send + 'a>> {
+    Box::pin(async move {
+        if depth >= MAX_FORWARD_DEPTH {
+            let mut blocks = Vec::new();
+            push_text_block(&mut blocks, text);
+            return blocks;
+        }
+
+        let mut blocks = Vec::new();
+        let mut remaining = text;
+        while let Some(start) = remaining.find(FORWARD_PREFIX) {
+            let (before, rest) = remaining.split_at(start);
+            push_text_block(&mut blocks, before);
+
+            let after_prefix = &rest[FORWARD_PREFIX.len()..];
+            let Some(end) = after_prefix.find(']') else {
+                push_text_block(&mut blocks, rest);
+                return blocks;
+            };
+            let id = after_prefix[..end].trim();
+            let mut resolved = forward_blocks_for_id(id, context, depth).await;
+            blocks.append(&mut resolved);
+            remaining = &after_prefix[end + 1..];
+        }
+        push_text_block(&mut blocks, remaining);
+        blocks
+    })
+}
+
+async fn forward_blocks_for_id(
+    forward_id: &str,
+    context: &mut ForwardContext,
+    depth: u32,
+) -> Vec<DraftBlock> {
+    if forward_id.is_empty() || depth >= MAX_FORWARD_DEPTH {
+        return vec![DraftBlock::Paragraph {
+            text: forward_placeholder(forward_id),
+        }];
+    }
+
+    if let Some(cached) = context.cache.get(forward_id) {
+        return cached.clone();
+    }
+    if context.seen.contains(forward_id) {
+        return vec![DraftBlock::Paragraph {
+            text: forward_placeholder(forward_id),
+        }];
+    }
+    context.seen.insert(forward_id.to_string());
+
+    let resolved = match fetch_forward_messages(context, forward_id).await {
+        Ok(messages) => forward_messages_to_blocks(&messages, context, depth + 1).await,
+        Err(err) => {
+            debug_log!("forward resolve failed: id={} err={}", forward_id, err);
+            vec![DraftBlock::Paragraph {
+                text: forward_placeholder(forward_id),
+            }]
+        }
+    };
+    context.cache.insert(forward_id.to_string(), resolved.clone());
+    resolved
+}
+
+async fn fetch_forward_messages(
+    context: &ForwardContext,
+    forward_id: &str,
+) -> Result<Vec<Value>, String> {
+    let url = format!("{}/get_forward_msg", context.api_base);
+    let mut req = context.client.post(url).json(&json!({ "message_id": forward_id }));
+    if let Some(token) = context.token.as_ref() {
+        req = req.header("Authorization", format!("Bearer {}", token));
+    }
+    let resp = req.send().await.map_err(|err| format!("http error: {}", err))?;
+    let status = resp.status();
+    let body: Value = resp.json().await.map_err(|err| format!("json error: {}", err))?;
+    if !status.is_success() {
+        return Err(format!("http status {}", status));
+    }
+    if body.get("status").and_then(|v| v.as_str()) != Some("ok") {
+        return Err(format!("napcat status {:?}", body.get("status")));
+    }
+    let messages = body
+        .get("data")
+        .and_then(|v| v.get("messages"))
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "missing forward messages".to_string())?;
+    Ok(messages.to_vec())
+}
+
+async fn forward_messages_to_blocks(
+    messages: &[Value],
+    context: &mut ForwardContext,
+    depth: u32,
+) -> Vec<DraftBlock> {
+    let mut blocks = Vec::new();
+    for message in messages {
+        let payload = message
+            .get("message")
+            .or_else(|| message.get("content"));
+        let (text, attachments) = extract_message_lite(payload);
+        let mut text_blocks = expand_forward_in_text(&text, context, depth).await;
+        blocks.append(&mut text_blocks);
+        for attachment in attachments {
+            blocks.push(DraftBlock::Attachment {
+                kind: attachment.kind,
+                reference: attachment.reference,
+            });
+        }
+    }
+    blocks
 }
 
 fn extract_header(state: &StateView, post_id: PostId) -> HeaderInfo {
     let mut group_id = "unknown".to_string();
     let mut user_id = "unknown".to_string();
+    let mut sender_name = None;
     if let Some(ingress_ids) = state.post_ingress.get(&post_id) {
         for ingress_id in ingress_ids {
             if let Some(meta) = state.ingress_meta.get(ingress_id) {
                 group_id = meta.group_id.clone();
                 user_id = meta.user_id.clone();
+                sender_name = meta.sender_name.clone().filter(|name| !name.trim().is_empty());
                 break;
             }
         }
@@ -200,19 +543,30 @@ fn extract_header(state: &StateView, post_id: PostId) -> HeaderInfo {
         group_id,
         user_id,
         post_id_hex: id128_hex(post_id.0),
+        sender_name,
     }
 }
 
-fn render_svg(draft: &Draft, header: &HeaderInfo, config: &RendererRuntimeConfig) -> String {
+fn render_png(
+    draft: &Draft,
+    header: &HeaderInfo,
+    image_sources: &RenderImageSources,
+    config: &RendererRuntimeConfig,
+) -> Result<Vec<u8>, String> {
     let padding = 20u32;
     let spacing_lg = 10u32;
     let spacing_xxl = 20u32;
-    let bubble_pad_x = 8u32;
-    let bubble_pad_y = 4u32;
-    let font_size = 14u32;
+    let bubble_pad_left = 8u32;
+    let bubble_pad_right = 8u32;
+    let bubble_pad_top = 6u32;
+    let bubble_pad_bottom = 6u32;
+    let font_size = 16u32;
     let line_height = 21u32;
-    let title_size = 24u32;
+    let face_size = 16u32;
+    let title_size = 32u32;
     let meta_size = 12u32;
+    let font_weight_title = 600u32;
+    let font_weight_body = 400u32;
     let header_gap = 10u32;
     let avatar_size = 50u32;
     let radius_lg = 12u32;
@@ -226,23 +580,42 @@ fn render_svg(draft: &Draft, header: &HeaderInfo, config: &RendererRuntimeConfig
     let file_meta_gap = 2u32;
     let file_icon_size = 40u32;
     let file_icon_gap = 6u32;
+    let font_dir = Path::new("res/fonts");
+    let font_collection = build_font_collection(font_dir);
+    let mut text_measurer = TextMeasurer::new(font_collection.clone());
 
+    let scale = 4u32;
     let content_width = config.canvas_width_px.saturating_sub(padding.saturating_mul(2));
     let header_x = padding;
     let header_y = padding;
     let header_text_x = header_x + avatar_size + header_gap;
     let header_text_width = content_width.saturating_sub(avatar_size + header_gap);
 
-    let title_text = if header.user_id == "unknown" {
-        "OQQWall".to_string()
+    let title_text = header.sender_name.clone().unwrap_or_else(|| {
+        if header.user_id == "unknown" {
+            "OQQWall".to_string()
+        } else {
+            format!("User {}", header.user_id)
+        }
+    });
+    let title_text = truncate_text(
+        &title_text,
+        header_text_width,
+        title_size,
+        font_weight_title,
+        &mut text_measurer,
+    );
+    let meta_source = if header.user_id == "unknown" {
+        header.post_id_hex.clone()
     } else {
-        format!("User {}", header.user_id)
+        header.user_id.clone()
     };
-    let title_text = truncate_text(&title_text, header_text_width, title_size);
     let meta_text = truncate_text(
-        &format!("Group {}  Post {}", header.group_id, header.post_id_hex),
+        &format!("QQ {}", meta_source),
         header_text_width,
         meta_size,
+        font_weight_body,
+        &mut text_measurer,
     );
     let title_y = header_y + title_size;
     let meta_y = title_y + meta_size + 4;
@@ -250,20 +623,30 @@ fn render_svg(draft: &Draft, header: &HeaderInfo, config: &RendererRuntimeConfig
 
     let mut cursor_y = header_y + header_height + spacing_xxl;
     let mut blocks = Vec::new();
-    let mut clip_defs = Vec::new();
-    let mut image_index = 0usize;
 
-    for block in &draft.blocks {
+    for (block_idx, block) in draft.blocks.iter().enumerate() {
         let layout = match block {
             DraftBlock::Paragraph { text } => {
-                let max_text_w = content_width.saturating_sub(bubble_pad_x * 2).max(1);
-                let lines = wrap_text(text, max_text_w, font_size);
+                let max_text_w = content_width
+                    .saturating_sub(bubble_pad_left + bubble_pad_right)
+                    .max(1);
+                let lines = wrap_inline_text(
+                    text,
+                    max_text_w,
+                    font_size,
+                    face_size,
+                    font_weight_body,
+                    &mut text_measurer,
+                );
                 let mut max_line_w = 0u32;
                 for line in &lines {
-                    max_line_w = max_line_w.max(estimate_text_width(line, font_size));
+                    max_line_w = max_line_w.max(line.width);
                 }
-                let bubble_w = (max_line_w + bubble_pad_x * 2).min(content_width).max(1);
-                let height = bubble_pad_y * 2 + line_height * lines.len() as u32;
+                let bubble_w = (max_line_w + bubble_pad_left + bubble_pad_right)
+                    .min(content_width)
+                    .max(1);
+                let height =
+                    bubble_pad_top + bubble_pad_bottom + line_height * lines.len() as u32;
                 BlockLayout {
                     x: padding,
                     y: cursor_y,
@@ -272,26 +655,47 @@ fn render_svg(draft: &Draft, header: &HeaderInfo, config: &RendererRuntimeConfig
                     kind: BlockKind::Text { lines },
                 }
             }
-            DraftBlock::Attachment { kind, reference } => {
-                let href = reference_url(reference);
+            DraftBlock::Attachment { kind, reference: _ } => {
+                let image = image_sources
+                    .block_images
+                    .get(block_idx)
+                    .and_then(|value| value.as_ref());
+                let label_href = image_sources
+                    .block_labels
+                    .get(block_idx)
+                    .and_then(|value| value.clone());
                 match *kind {
                     oqqwall_rust_core::MediaKind::Image => {
-                        let width = (content_width / 2).max(1);
-                        let height = (width.saturating_mul(3).saturating_div(4))
-                            .min(300)
-                            .max(1);
-                        let clip_id = format!("img-clip-{}", image_index);
-                        image_index += 1;
-                        clip_defs.push(format!(
-                            "<clipPath id=\"{}\"><rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"{}\" /></clipPath>",
-                            clip_id, padding, cursor_y, width, height, radius_lg
-                        ));
+                        let max_width = (content_width / 2).max(1);
+                        let max_height = 300u32;
+                        let (width, height) = match image
+                            .and_then(|img| img.width.zip(img.height))
+                            .filter(|(w, h)| *w > 0 && *h > 0)
+                        {
+                            Some((orig_w, orig_h)) => {
+                                let scale_w = max_width as f32 / orig_w as f32;
+                                let scale_h = max_height as f32 / orig_h as f32;
+                                let scale = scale_w.min(scale_h).min(1.0);
+                                let width = (orig_w as f32 * scale).round().max(1.0) as u32;
+                                let height = (orig_h as f32 * scale).round().max(1.0) as u32;
+                                (width, height)
+                            }
+                            None => {
+                                let width = max_width;
+                                let height = (width.saturating_mul(3).saturating_div(4))
+                                    .min(max_height)
+                                    .max(1);
+                                (width, height)
+                            }
+                        };
                         BlockLayout {
                             x: padding,
                             y: cursor_y,
                             width,
                             height,
-                            kind: BlockKind::Image { href, clip_id },
+                            kind: BlockKind::Image {
+                                image: image.cloned(),
+                            },
                         }
                     }
                     oqqwall_rust_core::MediaKind::File => {
@@ -299,12 +703,25 @@ fn render_svg(draft: &Draft, header: &HeaderInfo, config: &RendererRuntimeConfig
                         let text_max_w = width
                             .saturating_sub(file_padding * 2 + file_icon_size + file_icon_gap)
                             .max(1);
-                        let filename = href
+                        let filename = label_href
                             .as_deref()
                             .and_then(extract_filename)
                             .unwrap_or_else(|| "Unknown file".to_string());
-                        let mut name_lines = wrap_text(&filename, text_max_w, font_size);
-                        name_lines = limit_lines(name_lines, 2, text_max_w, font_size);
+                        let mut name_lines = wrap_text(
+                            &filename,
+                            text_max_w,
+                            font_size,
+                            font_weight_body,
+                            &mut text_measurer,
+                        );
+                        name_lines = limit_lines(
+                            name_lines,
+                            2,
+                            text_max_w,
+                            font_size,
+                            font_weight_body,
+                            &mut text_measurer,
+                        );
                         let meta_line = Some("Size: unknown".to_string());
                         let name_height = name_lines.len() as u32 * file_line_height;
                         let meta_height = if meta_line.is_some() {
@@ -335,8 +752,14 @@ fn render_svg(draft: &Draft, header: &HeaderInfo, config: &RendererRuntimeConfig
                             .max(1);
                         let label = media_label(*kind);
                         let mut lines = vec![label.to_string()];
-                        if let Some(detail) = href.as_deref().and_then(extract_filename) {
-                            let detail_line = truncate_text(&detail, text_max_w, font_size);
+                        if let Some(detail) = label_href.as_deref().and_then(extract_filename) {
+                            let detail_line = truncate_text(
+                                &detail,
+                                text_max_w,
+                                font_size,
+                                font_weight_body,
+                                &mut text_measurer,
+                            );
                             if !detail_line.is_empty() {
                                 lines.push(detail_line);
                             }
@@ -366,13 +789,25 @@ fn render_svg(draft: &Draft, header: &HeaderInfo, config: &RendererRuntimeConfig
             next_bottom = next_bottom.saturating_add(spacing_lg);
         }
         if next_bottom > config.max_height_px {
-            let trunc_lines = vec!["... truncated ...".to_string()];
+            let trunc_text_w = content_width
+                .saturating_sub(bubble_pad_left + bubble_pad_right)
+                .max(1);
+            let trunc_lines = wrap_inline_text(
+                "... truncated ...",
+                trunc_text_w,
+                font_size,
+                face_size,
+                font_weight_body,
+                &mut text_measurer,
+            );
             let mut max_line_w = 0u32;
             for line in &trunc_lines {
-                max_line_w = max_line_w.max(estimate_text_width(line, font_size));
+                max_line_w = max_line_w.max(line.width);
             }
-            let bubble_w = (max_line_w + bubble_pad_x * 2).min(content_width).max(1);
-            let trunc_height = bubble_pad_y * 2 + line_height;
+            let bubble_w = (max_line_w + bubble_pad_left + bubble_pad_right)
+                .min(content_width)
+                .max(1);
+            let trunc_height = bubble_pad_top + bubble_pad_bottom + line_height;
             let trunc_bottom = cursor_y.saturating_add(trunc_height).saturating_add(padding);
             if trunc_bottom <= config.max_height_px {
                 blocks.push(BlockLayout {
@@ -405,152 +840,245 @@ fn render_svg(draft: &Draft, header: &HeaderInfo, config: &RendererRuntimeConfig
         cursor_y
     };
     let canvas_height = canvas_bottom.saturating_add(padding);
-    let background_height = canvas_height.min(config.max_height_px).max(1);
+    let background_height = canvas_height
+        .max(config.canvas_width_px)
+        .min(config.max_height_px)
+        .max(1);
 
-    let avatar_url = if header.user_id == "unknown" {
-        None
-    } else {
-        Some(format!(
-            "https://qlogo2.store.qq.com/qzone/{0}/{0}/640",
-            header.user_id
-        ))
-    };
-    let avatar_cx = header_x + avatar_size / 2;
-    let avatar_cy = header_y + avatar_size / 2;
+    let output_width = config.canvas_width_px.saturating_mul(scale);
+    let output_height = background_height.saturating_mul(scale);
 
-    let mut out = String::new();
-    out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
-    out.push_str(&format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}\" height=\"{}\" viewBox=\"0 0 {} {}\">",
-        config.canvas_width_px,
-        background_height,
-        config.canvas_width_px,
-        background_height
-    ));
-    out.push_str("<defs>");
-    out.push_str("<filter id=\"shadow-sm\" x=\"-20%\" y=\"-20%\" width=\"140%\" height=\"140%\">");
-    out.push_str("<feDropShadow dx=\"0\" dy=\"0\" stdDeviation=\"2\" flood-color=\"#000\" flood-opacity=\"0.10\" />");
-    out.push_str("</filter>");
-    out.push_str("<filter id=\"shadow-md\" x=\"-20%\" y=\"-20%\" width=\"140%\" height=\"140%\">");
-    out.push_str("<feDropShadow dx=\"0\" dy=\"0\" stdDeviation=\"3\" flood-color=\"#000\" flood-opacity=\"0.20\" />");
-    out.push_str("</filter>");
-    out.push_str("<filter id=\"shadow-lg\" x=\"-20%\" y=\"-20%\" width=\"140%\" height=\"140%\">");
-    out.push_str("<feDropShadow dx=\"0\" dy=\"0\" stdDeviation=\"4\" flood-color=\"#000\" flood-opacity=\"0.30\" />");
-    out.push_str("</filter>");
-    out.push_str(&format!(
-        "<clipPath id=\"avatar-clip\"><circle cx=\"{}\" cy=\"{}\" r=\"{}\" /></clipPath>",
-        avatar_cx,
-        avatar_cy,
-        avatar_size / 2
-    ));
-    for def in clip_defs {
-        out.push_str(&def);
+    let mut surface = skia_safe::surfaces::raster_n32_premul((
+        output_width as i32,
+        output_height as i32,
+    ))
+    .ok_or_else(|| "surface alloc failed".to_string())?;
+    let canvas = surface.canvas();
+    canvas.scale((scale as f32, scale as f32));
+
+    let color_bg = color_from_hex(0xF2F2F2);
+    let color_white = Color4f::new(1.0, 1.0, 1.0, 1.0);
+    let color_border = color_from_hex(0xE0E0E0);
+    let color_text = Color4f::new(0.0, 0.0, 0.0, 1.0);
+    let color_meta = color_from_hex(0x666666);
+    let color_muted = color_from_hex(0x888888);
+
+    let mut bg_paint = Paint::default();
+    bg_paint.set_color4f(color_bg, None);
+    bg_paint.set_anti_alias(true);
+    canvas.draw_rect(
+        Rect::from_xywh(0.0, 0.0, config.canvas_width_px as f32, background_height as f32),
+        &bg_paint,
+    );
+
+    let avatar_rect = Rect::from_xywh(
+        header_x as f32,
+        header_y as f32,
+        avatar_size as f32,
+        avatar_size as f32,
+    );
+    let avatar_rr = RRect::new_rect_xy(
+        avatar_rect,
+        avatar_size as f32 / 2.0,
+        avatar_size as f32 / 2.0,
+    );
+    draw_shadowed_rrect(canvas, avatar_rr, 4.0, 0.30);
+    let mut avatar_bg = Paint::default();
+    avatar_bg.set_color4f(color_white, None);
+    avatar_bg.set_anti_alias(true);
+    canvas.draw_rrect(avatar_rr, &avatar_bg);
+    let mut avatar_border = Paint::default();
+    avatar_border.set_color4f(color_border, None);
+    avatar_border.set_style(skia_safe::paint::Style::Stroke);
+    avatar_border.set_stroke_width(1.0);
+    avatar_border.set_anti_alias(true);
+    canvas.draw_rrect(avatar_rr, &avatar_border);
+
+    if let Some(avatar) = image_sources.avatar.as_ref().filter(|img| img.has_bytes()) {
+        if let Some(image) = decode_image(avatar) {
+            draw_image_cover_rounded(canvas, &image, avatar_rect, avatar_size as f32 / 2.0);
+        }
     }
-    out.push_str("</defs>");
-    out.push_str("<style>");
-    out.push_str(".title{font-family:\"PingFang SC\", \"Microsoft YaHei\", Arial, sans-serif;font-size:");
-    out.push_str(&format!("{}px;font-weight:600;fill:#000;", title_size));
-    out.push_str(".meta{font-family:\"PingFang SC\", \"Microsoft YaHei\", Arial, sans-serif;font-size:");
-    out.push_str(&format!("{}px;fill:#666;", meta_size));
-    out.push_str(".body{font-family:\"PingFang SC\", \"Microsoft YaHei\", Arial, sans-serif;font-size:");
-    out.push_str(&format!("{}px;fill:#000;", font_size));
-    out.push_str(".muted{font-family:\"PingFang SC\", \"Microsoft YaHei\", Arial, sans-serif;font-size:");
-    out.push_str(&format!("{}px;fill:#888;", meta_size));
-    out.push_str(".file-meta{font-family:\"PingFang SC\", \"Microsoft YaHei\", Arial, sans-serif;font-size:11px;fill:#888;}");
-    out.push_str(".icon-text{font-family:\"PingFang SC\", \"Microsoft YaHei\", Arial, sans-serif;font-size:11px;fill:#666;}");
-    out.push_str("</style>");
-    out.push_str(&format!(
-        "<rect x=\"0\" y=\"0\" width=\"{}\" height=\"{}\" fill=\"#f2f2f2\" rx=\"12\" />",
-        config.canvas_width_px, background_height
-    ));
 
-    out.push_str(&format!(
-        "<circle cx=\"{}\" cy=\"{}\" r=\"{}\" fill=\"#ffffff\" stroke=\"#e0e0e0\" filter=\"url(#shadow-lg)\" />",
-        avatar_cx,
-        avatar_cy,
-        avatar_size / 2
-    ));
-    if let Some(url) = avatar_url {
-        out.push_str(&format!(
-            "<image x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" href=\"{}\" clip-path=\"url(#avatar-clip)\" />",
-            header_x,
-            header_y,
-            avatar_size,
-            avatar_size,
-            escape_xml(&url)
-        ));
-    }
-    out.push_str(&format!(
-        "<text x=\"{}\" y=\"{}\" class=\"title\">{}</text>",
-        header_text_x,
-        title_y,
-        escape_xml(&title_text)
-    ));
-    out.push_str(&format!(
-        "<text x=\"{}\" y=\"{}\" class=\"meta\">{}</text>",
-        header_text_x,
-        meta_y,
-        escape_xml(&meta_text)
-    ));
-    out.push_str(&format!(
-        "<line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" stroke=\"#e0e0e0\" stroke-width=\"1\" />",
-        padding,
-        header_y + header_height + spacing_xxl / 2,
-        padding + content_width,
-        header_y + header_height + spacing_xxl / 2
-    ));
+    draw_text_line(
+        canvas,
+        &font_collection,
+        &title_text,
+        header_text_x as f32,
+        title_y as f32,
+        title_size,
+        font_weight_title,
+        color_text,
+    );
+    draw_text_line(
+        canvas,
+        &font_collection,
+        &meta_text,
+        header_text_x as f32,
+        meta_y as f32,
+        meta_size,
+        font_weight_body,
+        color_meta,
+    );
+
+    let mut divider = Paint::default();
+    divider.set_color4f(color_border, None);
+    divider.set_anti_alias(true);
+    divider.set_style(skia_safe::paint::Style::Stroke);
+    divider.set_stroke_width(1.0);
+    canvas.draw_line(
+        (padding as f32, (header_y + header_height + spacing_xxl / 2) as f32),
+        ((padding + content_width) as f32, (header_y + header_height + spacing_xxl / 2) as f32),
+        &divider,
+    );
+
+    let mut face_cache: HashMap<String, ResolvedImage> = HashMap::new();
+    let mut face_image_cache: HashMap<String, Option<Image>> = HashMap::new();
 
     for block in blocks {
         match block.kind {
             BlockKind::Text { lines } => {
-                out.push_str(&format!(
-                    "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"#ffffff\" stroke=\"#e0e0e0\" rx=\"{}\" filter=\"url(#shadow-sm)\" />",
-                    block.x, block.y, block.width, block.height, radius_lg
-                ));
-                let text_x = block.x + bubble_pad_x;
-                let text_y = block.y + bubble_pad_y + font_size;
-                out.push_str(&format!(
-                    "<text x=\"{}\" y=\"{}\" class=\"body\">",
-                    text_x, text_y
-                ));
+                let rect = Rect::from_xywh(
+                    block.x as f32,
+                    block.y as f32,
+                    block.width as f32,
+                    block.height as f32,
+                );
+                let rr = RRect::new_rect_xy(rect, radius_lg as f32, radius_lg as f32);
+                draw_shadowed_rrect(canvas, rr, 2.0, 0.10);
+
+                let mut bubble_bg = Paint::default();
+                bubble_bg.set_color4f(color_white, None);
+                bubble_bg.set_anti_alias(true);
+                canvas.draw_rrect(rr, &bubble_bg);
+                let mut bubble_border = Paint::default();
+                bubble_border.set_color4f(color_border, None);
+                bubble_border.set_style(skia_safe::paint::Style::Stroke);
+                bubble_border.set_stroke_width(1.0);
+                bubble_border.set_anti_alias(true);
+                canvas.draw_rrect(rr, &bubble_border);
+
+                let line_x = block.x + bubble_pad_left;
+                let line_y = block.y + bubble_pad_top + font_size;
                 for (idx, line) in lines.iter().enumerate() {
-                    let escaped = escape_xml(line);
-                    if idx == 0 {
-                        out.push_str(&format!(
-                            "<tspan x=\"{}\" dy=\"0\">{}</tspan>",
-                            text_x, escaped
-                        ));
-                    } else {
-                        out.push_str(&format!(
-                            "<tspan x=\"{}\" dy=\"{}\">{}</tspan>",
-                            text_x, line_height, escaped
-                        ));
+                    let baseline_y =
+                        line_y + line_height.saturating_mul(idx as u32);
+                    let mut cursor_x = line_x;
+                    for run in &line.runs {
+                        match run {
+                            InlineRun::Text(text) => {
+                                if !text.is_empty() {
+                                    draw_text_line(
+                                        canvas,
+                                        &font_collection,
+                                        text,
+                                        cursor_x as f32,
+                                        baseline_y as f32,
+                                        font_size,
+                                        font_weight_body,
+                                        color_text,
+                                    );
+                                    cursor_x = cursor_x.saturating_add(
+                                        text_measurer
+                                            .measure_text_width(text, font_size, font_weight_body),
+                                    );
+                                }
+                            }
+                            InlineRun::Face { id } => {
+                                if let Some(face) = resolve_face_image(id, &mut face_cache) {
+                                    let line_top = baseline_y.saturating_sub(font_size);
+                                    let face_y = line_top
+                                        .saturating_add(line_height.saturating_sub(face_size) / 2);
+                                    let face_x = cursor_x;
+                                    let face_image = face_image_cache
+                                        .entry(id.clone())
+                                        .or_insert_with(|| decode_image(&face));
+                                    if let Some(image) = face_image.as_ref() {
+                                        draw_image_cover_rounded(
+                                            canvas,
+                                            image,
+                                            Rect::from_xywh(
+                                                face_x as f32,
+                                                face_y as f32,
+                                                face_size as f32,
+                                                face_size as f32,
+                                            ),
+                                            3.0,
+                                        );
+                                    } else {
+                                        let fallback = format!("[face:{}]", id);
+                                        draw_text_line(
+                                            canvas,
+                                            &font_collection,
+                                            &fallback,
+                                            cursor_x as f32,
+                                            baseline_y as f32,
+                                            font_size,
+                                            font_weight_body,
+                                            color_text,
+                                        );
+                                    }
+                                    cursor_x = cursor_x.saturating_add(face_size);
+                                } else {
+                                    let fallback = format!("[face:{}]", id);
+                                    draw_text_line(
+                                        canvas,
+                                        &font_collection,
+                                        &fallback,
+                                        cursor_x as f32,
+                                        baseline_y as f32,
+                                        font_size,
+                                        font_weight_body,
+                                        color_text,
+                                    );
+                                    cursor_x = cursor_x.saturating_add(
+                                        text_measurer
+                                            .measure_text_width(&fallback, font_size, font_weight_body),
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
-                out.push_str("</text>");
             }
-            BlockKind::Image { href, clip_id } => {
-                out.push_str(&format!(
-                    "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"#ffffff\" stroke=\"#e0e0e0\" rx=\"{}\" filter=\"url(#shadow-md)\" />",
-                    block.x, block.y, block.width, block.height, radius_lg
-                ));
-                if let Some(url) = href {
-                    out.push_str(&format!(
-                        "<image x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" href=\"{}\" preserveAspectRatio=\"xMidYMid slice\" clip-path=\"url(#{})\" />",
-                        block.x,
-                        block.y,
-                        block.width,
-                        block.height,
-                        escape_xml(&url),
-                        clip_id
-                    ));
+            BlockKind::Image { image } => {
+                let rect = Rect::from_xywh(
+                    block.x as f32,
+                    block.y as f32,
+                    block.width as f32,
+                    block.height as f32,
+                );
+                let rr = RRect::new_rect_xy(rect, radius_lg as f32, radius_lg as f32);
+                draw_shadowed_rrect(canvas, rr, 3.0, 0.20);
+
+                let mut img_bg = Paint::default();
+                img_bg.set_color4f(color_white, None);
+                img_bg.set_anti_alias(true);
+                canvas.draw_rrect(rr, &img_bg);
+                let mut img_border = Paint::default();
+                img_border.set_color4f(color_border, None);
+                img_border.set_style(skia_safe::paint::Style::Stroke);
+                img_border.set_stroke_width(1.0);
+                img_border.set_anti_alias(true);
+                canvas.draw_rrect(rr, &img_border);
+
+                if let Some(img) = image.as_ref().filter(|img| img.has_bytes()) {
+                    if let Some(decoded) = decode_image(img) {
+                        draw_image_cover_rounded(canvas, &decoded, rect, radius_lg as f32);
+                    }
                 } else {
-                    let text_x = block.x + bubble_pad_x;
-                    let text_y = block.y + bubble_pad_y + font_size;
-                    out.push_str(&format!(
-                        "<text x=\"{}\" y=\"{}\" class=\"muted\">Image</text>",
-                        text_x, text_y
-                    ));
+                    let text_x = block.x + bubble_pad_left;
+                    let text_y = block.y + bubble_pad_top + font_size;
+                    draw_text_line(
+                        canvas,
+                        &font_collection,
+                        "Image",
+                        text_x as f32,
+                        text_y as f32,
+                        meta_size,
+                        font_weight_body,
+                        color_muted,
+                    );
                 }
             }
             BlockKind::MediaCard {
@@ -558,89 +1086,168 @@ fn render_svg(draft: &Draft, header: &HeaderInfo, config: &RendererRuntimeConfig
                 icon_text,
                 media_kind,
             } => {
-                out.push_str(&format!(
-                    "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"#ffffff\" stroke=\"#e0e0e0\" rx=\"{}\" filter=\"url(#shadow-sm)\" />",
-                    block.x, block.y, block.width, block.height, radius_lg
-                ));
+                let rect = Rect::from_xywh(
+                    block.x as f32,
+                    block.y as f32,
+                    block.width as f32,
+                    block.height as f32,
+                );
+                let rr = RRect::new_rect_xy(rect, radius_lg as f32, radius_lg as f32);
+                draw_shadowed_rrect(canvas, rr, 2.0, 0.10);
+
+                let mut card_bg = Paint::default();
+                card_bg.set_color4f(color_white, None);
+                card_bg.set_anti_alias(true);
+                canvas.draw_rrect(rr, &card_bg);
+                let mut card_border = Paint::default();
+                card_border.set_color4f(color_border, None);
+                card_border.set_style(skia_safe::paint::Style::Stroke);
+                card_border.set_stroke_width(1.0);
+                card_border.set_anti_alias(true);
+                canvas.draw_rrect(rr, &card_border);
+
                 let icon_x = block.x + card_padding;
                 let icon_y = block.y + (block.height - card_icon_size) / 2;
                 if matches!(media_kind, oqqwall_rust_core::MediaKind::Video) {
                     let cx = icon_x + card_icon_size / 2;
                     let cy = icon_y + card_icon_size / 2;
-                    out.push_str(&format!(
-                        "<circle cx=\"{}\" cy=\"{}\" r=\"{}\" fill=\"#f2f2f2\" stroke=\"#e0e0e0\" />",
-                        cx,
-                        cy,
-                        card_icon_size / 2
-                    ));
+                    let mut icon_bg = Paint::default();
+                    icon_bg.set_color4f(color_bg, None);
+                    icon_bg.set_anti_alias(true);
+                    canvas.draw_circle((cx as f32, cy as f32), (card_icon_size / 2) as f32, &icon_bg);
+                    let mut icon_border = Paint::default();
+                    icon_border.set_color4f(color_border, None);
+                    icon_border.set_style(skia_safe::paint::Style::Stroke);
+                    icon_border.set_stroke_width(1.0);
+                    icon_border.set_anti_alias(true);
+                    canvas.draw_circle((cx as f32, cy as f32), (card_icon_size / 2) as f32, &icon_border);
+
                     let tri_x = icon_x + card_icon_size / 3;
                     let tri_y = icon_y + card_icon_size / 4;
                     let tri_w = card_icon_size / 2;
                     let tri_h = card_icon_size / 2;
-                    out.push_str(&format!(
-                        "<path d=\"M {} {} L {} {} L {} {} Z\" fill=\"#007aff\" />",
-                        tri_x,
-                        tri_y,
-                        tri_x,
-                        tri_y + tri_h,
-                        tri_x + tri_w,
-                        tri_y + tri_h / 2
-                    ));
+                    let mut tri = PathBuilder::new();
+                    tri.move_to((tri_x as f32, tri_y as f32));
+                    tri.line_to((tri_x as f32, (tri_y + tri_h) as f32));
+                    tri.line_to(((tri_x + tri_w) as f32, (tri_y + tri_h / 2) as f32));
+                    tri.close();
+                    let tri = tri.detach();
+                    let mut tri_paint = Paint::default();
+                    tri_paint.set_color4f(color_from_hex(0x007AFF), None);
+                    tri_paint.set_anti_alias(true);
+                    canvas.draw_path(&tri, &tri_paint);
                 } else {
-                    out.push_str(&format!(
-                        "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"4\" fill=\"#f2f2f2\" stroke=\"#e0e0e0\" />",
-                        icon_x, icon_y, card_icon_size, card_icon_size
-                    ));
-                    out.push_str(&format!(
-                        "<text x=\"{}\" y=\"{}\" class=\"icon-text\" text-anchor=\"middle\" dominant-baseline=\"middle\">{}</text>",
-                        icon_x + card_icon_size / 2,
-                        icon_y + card_icon_size / 2,
-                        escape_xml(&icon_text)
-                    ));
-                }
-                let text_x = block.x + card_padding + card_icon_size + card_icon_gap;
-                let text_y = block.y + card_padding + font_size;
-                out.push_str(&format!(
-                    "<text x=\"{}\" y=\"{}\" class=\"body\">",
-                    text_x, text_y
-                ));
-                for (idx, line) in lines.iter().enumerate() {
-                    let escaped = escape_xml(line);
-                    if idx == 0 {
-                        out.push_str(&format!(
-                            "<tspan x=\"{}\" dy=\"0\">{}</tspan>",
-                            text_x, escaped
-                        ));
-                    } else {
-                        out.push_str(&format!(
-                            "<tspan x=\"{}\" dy=\"{}\">{}</tspan>",
-                            text_x, card_line_height, escaped
-                        ));
+                    let icon_rect = Rect::from_xywh(
+                        icon_x as f32,
+                        icon_y as f32,
+                        card_icon_size as f32,
+                        card_icon_size as f32,
+                    );
+                    let icon_rr = RRect::new_rect_xy(icon_rect, 4.0, 4.0);
+                    let mut icon_bg = Paint::default();
+                    icon_bg.set_color4f(color_bg, None);
+                    icon_bg.set_anti_alias(true);
+                    canvas.draw_rrect(icon_rr, &icon_bg);
+                    let mut icon_border = Paint::default();
+                    icon_border.set_color4f(color_border, None);
+                    icon_border.set_style(skia_safe::paint::Style::Stroke);
+                    icon_border.set_stroke_width(1.0);
+                    icon_border.set_anti_alias(true);
+                    canvas.draw_rrect(icon_rr, &icon_border);
+
+                    let icon_center_x = icon_x + card_icon_size / 2;
+                    let icon_center_y = icon_y + card_icon_size / 2;
+                    if let Some((paragraph, metrics)) = build_line_paragraph(
+                        &font_collection,
+                        &icon_text,
+                        11,
+                        font_weight_body,
+                        color_meta,
+                    ) {
+                        let icon_baseline =
+                            center_baseline(icon_center_y as f32, &metrics);
+                        let icon_x = icon_center_x as f32 - metrics.width * 0.5;
+                        let top_y = icon_baseline - metrics.baseline;
+                        paragraph.paint(canvas, (icon_x, top_y));
                     }
                 }
-                out.push_str("</text>");
+
+                let text_x = block.x + card_padding + card_icon_size + card_icon_gap;
+                let text_y = block.y + card_padding + font_size;
+                for (idx, line) in lines.iter().enumerate() {
+                    let baseline = text_y + card_line_height.saturating_mul(idx as u32);
+                    draw_text_line(
+                        canvas,
+                        &font_collection,
+                        line,
+                        text_x as f32,
+                        baseline as f32,
+                        font_size,
+                        font_weight_body,
+                        color_text,
+                    );
+                }
             }
             BlockKind::FileCard {
                 name_lines,
                 meta_line,
                 icon_text,
             } => {
-                out.push_str(&format!(
-                    "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"#ffffff\" stroke=\"#e0e0e0\" rx=\"{}\" filter=\"url(#shadow-sm)\" />",
-                    block.x, block.y, block.width, block.height, radius_lg
-                ));
+                let rect = Rect::from_xywh(
+                    block.x as f32,
+                    block.y as f32,
+                    block.width as f32,
+                    block.height as f32,
+                );
+                let rr = RRect::new_rect_xy(rect, radius_lg as f32, radius_lg as f32);
+                draw_shadowed_rrect(canvas, rr, 2.0, 0.10);
+
+                let mut card_bg = Paint::default();
+                card_bg.set_color4f(color_white, None);
+                card_bg.set_anti_alias(true);
+                canvas.draw_rrect(rr, &card_bg);
+                let mut card_border = Paint::default();
+                card_border.set_color4f(color_border, None);
+                card_border.set_style(skia_safe::paint::Style::Stroke);
+                card_border.set_stroke_width(1.0);
+                card_border.set_anti_alias(true);
+                canvas.draw_rrect(rr, &card_border);
+
                 let icon_x = block.x + block.width.saturating_sub(file_padding + file_icon_size);
                 let icon_y = block.y + (block.height - file_icon_size) / 2;
-                out.push_str(&format!(
-                    "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"4\" fill=\"#f2f2f2\" stroke=\"#e0e0e0\" />",
-                    icon_x, icon_y, file_icon_size, file_icon_size
-                ));
-                out.push_str(&format!(
-                    "<text x=\"{}\" y=\"{}\" class=\"icon-text\" text-anchor=\"middle\" dominant-baseline=\"middle\">{}</text>",
-                    icon_x + file_icon_size / 2,
-                    icon_y + file_icon_size / 2,
-                    escape_xml(&icon_text)
-                ));
+                let icon_rect = Rect::from_xywh(
+                    icon_x as f32,
+                    icon_y as f32,
+                    file_icon_size as f32,
+                    file_icon_size as f32,
+                );
+                let icon_rr = RRect::new_rect_xy(icon_rect, 4.0, 4.0);
+                let mut icon_bg = Paint::default();
+                icon_bg.set_color4f(color_bg, None);
+                icon_bg.set_anti_alias(true);
+                canvas.draw_rrect(icon_rr, &icon_bg);
+                let mut icon_border = Paint::default();
+                icon_border.set_color4f(color_border, None);
+                icon_border.set_style(skia_safe::paint::Style::Stroke);
+                icon_border.set_stroke_width(1.0);
+                icon_border.set_anti_alias(true);
+                canvas.draw_rrect(icon_rr, &icon_border);
+
+                let icon_center_x = icon_x + file_icon_size / 2;
+                let icon_center_y = icon_y + file_icon_size / 2;
+                if let Some((paragraph, metrics)) = build_line_paragraph(
+                    &font_collection,
+                    &icon_text,
+                    11,
+                    font_weight_body,
+                    color_meta,
+                ) {
+                    let icon_baseline = center_baseline(icon_center_y as f32, &metrics);
+                    let icon_x = icon_center_x as f32 - metrics.width * 0.5;
+                    let top_y = icon_baseline - metrics.baseline;
+                    paragraph.paint(canvas, (icon_x, top_y));
+                }
+
                 let text_x = block.x + file_padding;
                 let name_height = name_lines.len() as u32 * file_line_height;
                 let meta_height = if meta_line.is_some() {
@@ -650,48 +1257,327 @@ fn render_svg(draft: &Draft, header: &HeaderInfo, config: &RendererRuntimeConfig
                 };
                 let text_height = name_height + meta_height;
                 let content_height = file_icon_size.max(text_height);
-                let text_y = block.y + file_padding + (content_height - text_height) / 2 + font_size;
-                out.push_str(&format!(
-                    "<text x=\"{}\" y=\"{}\" class=\"body\">",
-                    text_x, text_y
-                ));
+                let text_y =
+                    block.y + file_padding + (content_height - text_height) / 2 + font_size;
+
                 for (idx, line) in name_lines.iter().enumerate() {
-                    let escaped = escape_xml(line);
-                    if idx == 0 {
-                        out.push_str(&format!(
-                            "<tspan x=\"{}\" dy=\"0\">{}</tspan>",
-                            text_x, escaped
-                        ));
-                    } else {
-                        out.push_str(&format!(
-                            "<tspan x=\"{}\" dy=\"{}\">{}</tspan>",
-                            text_x, file_line_height, escaped
-                        ));
-                    }
+                    let baseline = text_y + file_line_height.saturating_mul(idx as u32);
+                    draw_text_line(
+                        canvas,
+                        &font_collection,
+                        line,
+                        text_x as f32,
+                        baseline as f32,
+                        font_size,
+                        font_weight_body,
+                        color_text,
+                    );
                 }
-                out.push_str("</text>");
                 if let Some(meta) = meta_line {
                     let meta_y = text_y + name_height + file_meta_gap + file_meta_height;
-                    out.push_str(&format!(
-                        "<text x=\"{}\" y=\"{}\" class=\"file-meta\">{}</text>",
-                        text_x,
-                        meta_y,
-                        escape_xml(&meta)
-                    ));
+                    draw_text_line(
+                        canvas,
+                        &font_collection,
+                        &meta,
+                        text_x as f32,
+                        meta_y as f32,
+                        11,
+                        font_weight_body,
+                        color_muted,
+                    );
                 }
             }
         }
     }
 
-    out.push_str("</svg>");
-    out
+    let image = surface.image_snapshot();
+    let data = image
+        .encode(None, EncodedImageFormat::PNG, None)
+        .ok_or_else(|| "encode png failed".to_string())?;
+    Ok(data.as_bytes().to_vec())
 }
 
-fn reference_url(reference: &oqqwall_rust_core::MediaReference) -> Option<String> {
-    match reference {
-        oqqwall_rust_core::MediaReference::RemoteUrl { url } => Some(url.clone()),
-        oqqwall_rust_core::MediaReference::Blob { .. } => None,
+fn color_from_hex(hex: u32) -> Color4f {
+    let r = ((hex >> 16) & 0xFF) as f32 / 255.0;
+    let g = ((hex >> 8) & 0xFF) as f32 / 255.0;
+    let b = (hex & 0xFF) as f32 / 255.0;
+    Color4f::new(r, g, b, 1.0)
+}
+
+struct LineMetricsSnapshot {
+    baseline: f32,
+    ascent: f32,
+    descent: f32,
+    width: f32,
+}
+
+fn build_text_style(font_size: u32, font_weight: u32, color: Color4f) -> TextStyle {
+    let mut ts = TextStyle::new();
+    ts.set_font_size(font_size as f32);
+    ts.set_font_families(&FONT_FAMILIES);
+    let font_style = FontStyle::new(
+        Weight::from(font_weight as i32),
+        Width::NORMAL,
+        Slant::Upright,
+    );
+    ts.set_font_style(font_style);
+    let mut paint = Paint::default();
+    paint.set_color4f(color, None);
+    ts.set_foreground_paint(&paint);
+    ts
+}
+
+fn build_line_paragraph(
+    font_collection: &FontCollection,
+    text: &str,
+    font_size: u32,
+    font_weight: u32,
+    color: Color4f,
+) -> Option<(Paragraph, LineMetricsSnapshot)> {
+    if text.is_empty() {
+        return None;
     }
+    let mut ps = ParagraphStyle::new();
+    let ts = build_text_style(font_size, font_weight, color);
+    ps.set_text_style(&ts);
+    let mut builder = ParagraphBuilder::new(&ps, font_collection.clone());
+    builder.add_text(text);
+    let mut paragraph = builder.build();
+    paragraph.layout(MEASURE_MAX_WIDTH);
+    let line_metrics = paragraph.get_line_metrics();
+    let metrics = line_metrics.get(0)?;
+    let snapshot = LineMetricsSnapshot {
+        baseline: metrics.baseline as f32,
+        ascent: metrics.ascent as f32,
+        descent: metrics.descent as f32,
+        width: metrics.width as f32,
+    };
+    Some((paragraph, snapshot))
+}
+
+fn draw_shadowed_rrect(canvas: &Canvas, rr: RRect, blur: f32, alpha: f32) {
+    let shadow = image_filters::drop_shadow_only(
+        (0.0, 0.0),
+        (blur, blur),
+        Color4f::new(0.0, 0.0, 0.0, alpha),
+        None,
+        None,
+        image_filters::CropRect::from(None),
+    );
+    if let Some(filter) = shadow {
+        let mut paint = Paint::default();
+        paint.set_image_filter(filter);
+        paint.set_anti_alias(true);
+        canvas.draw_rrect(rr, &paint);
+    }
+}
+
+fn draw_text_line(
+    canvas: &Canvas,
+    font_collection: &FontCollection,
+    text: &str,
+    x: f32,
+    baseline_y: f32,
+    font_size: u32,
+    font_weight: u32,
+    color: Color4f,
+) {
+    if let Some((paragraph, metrics)) =
+        build_line_paragraph(font_collection, text, font_size, font_weight, color)
+    {
+        let top_y = baseline_y - metrics.baseline;
+        paragraph.paint(canvas, (x, top_y));
+    }
+}
+
+fn center_baseline(center_y: f32, metrics: &LineMetricsSnapshot) -> f32 {
+    center_y + (metrics.ascent - metrics.descent) * 0.5
+}
+
+fn decode_image(image: &ResolvedImage) -> Option<Image> {
+    let bytes = image.bytes.as_ref()?;
+    let data = Data::new_copy(bytes);
+    Image::from_encoded(data)
+}
+
+fn draw_image_cover_rounded(canvas: &Canvas, img: &Image, dst: Rect, radius: f32) {
+    let sw = img.width() as f32;
+    let sh = img.height() as f32;
+    if sw <= 0.0 || sh <= 0.0 || dst.width() <= 0.0 || dst.height() <= 0.0 {
+        return;
+    }
+    let scale = (dst.width() / sw).max(dst.height() / sh);
+    let crop_w = dst.width() / scale;
+    let crop_h = dst.height() / scale;
+    let crop_x = (sw - crop_w) * 0.5;
+    let crop_y = (sh - crop_h) * 0.5;
+    let src = Rect::from_xywh(crop_x.max(0.0), crop_y.max(0.0), crop_w.max(1.0), crop_h.max(1.0));
+    let rr = RRect::new_rect_xy(dst, radius, radius);
+
+    canvas.save();
+    canvas.clip_rrect(rr, Some(ClipOp::Intersect), Some(true));
+
+    let sampling = SamplingOptions {
+        filter: skia_safe::FilterMode::Linear,
+        mipmap: skia_safe::MipmapMode::None,
+        ..SamplingOptions::default()
+    };
+    let paint = Paint::default();
+    canvas.draw_image_rect_with_sampling_options(
+        img,
+        Some((&src, SrcRectConstraint::Fast)),
+        &dst,
+        sampling,
+        &paint,
+    );
+    canvas.restore();
+}
+
+async fn resolve_image_sources(
+    state: &StateView,
+    draft: &Draft,
+    header: &HeaderInfo,
+) -> RenderImageSources {
+    let mut client = None;
+    let mut block_images = vec![None; draft.blocks.len()];
+    let mut block_labels = vec![None; draft.blocks.len()];
+    for (idx, block) in draft.blocks.iter().enumerate() {
+        if let DraftBlock::Attachment { kind, reference } = block {
+            if *kind == oqqwall_rust_core::MediaKind::Image {
+                block_images[idx] =
+                    resolve_media_reference_for_image(reference, state, &mut client).await;
+            } else {
+                block_labels[idx] = resolve_media_reference_for_label(reference, state);
+            }
+        }
+    }
+    let avatar = if header.user_id == "unknown" {
+        None
+    } else {
+        let url = format!(
+            "https://qlogo2.store.qq.com/qzone/{0}/{0}/640",
+            header.user_id
+        );
+        resolve_url_to_image(&url, &mut client).await
+    };
+    RenderImageSources {
+        avatar,
+        block_images,
+        block_labels,
+    }
+}
+
+async fn resolve_media_reference_for_image(
+    reference: &oqqwall_rust_core::MediaReference,
+    state: &StateView,
+    client: &mut Option<Client>,
+) -> Option<ResolvedImage> {
+    match reference {
+        oqqwall_rust_core::MediaReference::Blob { blob_id } => {
+            resolve_blob_image(state, *blob_id)
+        }
+        oqqwall_rust_core::MediaReference::RemoteUrl { url } => {
+            resolve_url_to_image(url, client).await
+        }
+    }
+}
+
+fn resolve_media_reference_for_label(
+    reference: &oqqwall_rust_core::MediaReference,
+    _state: &StateView,
+) -> Option<String> {
+    match reference {
+        oqqwall_rust_core::MediaReference::Blob { .. } => None,
+        oqqwall_rust_core::MediaReference::RemoteUrl { url } => Some(url.clone()),
+    }
+}
+
+fn resolve_face_image(id: &str, cache: &mut HashMap<String, ResolvedImage>) -> Option<ResolvedImage> {
+    if let Some(found) = cache.get(id) {
+        return Some(found.clone());
+    }
+    let path = Path::new("res").join("face").join(format!("{}.png", id));
+    let path_str = path.to_string_lossy();
+    let resolved = resolved_image_from_path(&path_str)?;
+    cache.insert(id.to_string(), resolved.clone());
+    Some(resolved)
+}
+
+fn resolve_blob_image(state: &StateView, blob_id: oqqwall_rust_core::BlobId) -> Option<ResolvedImage> {
+    let path = state
+        .blobs
+        .get(&blob_id)
+        .and_then(|meta| meta.persisted_path.clone())?;
+    resolved_image_from_path(&path)
+}
+
+async fn resolve_url_to_image(url: &str, client: &mut Option<Client>) -> Option<ResolvedImage> {
+    if url.starts_with("data:") {
+        return resolved_image_from_data_url(url);
+    }
+    if let Some(path) = url.strip_prefix("file://") {
+        return resolved_image_from_path(path);
+    }
+    if Path::new(url).exists() {
+        return resolved_image_from_path(url);
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        if client.is_none() {
+            let built = Client::builder()
+                .timeout(Duration::from_secs(6))
+                .build()
+                .ok()?;
+            *client = Some(built);
+        }
+        let client = client.as_ref()?;
+        if let Some((bytes, _content_type)) = fetch_remote_bytes(client, url).await {
+            return Some(ResolvedImage::from_bytes(bytes));
+        }
+    }
+    None
+}
+
+fn resolved_image_from_path(path: &str) -> Option<ResolvedImage> {
+    let bytes = fs::read(path).ok()?;
+    Some(ResolvedImage::from_bytes(bytes))
+}
+
+fn resolved_image_from_data_url(url: &str) -> Option<ResolvedImage> {
+    let (_mime, bytes) = parse_data_url(url)?;
+    Some(ResolvedImage::from_bytes(bytes))
+}
+
+fn image_size_from_bytes(bytes: &[u8]) -> Option<(u32, u32)> {
+    let size = imagesize::blob_size(bytes).ok()?;
+    let width = u32::try_from(size.width).ok()?;
+    let height = u32::try_from(size.height).ok()?;
+    Some((width, height))
+}
+
+fn parse_data_url(source: &str) -> Option<(Option<String>, Vec<u8>)> {
+    let payload = source.strip_prefix("data:")?;
+    let (meta, data) = payload.split_once(',')?;
+    let mime = meta.split(';').next().map(|value| value.to_string());
+    let bytes = if meta.contains(";base64") {
+        STANDARD.decode(data).ok()?
+    } else {
+        data.as_bytes().to_vec()
+    };
+    Some((mime, bytes))
+}
+
+async fn fetch_remote_bytes(client: &Client, url: &str) -> Option<(Vec<u8>, Option<String>)> {
+    let response = client.get(url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    let bytes = response.bytes().await.ok()?.to_vec();
+    Some((bytes, content_type))
 }
 
 fn extract_filename(url: &str) -> Option<String> {
@@ -739,23 +1625,29 @@ fn media_icon_text(kind: oqqwall_rust_core::MediaKind) -> String {
     }
 }
 
-fn truncate_text(text: &str, max_width: u32, font_size: u32) -> String {
+fn truncate_text(
+    text: &str,
+    max_width: u32,
+    font_size: u32,
+    font_weight: u32,
+    measurer: &mut TextMeasurer,
+) -> String {
     if text.is_empty() {
         return String::new();
     }
     let mut out = String::new();
-    let mut width = 0u32;
     for ch in text.chars() {
-        let ch_width = estimate_char_width(ch, font_size);
-        if width + ch_width > max_width {
-            let ellipsis_width = estimate_text_width("...", font_size);
-            if width + ellipsis_width <= max_width && !out.is_empty() {
+        out.push(ch);
+        let width = measurer.measure_text_width(&out, font_size, font_weight);
+        if width > max_width {
+            out.pop();
+            let ellipsis_width = measurer.measure_text_width("...", font_size, font_weight);
+            let base_width = measurer.measure_text_width(&out, font_size, font_weight);
+            if base_width + ellipsis_width <= max_width && !out.is_empty() {
                 out.push_str("...");
             }
             return out;
         }
-        out.push(ch);
-        width = width.saturating_add(ch_width);
     }
     out
 }
@@ -765,6 +1657,8 @@ fn limit_lines(
     max_lines: usize,
     max_width: u32,
     font_size: u32,
+    font_weight: u32,
+    measurer: &mut TextMeasurer,
 ) -> Vec<String> {
     if lines.len() <= max_lines {
         return lines;
@@ -772,12 +1666,153 @@ fn limit_lines(
     lines.truncate(max_lines);
     if let Some(last) = lines.last_mut() {
         let padded = format!("{}...", last);
-        *last = truncate_text(&padded, max_width, font_size);
+        *last = truncate_text(&padded, max_width, font_size, font_weight, measurer);
     }
     lines
 }
 
-fn wrap_text(text: &str, max_width: u32, font_size: u32) -> Vec<String> {
+fn wrap_inline_text(
+    text: &str,
+    max_width: u32,
+    font_size: u32,
+    face_size: u32,
+    font_weight: u32,
+    measurer: &mut TextMeasurer,
+) -> Vec<InlineLine> {
+    let mut lines = Vec::new();
+    for raw_line in text.lines() {
+        if raw_line.is_empty() {
+            lines.push(InlineLine {
+                runs: Vec::new(),
+                width: 0,
+            });
+            continue;
+        }
+        let atoms = parse_inline_atoms(raw_line);
+        let mut current: Vec<InlineAtom> = Vec::new();
+        let mut segment_text = String::new();
+        let mut base_width = 0u32;
+        let mut last_break: Option<usize> = None;
+        for atom in atoms {
+            let is_break = inline_atom_is_break(&atom);
+            match &atom {
+                InlineAtom::Char(ch) => segment_text.push(*ch),
+                InlineAtom::Face(_) => {
+                    if !segment_text.is_empty() {
+                        base_width = base_width.saturating_add(measurer.measure_text_width(
+                            &segment_text,
+                            font_size,
+                            font_weight,
+                        ));
+                        segment_text.clear();
+                    }
+                    base_width = base_width.saturating_add(face_size);
+                }
+            }
+            current.push(atom);
+            let segment_width =
+                measurer.measure_text_width(&segment_text, font_size, font_weight);
+            let current_width = base_width.saturating_add(segment_width);
+            if current_width > max_width && current.len() > 1 {
+                if let Some(break_idx) = last_break {
+                    let mut line_atoms = current[..break_idx].to_vec();
+                    trim_inline_trailing_spaces(&mut line_atoms);
+                    lines.push(build_inline_line(
+                        &line_atoms,
+                        font_size,
+                        face_size,
+                        font_weight,
+                        measurer,
+                    ));
+                    let mut remainder = current[break_idx..].to_vec();
+                    trim_inline_leading_spaces(&mut remainder);
+                    current = remainder;
+                } else {
+                    let last_atom = current.pop().unwrap();
+                    let line_atoms = current;
+                    lines.push(build_inline_line(
+                        &line_atoms,
+                        font_size,
+                        face_size,
+                        font_weight,
+                        measurer,
+                    ));
+                    current = vec![last_atom];
+                }
+                let (next_segment_text, next_base_width) = rebuild_inline_measure_state(
+                    &current,
+                    font_size,
+                    face_size,
+                    font_weight,
+                    measurer,
+                );
+                segment_text = next_segment_text;
+                base_width = next_base_width;
+                last_break = None;
+                if let Some(last_atom) = current.last() {
+                    if inline_atom_is_break(last_atom) {
+                        last_break = Some(current.len());
+                    }
+                }
+            }
+            if is_break {
+                last_break = Some(current.len());
+            }
+        }
+        if !current.is_empty() {
+            lines.push(build_inline_line(
+                &current,
+                font_size,
+                face_size,
+                font_weight,
+                measurer,
+            ));
+        }
+    }
+    if lines.is_empty() {
+        lines.push(InlineLine {
+            runs: Vec::new(),
+            width: 0,
+        });
+    }
+    lines
+}
+
+fn rebuild_inline_measure_state(
+    atoms: &[InlineAtom],
+    font_size: u32,
+    face_size: u32,
+    font_weight: u32,
+    measurer: &mut TextMeasurer,
+) -> (String, u32) {
+    let mut segment_text = String::new();
+    let mut base_width = 0u32;
+    for atom in atoms {
+        match atom {
+            InlineAtom::Char(ch) => segment_text.push(*ch),
+            InlineAtom::Face(_) => {
+                if !segment_text.is_empty() {
+                    base_width = base_width.saturating_add(measurer.measure_text_width(
+                        &segment_text,
+                        font_size,
+                        font_weight,
+                    ));
+                    segment_text.clear();
+                }
+                base_width = base_width.saturating_add(face_size);
+            }
+        }
+    }
+    (segment_text, base_width)
+}
+
+fn wrap_text(
+    text: &str,
+    max_width: u32,
+    font_size: u32,
+    font_weight: u32,
+    measurer: &mut TextMeasurer,
+) -> Vec<String> {
     let mut lines = Vec::new();
     for raw_line in text.lines() {
         if raw_line.is_empty() {
@@ -785,11 +1820,14 @@ fn wrap_text(text: &str, max_width: u32, font_size: u32) -> Vec<String> {
             continue;
         }
         let mut current: Vec<char> = Vec::new();
-        let mut current_width = 0u32;
+        let mut current_text = String::new();
         let mut last_break: Option<usize> = None;
         for ch in raw_line.chars() {
-            let ch_width = estimate_char_width(ch, font_size);
-            if current_width + ch_width > max_width && !current.is_empty() {
+            current.push(ch);
+            current_text.push(ch);
+            let current_width =
+                measurer.measure_text_width(&current_text, font_size, font_weight);
+            if current_width > max_width && current.len() > 1 {
                 if let Some(break_idx) = last_break {
                     let line: String = current[..break_idx].iter().collect();
                     lines.push(line.trim_end().to_string());
@@ -798,18 +1836,21 @@ fn wrap_text(text: &str, max_width: u32, font_size: u32) -> Vec<String> {
                         remainder.remove(0);
                     }
                     current = remainder;
-                    current_width = estimate_text_width(&current.iter().collect::<String>(), font_size);
-                    last_break = None;
                 } else {
+                    let last = current.pop().unwrap();
                     let line: String = current.iter().collect();
                     lines.push(line);
                     current.clear();
-                    current_width = 0;
-                    last_break = None;
+                    current.push(last);
+                }
+                current_text = current.iter().collect();
+                last_break = None;
+                if let Some(last_ch) = current.last() {
+                    if is_break_char(*last_ch) {
+                        last_break = Some(current.len());
+                    }
                 }
             }
-            current.push(ch);
-            current_width = current_width.saturating_add(ch_width);
             if is_break_char(ch) {
                 last_break = Some(current.len());
             }
@@ -824,6 +1865,93 @@ fn wrap_text(text: &str, max_width: u32, font_size: u32) -> Vec<String> {
     lines
 }
 
+fn parse_inline_atoms(line: &str) -> Vec<InlineAtom> {
+    let mut atoms = Vec::new();
+    let bytes = line.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        if bytes[idx] == b'[' && bytes.get(idx + 1) == Some(&b'[') {
+            let rest = &line[idx..];
+            if rest.starts_with("[[face:") {
+                let after_prefix = idx + "[[face:".len();
+                if after_prefix <= line.len() {
+                    if let Some(close) = line[after_prefix..].find("]]") {
+                        let face_id = &line[after_prefix..after_prefix + close];
+                        if !face_id.is_empty() && face_id.chars().all(|c| c.is_ascii_digit()) {
+                            atoms.push(InlineAtom::Face(face_id.to_string()));
+                            idx = after_prefix + close + 2;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        let ch = line[idx..].chars().next().unwrap();
+        atoms.push(InlineAtom::Char(ch));
+        idx += ch.len_utf8();
+    }
+    atoms
+}
+
+fn inline_atom_is_break(atom: &InlineAtom) -> bool {
+    match atom {
+        InlineAtom::Char(ch) => is_break_char(*ch),
+        InlineAtom::Face(_) => false,
+    }
+}
+
+fn inline_atom_is_whitespace(atom: &InlineAtom) -> bool {
+    matches!(atom, InlineAtom::Char(ch) if ch.is_whitespace())
+}
+
+fn trim_inline_leading_spaces(atoms: &mut Vec<InlineAtom>) {
+    while atoms.first().map(inline_atom_is_whitespace).unwrap_or(false) {
+        atoms.remove(0);
+    }
+}
+
+fn trim_inline_trailing_spaces(atoms: &mut Vec<InlineAtom>) {
+    while atoms.last().map(inline_atom_is_whitespace).unwrap_or(false) {
+        atoms.pop();
+    }
+}
+
+fn build_inline_line(
+    atoms: &[InlineAtom],
+    font_size: u32,
+    face_size: u32,
+    font_weight: u32,
+    measurer: &mut TextMeasurer,
+) -> InlineLine {
+    let mut runs = Vec::new();
+    let mut current = String::new();
+    let mut width = 0u32;
+    for atom in atoms {
+        match atom {
+            InlineAtom::Char(ch) => {
+                current.push(*ch);
+            }
+            InlineAtom::Face(id) => {
+                if !current.is_empty() {
+                    width = width.saturating_add(
+                        measurer.measure_text_width(&current, font_size, font_weight),
+                    );
+                    runs.push(InlineRun::Text(current.clone()));
+                    current.clear();
+                }
+                runs.push(InlineRun::Face { id: id.clone() });
+                width = width.saturating_add(face_size);
+            }
+        }
+    }
+    if !current.is_empty() {
+        width =
+            width.saturating_add(measurer.measure_text_width(&current, font_size, font_weight));
+        runs.push(InlineRun::Text(current));
+    }
+    InlineLine { runs, width }
+}
+
 fn is_break_char(ch: char) -> bool {
     if ch.is_whitespace() {
         return true;
@@ -834,39 +1962,6 @@ fn is_break_char(ch: char) -> bool {
     )
 }
 
-fn estimate_char_width(ch: char, font_size: u32) -> u32 {
-    if ch.is_ascii() {
-        if ch.is_whitespace() {
-            return font_size.saturating_mul(1).saturating_div(3).max(3);
-        }
-        if ch.is_ascii_punctuation() {
-            return font_size.saturating_mul(1).saturating_div(2).max(4);
-        }
-        return font_size.saturating_mul(3).saturating_div(5).max(6);
-    }
-    font_size
-}
-
-fn estimate_text_width(text: &str, font_size: u32) -> u32 {
-    text.chars()
-        .map(|ch| estimate_char_width(ch, font_size))
-        .sum()
-}
-
-fn escape_xml(value: &str) -> String {
-    let mut out = String::new();
-    for ch in value.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(ch),
-        }
-    }
-    out
-}
 
 fn persist_blob(
     root: &Path,
@@ -896,12 +1991,8 @@ fn persist_blob(
     Ok((path.to_string_lossy().to_string(), size_bytes))
 }
 
-fn render_blob_id(post_id: PostId, format: RenderFormat) -> oqqwall_rust_core::BlobId {
-    let tag = match format {
-        RenderFormat::Svg => b"svg",
-        RenderFormat::Png => b"png",
-    };
-    derive_blob_id(&[&post_id.to_be_bytes(), tag])
+fn render_blob_id(post_id: PostId) -> oqqwall_rust_core::BlobId {
+    derive_blob_id(&[&post_id.to_be_bytes(), b"png"])
 }
 
 fn id128_hex(value: u128) -> String {
@@ -918,14 +2009,12 @@ async fn send_event(cmd_tx: &mpsc::Sender<Command>, event: Event) -> Result<(), 
 async fn send_render_failed(
     cmd_tx: &mpsc::Sender<Command>,
     post_id: PostId,
-    format: RenderFormat,
     attempt: u32,
     error: String,
 ) -> Result<(), String> {
     let retry_at_ms = now_ms().saturating_add(10_000);
     let event = RenderEvent::RenderFailed {
         post_id,
-        format,
         attempt,
         retry_at_ms,
         error,
@@ -940,27 +2029,44 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-async fn render_png_async(svg: String) -> Result<Vec<u8>, String> {
-    tokio::task::spawn_blocking(move || render_png(&svg))
-        .await
-        .map_err(|err| format!("png task failed: {}", err))?
+fn build_font_collection(font_dir: &Path) -> FontCollection {
+    let mut asset_mgr = TypefaceFontProvider::new();
+    let sys_mgr = skia_safe::FontMgr::new();
+    if font_dir.exists() {
+        if let Ok(entries) = fs::read_dir(font_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("");
+                if !matches!(ext.to_ascii_lowercase().as_str(), "ttf" | "otf") {
+                    continue;
+                }
+                if let Ok(bytes) = fs::read(&path) {
+                    if let Some(tf) = sys_mgr.new_from_data(&bytes, 0) {
+                        asset_mgr.register_typeface(tf, None);
+                    }
+                }
+            }
+        }
+    } else {
+        debug_log!("font dir not found: {}", font_dir.display());
+    }
+    let mut fc = FontCollection::new();
+    fc.set_asset_font_manager(Some(asset_mgr.into()));
+    fc.set_dynamic_font_manager(Some(sys_mgr));
+    fc
 }
 
-fn render_png(svg: &str) -> Result<Vec<u8>, String> {
-    let mut options = resvg::usvg::Options::default();
-    options.fontdb_mut().load_system_fonts();
-    let tree = resvg::usvg::Tree::from_str(svg, &options)
-        .map_err(|err| format!("parse svg failed: {}", err))?;
-    let size = tree.size().to_int_size();
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(size.width(), size.height())
-        .ok_or_else(|| "pixmap alloc failed".to_string())?;
-    let mut pixmap_mut = pixmap.as_mut();
-    resvg::render(
-        &tree,
-        resvg::tiny_skia::Transform::identity(),
-        &mut pixmap_mut,
-    );
-    pixmap
-        .encode_png()
-        .map_err(|err| format!("encode png failed: {}", err))
+async fn render_png_async(
+    draft: &Draft,
+    header: &HeaderInfo,
+    image_sources: &RenderImageSources,
+    config: &RendererRuntimeConfig,
+) -> Result<Vec<u8>, String> {
+    let draft = draft.clone();
+    let header = header.clone();
+    let image_sources = image_sources.clone();
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || render_png(&draft, &header, &image_sources, &config))
+        .await
+        .map_err(|err| format!("png task failed: {}", err))?
 }

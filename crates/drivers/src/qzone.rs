@@ -15,8 +15,7 @@ use oqqwall_rust_core::draft::{
     Draft, DraftBlock, IngressMessage, MediaKind, MediaReference,
 };
 use oqqwall_rust_core::event::{
-    BlobEvent, DraftEvent, Event, IngressEvent, MediaEvent, RenderEvent,
-    RenderFormat, SendEvent,
+    BlobEvent, DraftEvent, Event, IngressEvent, MediaEvent, RenderEvent, SendEvent,
 };
 use oqqwall_rust_core::ids::{BlobId, IngressId, PostId, TimestampMs};
 use oqqwall_rust_core::{build_draft_from_messages, derive_blob_id, Command};
@@ -133,7 +132,6 @@ struct CookieCache {
 
 #[derive(Debug, Default, Clone, Copy)]
 struct RenderBlobs {
-    svg: Option<BlobId>,
     png: Option<BlobId>,
 }
 
@@ -229,25 +227,15 @@ pub fn spawn_qzone_sender(
                     let mut guard = state.lock().await;
                     guard.blob_paths.remove(&blob_id);
                 }
-                Event::Render(RenderEvent::SvgReady { post_id, blob_id }) => {
-                    let mut guard = state.lock().await;
-                    let entry = guard.render_blobs.entry(post_id).or_default();
-                    entry.svg = Some(blob_id);
-                }
                 Event::Render(RenderEvent::PngReady { post_id, blob_id }) => {
                     let mut guard = state.lock().await;
                     let entry = guard.render_blobs.entry(post_id).or_default();
                     entry.png = Some(blob_id);
                 }
-                Event::Render(RenderEvent::RenderFailed {
-                    post_id, format, ..
-                }) => {
+                Event::Render(RenderEvent::RenderFailed { post_id, .. }) => {
                     let mut guard = state.lock().await;
                     let entry = guard.render_blobs.entry(post_id).or_default();
-                    match format {
-                        RenderFormat::Svg => entry.svg = None,
-                        RenderFormat::Png => entry.png = None,
-                    }
+                    entry.png = None;
                 }
                 Event::Send(SendEvent::SendStarted {
                     post_id,
@@ -793,9 +781,6 @@ fn render_preview_blobs(state: &QzoneState, post_id: PostId) -> Vec<BlobId> {
     };
     if let Some(png) = render.png {
         return vec![png];
-    }
-    if let Some(svg) = render.svg {
-        return vec![svg];
     }
     Vec::new()
 }

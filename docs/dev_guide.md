@@ -18,7 +18,7 @@
 8. Drivers（副作用执行器：渲染/发审核/发空间/附件下载）
 9. 存储与 IO 策略（“常规只写不读”）
 10. NapCat/OneBot 集成与自愈策略
-11. 渲染体系（SVG-first，PNG on-demand）
+11. 渲染体系（PNG-only）
 12. 审核体系（群指令 + 幂等）
 13. 调度与发送（时间 if-else 排程）
 14. 可观测性、运维与故障演练
@@ -35,7 +35,7 @@
 * 从 OneBot（NapCat）接收投稿（群/私聊）。
 * **按时间窗口聚合投稿**（`process_waittime_sec` 语义）。
 * 生成稿件（最小分段：按消息/空行/标点），不做 AI/内容识别。
-* 渲染稿件：**默认输出 SVG**；需要审核预览/最终发送时可按需输出 PNG。
+* 渲染稿件：**默认输出 PNG**，用于审核预览与最终发送。
 * 把预览发到审核群，并生成短码 `review_code`（仅审核内部使用，不对外展示）。
 * 管理员在审核群用指令：通过/拒绝/延后/改路由/立即发/查看。
 * 调度系统按 **发送窗口/最小间隔/队列上限/账号冷却** 做排队与发送。
@@ -102,12 +102,12 @@
 * 幂等更容易保证；
 * 将来集群化时，把 IO 任务分发出去不会改动 core 的逻辑。
 
-## 3.3 为什么默认 SVG（SVG-first）
+## 3.3 为什么默认 PNG
 
-渲染是单机 CPU/内存大头。SVG-first 的路线：
+渲染是单机 CPU/内存大头。PNG-only 的路线：
 
-* 审核默认可用链接查看 SVG（几乎不需要栅格化）；
-* 只有“需要发图片到 QQ / 发空间”时才生成 PNG；
+* 渲染产物与审核预览一致，避免 SVG/PNG 双路径带来的偏差；
+* 统一走 PNG 输出，便于下游直接发送；
 * PNG 渲染放入单独 blocking 线程池，队列限长，避免拖垮主流程。
 
 ---
@@ -152,13 +152,13 @@
 * `drivers/onebot.rs`：OneBot 客户端（收/发）
 * `drivers/napcatd.rs`：NapCat 子进程守护（拉起/健康检查/重启退避）
 * `drivers/media_fetcher.rs`：下载附件 URL → blob
-* `drivers/renderer.rs`：draft → SVG；SVG→PNG（按需）
+* `drivers/renderer.rs`：draft → PNG
 * `drivers/audit_publisher.rs`：发审核群消息（请求→完成/失败）
 * `drivers/qzone_sender.rs`：发空间（请求→完成/失败）
 
 ## 5.4 API/运维（可选）
 
-* `admin/web.rs`：本地 web UI（列出稿件、展示 SVG、手工操作）
+* `admin/web.rs`：本地 web UI（列出稿件、展示 PNG、手工操作）
 * `metrics.rs`：指标与 tracing
 
 ---
@@ -173,7 +173,7 @@
 * Ingress（消息接入、去重、落入 ingress store）
 * Aggregator（session open/append/close）
 * Draft（PostDraftCreated/Edited/Routed）
-* Render（RenderRequested/SvgReady/PngReady/Failed）
+* Render（RenderRequested/PngReady/Failed）
 * Review（ReviewItemCreated/ReviewPublishRequested/Published/Decision…）
 * Scheduling/Queue（SendPlanCreated/Rescheduled/…）
 * Sending（SendStarted/Succeeded/Failed/GaveUp）
@@ -232,7 +232,7 @@
 tick 做三类事情：
 
 1. **关闭到期 session**：`now>=close_at` → `DraftSessionClosed`
-   然后对刚关闭 session：创建 `PostDraftCreated` + `RenderRequested(Svg)`
+   然后对刚关闭 session：创建 `PostDraftCreated` + `RenderRequested`
 2. **审核发布重试**：`review_publish.failed && now>=retry_at` → `ReviewPublishRequested`
 3. **发送启动**：
 
@@ -253,19 +253,17 @@ tick 做三类事情：
   * 写入 BlobStore（RAM + 异步备份）
   * emit `MediaFetched` 或 `MediaFetchFailed{retry_at}`
 
-## 8.2 Renderer（SVG-first）
+## 8.2 Renderer（PNG-only）
 
-* 消费 `RenderRequested(Svg)`：生成 SVG bytes → Blob → `RenderSvgReady`
-* 需要 PNG 时：由 AuditPublisher/QzoneSender 触发
-
-  * PNG 放 `spawn_blocking`
-  * 队列限长（例如 16），超限则降级策略（审核只发 SVG 链接）
+* 消费 `RenderRequested`：生成 PNG bytes → Blob → `RenderPngReady`
+* PNG 放 `spawn_blocking`
+* 队列限长（例如 16），超限则降级策略（审核只发摘要文本）
 
 ## 8.3 AuditPublisher
 
 * 消费 `ReviewPublishRequested`：
 
-  * 构造审核文本 + 预览策略（svg_link / png_low / png_full）
+  * 构造审核文本 + 预览策略（png_low / png_full）
   * 发审核群消息（OneBot action）
   * 成功：emit `ReviewPublished{ audit_msg_id }`
   * 失败：emit `ReviewPublishFailed{ retry_at_ms = now + backoff(attempt) }`
@@ -274,7 +272,7 @@ tick 做三类事情：
 
 * 消费 `SendStarted`：
 
-  * 确保素材（如果需要 PNG）
+  * 确保素材（PNG）
   * 调用发空间接口（OneBot 或你的 qzone driver）
   * 成功：`SendSucceeded` + `AccountLastSendUpdated` + `GroupLastSendUpdated`
   * 失败：`SendFailed{ retryable, retry_at }`；必要时 `AccountCooldownSet`
@@ -294,7 +292,6 @@ data/
   snapshot/
     latest.snap
   blobs/
-    svg/
     png/
     image/
     file/
@@ -347,29 +344,22 @@ data/
 
 ---
 
-# 11. 渲染体系（SVG-first，PNG on-demand）
+# 11. 渲染体系（PNG-only）
 
-## 11.1 SVG 生成
+## 11.1 PNG 生成
 * 参考 ./typesetting&render.md
 * 输入：`PostDraft.blocks + theme`
-* 输出：SVG bytes（包含字体/排版/图片占位）
+* 输出：PNG bytes（包含字体/排版/图片占位）
 * 附件图片可：
 
   * 审核阶段：只显示缩略/占位符（避免下载未完成阻塞）
   * 发送阶段：需要则使用 blob 图片嵌入（或贴图）
 
-## 11.2 PNG 生成（可选）
-
-触发条件：
-
-* 审核预览模式为 PNG（或 QQ 不适合看 SVG 链接）
-* 若下游（QQ/空间接口）不接受 SVG，则转换为 PNG；若支持 SVG 可直接推送，无需生成 PNG
-
-执行原则：
+## 11.2 渲染执行原则
 
 * 放入 blocking 线程池
 * 队列限长
-* 失败可降级：审核只发 SVG link；发送失败进入人工介入
+* 失败可降级：审核只发摘要文本；发送失败进入人工介入
 
 ---
 
@@ -425,7 +415,7 @@ data/
 
 * kill -9 主进程：重启后能恢复 pending/retry/queue
 * NapCat 卡死：daemon 自动重启并继续接收/发送
-* 渲染失败：不影响审核队列推进（可降级为 SVG link）
+* 渲染失败：不影响审核队列推进（可降级为摘要文本）
 * 发送失败：按 backoff 重试，超过次数进入 manual
 
 ---
@@ -475,14 +465,14 @@ data/
 * Ingress + 去重
 * Session 聚合（waittime）
 * Draft 生成（最小分段）
-* SVG 渲染（内置主题）
-* 审核群发布（先只发文本 + link）
+* PNG 渲染（内置主题）
+* 审核群发布（摘要 + 渲染图）
 * 指令解析（是/否/等）
 * SendPlan + Sender（先用 fake sender 打日志）
 
 ## M2（完整单机）
 
-* PNG on-demand（预览/发送）
+* PNG 渲染（预览/发送）
 * QzoneSender 真接口
 * 重试/backoff/冷却
 * snapshot + 恢复回放

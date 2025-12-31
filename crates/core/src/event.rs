@@ -3,8 +3,9 @@ use crate::ids::{
     AccountId, ActorId, AuditMsgId, BlobId, CorrelationId, EventId, GroupId, IngressId, PostId,
     RemotePostId, ReviewCode, ReviewId, SessionId, TimestampMs,
 };
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventEnvelope {
     pub id: EventId,
     pub ts_ms: TimestampMs,
@@ -13,7 +14,7 @@ pub struct EventEnvelope {
     pub event: Event,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Event {
     System(SystemEvent),
     Config(ConfigEvent),
@@ -30,14 +31,14 @@ pub enum Event {
     Manual(ManualEvent),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SystemEvent {
     Booted,
     SnapshotLoaded,
     SnapshotTaken,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConfigEvent {
     Applied {
         version: u64,
@@ -45,7 +46,7 @@ pub enum ConfigEvent {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IngressEvent {
     MessageAccepted {
         ingress_id: IngressId,
@@ -64,12 +65,12 @@ pub enum IngressEvent {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IngressIgnoreReason {
     Duplicate,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionEvent {
     Opened {
         session_id: SessionId,
@@ -90,7 +91,7 @@ pub enum SessionEvent {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DraftEvent {
     PostDraftCreated {
         post_id: PostId,
@@ -102,7 +103,7 @@ pub enum DraftEvent {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MediaEvent {
     MediaFetchRequested {
         ingress_id: IngressId,
@@ -123,23 +124,12 @@ pub enum MediaEvent {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RenderFormat {
-    Svg,
-    Png,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RenderEvent {
     RenderRequested {
         post_id: PostId,
-        format: RenderFormat,
         attempt: u32,
         requested_at_ms: TimestampMs,
-    },
-    SvgReady {
-        post_id: PostId,
-        blob_id: BlobId,
     },
     PngReady {
         post_id: PostId,
@@ -147,14 +137,13 @@ pub enum RenderEvent {
     },
     RenderFailed {
         post_id: PostId,
-        format: RenderFormat,
         attempt: u32,
         retry_at_ms: TimestampMs,
         error: String,
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewEvent {
     ReviewItemCreated {
         review_id: ReviewId,
@@ -214,7 +203,7 @@ pub enum ReviewEvent {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewDecision {
     Approved,
     Rejected,
@@ -222,13 +211,13 @@ pub enum ReviewDecision {
     Skipped,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum SendPriority {
     High,
     Normal,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScheduleEvent {
     SendPlanCreated {
         post_id: PostId,
@@ -255,13 +244,13 @@ pub enum ScheduleEvent {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupFlushReason {
     Scheduled,
     Manual,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SendEvent {
     SendStarted {
         post_id: PostId,
@@ -288,7 +277,7 @@ pub enum SendEvent {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlobEvent {
     BlobRegistered {
         blob_id: BlobId,
@@ -306,7 +295,7 @@ pub enum BlobEvent {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AccountEvent {
     AccountEnabled {
         account_id: AccountId,
@@ -324,7 +313,7 @@ pub enum AccountEvent {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ManualEvent {
     ManualInterventionRequired {
         post_id: PostId,

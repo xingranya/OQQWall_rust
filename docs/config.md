@@ -84,17 +84,16 @@
 
 ### 4.1 字段表
 
-| JSON Key (snake_case)        | 兼容别名                         |     类型 |                默认 | 原版语义/参考                                               |
-| ---------------------------- | ---------------------------- | -----: | ----------------: | ----------------------------------------------------- |
-| manage_napcat_internal       | manage_napcat_internal       |   bool |             false | 是否由系统内部管理 NapCat/QQ（原版有同名配置提示）                        |
-| renewcookies_use_napcat      | renewcookies_use_napcat      |   bool |              true | 续 cookies 逻辑使用 NapCat 版本/非 NapCat 版本（原版提示）            |
-| render_png | render_png | bool | false | 是否同时渲染 PNG；默认只产出 SVG（腾讯 QQ/空间接口可直接接受 SVG），开启后审核群可直接收到 PNG 图 |
-| max_attempts_qzone_autologin | max_attempts_qzone_autologin |    u32 |                 3 | sendcontrol 默认 3 次并校验数字                               |
-| at_unprived_sender           | at_unprived_sender           |   bool |             false | 通过时是否 @ 未公开空间的投稿人（sendcontrol 读取此 key）                |
-| friend_request_window_sec    | friend_request_window_sec    |    u32 |               300 | 好友请求/私聊抑制窗口（原版 TUI 提示）                                |
-| use_web_review               | use_web_review               |   bool |             false | 是否启用网页审核面板（原版提示）                                      |
-| web_review_port              | web_review_port              |    u16 |             10923 | 网页审核监听端口（原版提示）                                        |
-| process_waittime_sec         | process_waittime             |    u32 |                20 | 原版 `preprocess.sh` 读取 `process_waittime`（秒）           |
+| JSON Key (snake_case)        | 兼容别名                         |     类型 |                默认 | 当前支持状态             | 原版语义/参考                                               |
+| ---------------------------- | ---------------------------- | -----: | ----------------: | ------------------ | ----------------------------------------------------- |
+| manage_napcat_internal       | manage_napcat_internal       |   bool |             false | 未支持               | 是否由系统内部管理 NapCat/QQ（原版有同名配置提示）                        |
+| renewcookies_use_napcat      | renewcookies_use_napcat      |   bool |              true | 未支持               | 续 cookies 逻辑使用 NapCat 版本/非 NapCat 版本（原版提示）            |
+| max_attempts_qzone_autologin | max_attempts_qzone_autologin |    u32 |                 3 | 未支持               | sendcontrol 默认 3 次并校验数字                               |
+| at_unprived_sender           | at_unprived_sender           |   bool |             false | 未支持               | 通过时是否 @ 未公开空间的投稿人（sendcontrol 读取此 key）                |
+| friend_request_window_sec    | friend_request_window_sec    |    u32 |               300 | 未支持               | 好友请求/私聊抑制窗口（原版 TUI 提示）                                |
+| use_web_review               | use_web_review               |   bool |             false | 未支持               | 是否启用网页审核面板（原版提示）                                      |
+| web_review_port              | web_review_port              |    u16 |             10923 | 未支持               | 网页审核监听端口（原版提示）                                        |
+| process_waittime_sec         | process_waittime             |    u32 |                20 | 已支持               | 原版 `preprocess.sh` 读取 `process_waittime`（秒）           |
 
 关于 `process_waittime_sec` / `process_waittime`：
 强制只允许process_waittime_sec
@@ -111,21 +110,21 @@
 
 ### 5.1 字段表（每个 group 对象）
 
-| JSON Key                  |                         类型 | 默认/规则            | 原版行为/参考                                                         |
-| ------------------------- | -------------------------: | ---------------- | --------------------------------------------------------------- |
-| mangroupid                |                     string | 必填               | 用于识别/管理群（`serv.py` 把它加入受管群集合）                                   |
-| napcat_ws_url             |                     string | 必填               | 本组 NapCat OneBot WS 地址                                          |
-| napcat_access_token       |                     string | 必填（可 env 覆盖）   | 本组 NapCat token；可用 `OQQWALL_NAPCAT_TOKEN` 覆盖                 |
-| mainqqid                  |                     string | 必填               | 主账号 QQ 号，用于组归属等                                                 |
-| minorqqid                 |              array[string] | 可空               | 副账号 QQ 列表                                                       |
-| max_post_stack            |                        int | 默认 1；只允许正整数（1 表示单条直接发送，>1 启用暂存堆栈） | sendcontrol 对此字段做默认值与数字校验                                       |
-| max_image_number_one_post |                        int | 默认 30；只允许正整数     | sendcontrol 同样校验并默认                                             |
-| individual_image_in_posts |                       bool | 默认 true          | preprocess 缺省为 true，决定是否把用户原图也拷贝到 prepost（组策略）                  |
-| send_schedule             |             array["HH:MM"] | 默认空（不启用定时 flush） | sendcontrol scheduler 从该字段读出 HH:MM 列表并按分钟触发 flush；同一时间点当日只触发一次  |
-| watermark_text            |                     string | 默认 ""            | 用于渲染/展示（Rust 可保留用于 SVG 主题）                                    |
-| friend_add_message        |                     string | 默认 ""            | 用于自动通过好友申请后发送文本（你样例包含）                                        |
-| quick_replies             |     object{string->string} | 默认 {}            | 用于快捷回复              |
-| admins                    | array[{username,password}] | 默认 []            | 用于 web_review 管理员）                                      |
+| JSON Key                  |                         类型 | 默认/规则            | 当前支持状态                 | 原版行为/参考                                                         |
+| ------------------------- | -------------------------: | ---------------- | ---------------------- | --------------------------------------------------------------- |
+| mangroupid                |                     string | 必填               | 已支持                   | 用于识别/管理群（`serv.py` 把它加入受管群集合）                                   |
+| napcat_ws_url             |                     string | 必填               | 已支持                   | 本组 NapCat OneBot WS 地址                                          |
+| napcat_access_token       |                     string | 必填（可 env 覆盖）   | 已支持                   | 本组 NapCat token；可用 `OQQWALL_NAPCAT_TOKEN` 覆盖                 |
+| mainqqid                  |                     string | 必填               | 已支持                   | 主账号 QQ 号，用于组归属等                                                 |
+| minorqqid                 |              array[string] | 可空               | 已支持                   | 副账号 QQ 列表                                                       |
+| max_post_stack            |                        int | 默认 1；只允许正整数（1 表示单条直接发送，>1 启用暂存堆栈） | 已支持（映射 max_queue） | sendcontrol 对此字段做默认值与数字校验                                       |
+| max_image_number_one_post |                        int | 默认 30；只允许正整数     | 未支持                   | sendcontrol 同样校验并默认                                             |
+| individual_image_in_posts |                       bool | 默认 true          | 未支持                   | preprocess 缺省为 true，决定是否把用户原图也拷贝到 prepost（组策略）                  |
+| send_schedule             |             array["HH:MM"] | 默认空（不启用定时 flush） | 已支持                   | sendcontrol scheduler 从该字段读出 HH:MM 列表并按分钟触发 flush；同一时间点当日只触发一次  |
+| watermark_text            |                     string | 默认 ""            | 未支持                   | 用于渲染/展示（Rust 可保留用于渲染主题）                                    |
+| friend_add_message        |                     string | 默认 ""            | 未支持                   | 用于自动通过好友申请后发送文本（你样例包含）                                        |
+| quick_replies             |     object{string->string} | 默认 {}            | 未支持                   | 用于快捷回复              |
+| admins                    | array[{username,password}] | 默认 []            | 未支持                   | 用于 web_review 管理员）                                      |
 
 ### 5.2 send_schedule 的语义（必须写清楚）
 

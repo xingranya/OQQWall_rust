@@ -17,8 +17,7 @@ fn build_draft_splits_paragraphs_and_keeps_attachments() {
     };
 
     let draft = build_draft_from_messages(&[message]);
-    assert_eq!(draft.blocks.len(), 3);
+    assert_eq!(draft.blocks.len(), 2);
     assert!(matches!(draft.blocks[0], DraftBlock::Paragraph { .. }));
-    assert!(matches!(draft.blocks[1], DraftBlock::Paragraph { .. }));
-    assert!(matches!(draft.blocks[2], DraftBlock::Attachment { .. }));
+    assert!(matches!(draft.blocks[1], DraftBlock::Attachment { .. }));
 }

@@ -16,7 +16,7 @@
 
 * ✅ OneBot 入站（群/私聊投稿）可接入
 * ✅ `(chat_id, user_id)` 维度按 `process_waittime_sec` 聚合，超时自动成稿
-* ✅ 默认生成 SVG（不依赖浏览器/外部渲染器），可通过本地 Web URL 查看
+* ✅ 默认生成 PNG（不依赖浏览器/外部渲染器）
 * ✅ 审核群发布（先文本+链接即可）
 * ✅ 审核指令：参考command.md,至少实现 是 否 等 删
 * ✅ 调度：发送窗口 + 最小间隔 + 队列上限 + 单写者发送（先用 fake sender 打日志也可）
@@ -24,7 +24,7 @@
 
 ### 1.2 完整单机版本必须满足
 
-* ✅ PNG 按需（预览/最终发送）
+* ✅ PNG 输出（预览/最终发送）
 * ✅ 真实 Qzone 发送（或通过 NapCat action / 内置 driver）
 * ✅ 失败重试 + 账号冷却 + 人工介入态
 * ✅ 监控：tracing 日志 + 基础指标（队列深度、发送成功率、NapCat 重启次数）
@@ -207,7 +207,7 @@ driver 不应依赖自己的内存去重，应该依赖 state 的 request 状态
 * PNG 渲染、附件下载、发送空间，都必须：
 
   * 使用专用 `tokio::task::spawn_blocking` 或单独线程池
-  * 队列限长（例如 16），超限则丢弃/降级（例如审核只发 SVG link）
+  * 队列限长（例如 16），超限则丢弃/降级（例如审核只发摘要文本）
 
 ---
 
@@ -243,12 +243,12 @@ driver 不应依赖自己的内存去重，应该依赖 state 的 request 状态
 
    * `now>=close_at` → `DraftSessionClosed`
    * `PostDraftCreated`（由 builder 纯函数构造 blocks）
-   * `RenderRequested(Svg)`
+   * `RenderRequested`
 
 ### 8.2 渲染与审核发布（第二阶段）
 
-4. Renderer driver 消费 `RenderRequested(Svg)` → `RenderSvgReady`
-5. decider（看到 SvgReady）：
+4. Renderer driver 消费 `RenderRequested` → `RenderPngReady`
+5. decider（看到 PngReady）：
 
    * `ReviewItemCreated`（分配 review_code）
    * `ReviewPublishRequested`
@@ -302,16 +302,12 @@ driver 不应依赖自己的内存去重，应该依赖 state 的 request 状态
 
 ### 9.3 PNG 渲染建议（落地策略）
 
-* MVP 先只产 SVG（审核发链接）
-* PNG 作为后续增强：
-
-  * `resvg/usvg + tiny-skia`（尽量避免外部浏览器）
-  * blocking 线程池 size=1（先保守）
-  * 大量积压时降级：审核只发 SVG link
+* `resvg/usvg + tiny-skia`（尽量避免外部浏览器）
+* blocking 线程池 size=1（先保守）
+* 大量积压时降级：审核只发摘要文本
 
 ### 9.4 审核预览策略（可配置）
 
-* `svg_link`：审核群发文本 + 链接（最省 CPU/IO）
 * `png_low`：审核群发 720px 预览（更友好，但 CPU 增加）
 * `png_full`：重（不推荐默认）
 
@@ -396,7 +392,7 @@ retry_at = now + delay
 * [ ] app：engine actor（单线程）+ cmd channel + bus
 * [ ] drivers：OneBot inbound/outbound（可先 mock）
 * [ ] core.decide：ingress 去重 + session 聚合 + tick close → PostDraftCreated
-* [ ] renderer：先实现 SVG 生成（简单模板）
+* [ ] renderer：先实现 PNG 生成（简单模板）
 * [ ] audit：发布审核消息（先文本+link）
 * [ ] command parser：是/否/等
 * [ ] scheduler：ReviewApproved → SendPlanCreated（not_before 基础 if-else）

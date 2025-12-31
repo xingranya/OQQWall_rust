@@ -4,7 +4,6 @@ use crate::ids::{AccountId, GroupId, TimestampMs};
 
 #[derive(Debug, Clone, Default)]
 pub struct CoreConfig {
-    pub render_png: bool,
     pub default_process_waittime_ms: TimestampMs,
     pub default_send_windows: Vec<TimeWindow>,
     pub default_min_interval_ms: TimestampMs,

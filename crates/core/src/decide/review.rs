@@ -1,10 +1,10 @@
 use crate::command::{ReviewAction, ReviewActionCommand};
 use crate::config::CoreConfig;
 use crate::decide::builder::build_draft_from_messages;
+use crate::decide::flush::build_group_flush_events;
 use crate::decide::scheduler::{compute_not_before, day_index, minute_of_day};
 use crate::event::{
-    DraftEvent, Event, RenderEvent, RenderFormat, ReviewDecision, ReviewEvent, ScheduleEvent,
-    SendPriority,
+    DraftEvent, Event, RenderEvent, ReviewDecision, ReviewEvent, ScheduleEvent, SendPriority,
 };
 use crate::ids::ReviewId;
 use crate::state::StateView;
@@ -74,7 +74,6 @@ pub fn decide_review_action(
             events.push(Event::Review(ReviewEvent::ReviewRefreshRequested { review_id }));
             events.push(Event::Render(RenderEvent::RenderRequested {
                 post_id,
-                format: RenderFormat::Svg,
                 attempt: 1,
                 requested_at_ms: cmd.now_ms,
             }));
@@ -84,7 +83,6 @@ pub fn decide_review_action(
             Event::Review(ReviewEvent::ReviewRerenderRequested { review_id }),
             Event::Render(RenderEvent::RenderRequested {
                 post_id,
-                format: RenderFormat::Svg,
                 attempt: 1,
                 requested_at_ms: cmd.now_ms,
             }),
@@ -97,7 +95,6 @@ pub fn decide_review_action(
             events.push(Event::Review(ReviewEvent::ReviewSelectAllRequested { review_id }));
             events.push(Event::Render(RenderEvent::RenderRequested {
                 post_id,
-                format: RenderFormat::Svg,
                 attempt: 1,
                 requested_at_ms: cmd.now_ms,
             }));
@@ -185,11 +182,12 @@ fn build_immediate_events(
     let minute = minute_of_day(cmd.now_ms, cmd.tz_offset_minutes);
     let day = day_index(cmd.now_ms, cmd.tz_offset_minutes);
     events.push(Event::Schedule(ScheduleEvent::GroupFlushRequested {
-        group_id,
+        group_id: group_id.clone(),
         minute_of_day: minute,
         day_index: day,
         reason: crate::event::GroupFlushReason::Manual,
     }));
+    events.extend(build_group_flush_events(state, &group_id, cmd.now_ms));
 
     events
 }

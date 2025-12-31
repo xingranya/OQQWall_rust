@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::fs;
+use std::pin::Pin;
 use std::time::Duration;
 
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use oqqwall_rust_core::command::{
     GlobalAction, GlobalActionCommand, ReviewAction, ReviewActionCommand,
@@ -15,7 +15,8 @@ use oqqwall_rust_core::{derive_blob_id, Command, IngressCommand};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde_json::Value;
+use reqwest::Client;
+use serde_json::{json, Value};
 
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::JoinHandle;
@@ -48,6 +49,8 @@ pub struct NapCatRuntimeConfig {
     pub tz_offset_minutes: i32,
 }
 
+const MAX_FORWARD_DEPTH: u32 = 4;
+
 #[derive(Debug, Clone)]
 struct ReviewInfo {
     review_code: ReviewCode,
@@ -63,6 +66,21 @@ struct IngressSummary {
 }
 
 #[derive(Debug, Clone)]
+struct MessageChunk {
+    text: String,
+    attachments: Vec<IngressAttachment>,
+}
+
+#[derive(Debug)]
+struct ForwardResolver {
+    client: Client,
+    api_base: String,
+    token: Option<String>,
+    cache: HashMap<String, Vec<MessageChunk>>,
+    seen: HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
 struct AuditMessage {
     text: String,
     images: Vec<String>,
@@ -73,7 +91,7 @@ enum PendingAction {
     SendAuditMessage { review_id: ReviewId },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum AuditCommand {
     Review {
         review_code: Option<ReviewCode>,
@@ -252,6 +270,32 @@ fn build_ws_url(base: &str, token: Option<&str>) -> String {
     }
 }
 
+fn napcat_http_base(ws_url: &str) -> Option<String> {
+    let trimmed = ws_url.split('?').next().unwrap_or(ws_url);
+    if let Some(rest) = trimmed.strip_prefix("ws://") {
+        let mut base = format!("http://{}", rest.trim_end_matches('/'));
+        if base.ends_with("/ws") {
+            base = base.trim_end_matches("/ws").trim_end_matches('/').to_string();
+        }
+        return Some(base);
+    }
+    if let Some(rest) = trimmed.strip_prefix("wss://") {
+        let mut base = format!("https://{}", rest.trim_end_matches('/'));
+        if base.ends_with("/ws") {
+            base = base.trim_end_matches("/ws").trim_end_matches('/').to_string();
+        }
+        return Some(base);
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        let mut base = trimmed.trim_end_matches('/').to_string();
+        if base.ends_with("/ws") {
+            base = base.trim_end_matches("/ws").trim_end_matches('/').to_string();
+        }
+        return Some(base);
+    }
+    None
+}
+
 #[cfg(debug_assertions)]
 fn ws_url_for_log(url: &str) -> &str {
     url.split('?').next().unwrap_or(url)
@@ -404,10 +448,7 @@ async fn build_action_from_event(
                 PendingAction::SendAuditMessage { review_id },
             );
 
-            let mut message = vec![serde_json::json!({
-                "type": "text",
-                "data": { "text": summary.text }
-            })];
+            let mut message = message_segments_from_text(&summary.text);
             for image in summary.images {
                 message.push(serde_json::json!({
                     "type": "image",
@@ -417,7 +458,7 @@ async fn build_action_from_event(
             let payload = serde_json::json!({
                 "action": "send_group_msg",
                 "params": {
-                    "group_id": group_id,
+                    "group_id": json_id(group_id),
                     "message": message
                 },
                 "echo": echo
@@ -435,13 +476,30 @@ async fn handle_action_response(
 ) -> Option<Event> {
     let mut guard = state.lock().await;
     let pending = guard.pending.remove(echo)?;
+    // OneBot/NapCat action responses look like:
+    // {"status":"ok","retcode":0,"data":{...},"echo":"..."}
+    // If failed (e.g. wrong group_id type/permission issues), data may be empty.
+    let status = value
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let retcode = value.get("retcode").and_then(|v| v.as_i64()).unwrap_or(-1);
+    if status != "ok" || retcode != 0 {
+        debug_log!(
+            "napcat action failed: echo={} status={} retcode={} raw={}",
+            echo,
+            status,
+            retcode,
+            value
+        );
+        return None;
+    }
     match pending {
         PendingAction::SendAuditMessage { review_id } => {
             let message_id = value
                 .get("data")
                 .and_then(|data| data.get("message_id"))
-                .and_then(value_to_string)
-                .unwrap_or_else(|| "unknown".to_string());
+                .and_then(value_to_string)?;
             debug_log!(
                 "napcat audit message sent: review_id={} message_id={}",
                 review_id.0,
@@ -455,6 +513,15 @@ async fn handle_action_response(
                 audit_msg_id: message_id,
             }))
         }
+    }
+}
+
+fn json_id(id: &str) -> Value {
+    let trimmed = id.trim();
+    if let Ok(n) = trimmed.parse::<i64>() {
+        Value::Number(n.into())
+    } else {
+        Value::String(trimmed.to_string())
     }
 }
 
@@ -487,15 +554,32 @@ async fn parse_inbound_event(
         .map(|sec| sec.saturating_mul(1000))
         .unwrap_or(0);
 
-    let (text, attachments, reply_id) = extract_message(value.get("message"));
-    debug_log!(
-        "napcat inbound content: text_len={} attachments={} reply_id_present={}",
-        text.len(),
-        attachments.len(),
-        reply_id.is_some()
-    );
-
     if message_type == "group" {
+        let mut forward_resolver = if message_has_forward(value.get("message")) {
+            napcat_http_base(&runtime.napcat.ws_url).and_then(|api_base| {
+                Client::builder()
+                    .timeout(Duration::from_secs(6))
+                    .build()
+                    .ok()
+                    .map(|client| ForwardResolver {
+                        client,
+                        api_base,
+                        token: runtime.napcat.access_token.clone(),
+                        cache: HashMap::new(),
+                        seen: HashSet::new(),
+                    })
+            })
+        } else {
+            None
+        };
+        let (text, attachments, reply_id) =
+            extract_message(value.get("message"), &mut forward_resolver).await;
+        debug_log!(
+            "napcat inbound content: text_len={} attachments={} reply_id_present={}",
+            text.len(),
+            attachments.len(),
+            reply_id.is_some()
+        );
         let chat_group_id = value_opt_to_string(value.get("group_id"))?;
         if runtime.audit_group_id.as_deref() == Some(chat_group_id.as_str()) {
             if let Some(command) = parse_audit_command(&text, reply_id.is_some()) {
@@ -550,6 +634,12 @@ async fn parse_inbound_event(
     }
 
     if message_type == "private" {
+        let (text, attachments) = extract_message_lite(value.get("message"));
+        debug_log!(
+            "napcat inbound private lite: text_len={} attachments={}",
+            text.len(),
+            attachments.len()
+        );
         return Some(Command::Ingress(IngressCommand {
             profile_id: self_id,
             chat_id: user_id.clone(),
@@ -565,14 +655,243 @@ async fn parse_inbound_event(
     None
 }
 
-fn extract_message(value: Option<&Value>) -> (String, Vec<IngressAttachment>, Option<String>) {
+fn message_has_forward(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::Array(items)) => items.iter().any(|item| {
+            item.get("type")
+                .and_then(|v| v.as_str())
+                .is_some_and(|kind| kind == "forward")
+        }),
+        _ => false,
+    }
+}
+
+fn forward_placeholder(id: &str) -> String {
+    if id.is_empty() {
+        "[合并转发]".to_string()
+    } else {
+        format!("[合并转发:{}]", id)
+    }
+}
+
+fn push_chunk(
+    chunks: &mut Vec<MessageChunk>,
+    text: &mut String,
+    attachments: &mut Vec<IngressAttachment>,
+) {
+    let text_value = text.trim().to_string();
+    let attachments_value = std::mem::take(attachments);
+    if !text_value.is_empty() || !attachments_value.is_empty() {
+        chunks.push(MessageChunk {
+            text: text_value,
+            attachments: attachments_value,
+        });
+    }
+    text.clear();
+}
+
+fn extract_message_chunks<'a>(
+    value: Option<&'a Value>,
+    mut resolver: Option<&'a mut ForwardResolver>,
+    depth: u32,
+    capture_reply: bool,
+) -> Pin<Box<dyn Future<Output = (Vec<MessageChunk>, Option<String>)> + Send + 'a>> {
+    Box::pin(async move {
+        let mut chunks = Vec::new();
+        let mut text = String::new();
+        let mut attachments = Vec::new();
+        let mut reply_id = None;
+
+        match value {
+            Some(Value::String(s)) => {
+                text.push_str(&extract_cq_faces(s));
+            }
+            Some(Value::Array(items)) => {
+                for item in items {
+                    let segment_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    let data = item.get("data");
+                    match segment_type {
+                        "text" => {
+                            if let Some(segment) =
+                                data.and_then(|d| d.get("text")).and_then(|v| v.as_str())
+                            {
+                                text.push_str(segment);
+                            }
+                        }
+                        "reply" => {
+                            if capture_reply {
+                                if let Some(id) = data
+                                    .and_then(|d| d.get("id"))
+                                    .and_then(value_to_string)
+                                {
+                                    reply_id = Some(id);
+                                }
+                            }
+                        }
+                        "face" => {
+                            if let Some(id) = data
+                                .and_then(|d| d.get("id"))
+                                .and_then(value_to_string)
+                            {
+                                if let Some(placeholder) = face_inline_placeholder(&id) {
+                                    text.push_str(&placeholder);
+                                } else {
+                                    text.push_str(&format!("[face:{}]", id));
+                                }
+                            }
+                        }
+                        "forward" => {
+                            let id = data
+                                .and_then(|d| d.get("id"))
+                                .and_then(value_to_string)
+                                .unwrap_or_default();
+                            push_chunk(&mut chunks, &mut text, &mut attachments);
+                            if let Some(resolver) = resolver.as_mut() {
+                                let mut resolved =
+                                    resolve_forward_chunks(&id, resolver, depth).await;
+                                chunks.append(&mut resolved);
+                            } else {
+                                chunks.push(MessageChunk {
+                                    text: forward_placeholder(&id),
+                                    attachments: Vec::new(),
+                                });
+                            }
+                        }
+                        "image" | "video" | "file" | "record" => {
+                            if let Some(reference) = extract_reference(data) {
+                                attachments.push(IngressAttachment {
+                                    kind: match segment_type {
+                                        "image" => MediaKind::Image,
+                                        "video" => MediaKind::Video,
+                                        "file" => MediaKind::File,
+                                        "record" => MediaKind::Audio,
+                                        _ => MediaKind::Other,
+                                    },
+                                    name: data
+                                        .and_then(|d| d.get("name"))
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.to_string()),
+                                    reference,
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        push_chunk(&mut chunks, &mut text, &mut attachments);
+        (chunks, reply_id)
+    })
+}
+
+async fn resolve_forward_chunks(
+    forward_id: &str,
+    resolver: &mut ForwardResolver,
+    depth: u32,
+) -> Vec<MessageChunk> {
+    if forward_id.is_empty() || depth >= MAX_FORWARD_DEPTH {
+        return vec![MessageChunk {
+            text: forward_placeholder(forward_id),
+            attachments: Vec::new(),
+        }];
+    }
+
+    if let Some(cached) = resolver.cache.get(forward_id) {
+        return cached.clone();
+    }
+    if resolver.seen.contains(forward_id) {
+        return vec![MessageChunk {
+            text: forward_placeholder(forward_id),
+            attachments: Vec::new(),
+        }];
+    }
+    resolver.seen.insert(forward_id.to_string());
+
+    let resolved = match fetch_forward_messages(resolver, forward_id).await {
+        Ok(messages) => forward_messages_to_chunks(&messages, resolver, depth + 1).await,
+        Err(err) => {
+            debug_log!("forward resolve failed: id={} err={}", forward_id, err);
+            vec![MessageChunk {
+                text: forward_placeholder(forward_id),
+                attachments: Vec::new(),
+            }]
+        }
+    };
+    resolver.cache.insert(forward_id.to_string(), resolved.clone());
+    resolved
+}
+
+async fn fetch_forward_messages(
+    resolver: &ForwardResolver,
+    forward_id: &str,
+) -> Result<Vec<Value>, String> {
+    let url = format!("{}/get_forward_msg", resolver.api_base);
+    let mut req = resolver
+        .client
+        .post(url)
+        .json(&json!({ "message_id": forward_id }));
+    if let Some(token) = resolver.token.as_ref() {
+        req = req.header("Authorization", format!("Bearer {}", token));
+    }
+    let resp = req.send().await.map_err(|err| format!("http error: {}", err))?;
+    let status = resp.status();
+    let body: Value = resp.json().await.map_err(|err| format!("json error: {}", err))?;
+    if !status.is_success() {
+        return Err(format!("http status {}", status));
+    }
+    if body.get("status").and_then(|v| v.as_str()) != Some("ok") {
+        return Err(format!("napcat status {:?}", body.get("status")));
+    }
+    let messages = body
+        .get("data")
+        .and_then(|v| v.get("messages"))
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "missing forward messages".to_string())?;
+    Ok(messages.to_vec())
+}
+
+async fn forward_messages_to_chunks(
+    messages: &[Value],
+    resolver: &mut ForwardResolver,
+    depth: u32,
+) -> Vec<MessageChunk> {
+    let mut chunks = Vec::new();
+    for message in messages {
+        let payload = message.get("message").or_else(|| message.get("content"));
+        let (mut msg_chunks, _) =
+            extract_message_chunks(payload, Some(&mut *resolver), depth, false).await;
+        chunks.append(&mut msg_chunks);
+    }
+    chunks
+}
+
+async fn extract_message(
+    value: Option<&Value>,
+    resolver: &mut Option<ForwardResolver>,
+) -> (String, Vec<IngressAttachment>, Option<String>) {
+    let (chunks, reply_id) = extract_message_chunks(value, resolver.as_mut(), 0, true).await;
+    let mut parts = Vec::new();
+    let mut attachments = Vec::new();
+    for chunk in chunks {
+        if !chunk.text.is_empty() {
+            parts.push(chunk.text);
+        }
+        attachments.extend(chunk.attachments);
+    }
+    let text = parts.join("\n\n");
+    (text.trim().to_string(), attachments, reply_id)
+}
+
+pub(crate) fn extract_message_lite(value: Option<&Value>) -> (String, Vec<IngressAttachment>) {
     let mut text = String::new();
     let mut attachments = Vec::new();
-    let mut reply_id = None;
 
     match value {
         Some(Value::String(s)) => {
-            text.push_str(&extract_cq_faces(s, &mut attachments));
+            text.push_str(&extract_cq_faces(s));
         }
         Some(Value::Array(items)) => {
             for item in items {
@@ -580,16 +899,17 @@ fn extract_message(value: Option<&Value>) -> (String, Vec<IngressAttachment>, Op
                 let data = item.get("data");
                 match segment_type {
                     "text" => {
-                        if let Some(segment) = data.and_then(|d| d.get("text")).and_then(|v| v.as_str()) {
+                        if let Some(segment) =
+                            data.and_then(|d| d.get("text")).and_then(|v| v.as_str())
+                        {
                             text.push_str(segment);
                         }
                     }
                     "reply" => {
-                        if let Some(id) = data
-                            .and_then(|d| d.get("id"))
-                            .and_then(value_to_string)
-                        {
-                            reply_id = Some(id);
+                        if let Some(id) = data.and_then(|d| d.get("id")).and_then(value_to_string) {
+                            text.push_str(&format!("[回复:{}]", id));
+                        } else {
+                            text.push_str("[回复]");
                         }
                     }
                     "face" => {
@@ -597,12 +917,36 @@ fn extract_message(value: Option<&Value>) -> (String, Vec<IngressAttachment>, Op
                             .and_then(|d| d.get("id"))
                             .and_then(value_to_string)
                         {
-                            if !push_face_attachment(&id, &mut attachments) {
+                            if let Some(placeholder) = face_inline_placeholder(&id) {
+                                text.push_str(&placeholder);
+                            } else {
                                 text.push_str(&format!("[face:{}]", id));
                             }
                         }
                     }
+                    "json" => {
+                        text.push_str("[卡片]");
+                    }
+                    "forward" => {
+                        if let Some(id) =
+                            data.and_then(|d| d.get("id")).and_then(value_to_string)
+                        {
+                            text.push_str(&format!("[合并转发:{}]", id));
+                        } else {
+                            text.push_str("[合并转发]");
+                        }
+                    }
+                    "poke" => {
+                        text.push_str("[戳一戳]");
+                    }
                     "image" | "video" | "file" | "record" => {
+                        match segment_type {
+                            "image" => text.push_str("[图片]"),
+                            "video" => text.push_str("[视频]"),
+                            "file" => text.push_str("[文件]"),
+                            "record" => text.push_str("[语音]"),
+                            _ => {}
+                        }
                         if let Some(reference) = extract_reference(data) {
                             attachments.push(IngressAttachment {
                                 kind: match segment_type {
@@ -612,7 +956,10 @@ fn extract_message(value: Option<&Value>) -> (String, Vec<IngressAttachment>, Op
                                     "record" => MediaKind::Audio,
                                     _ => MediaKind::Other,
                                 },
-                                name: data.and_then(|d| d.get("name")).and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                name: data
+                                    .and_then(|d| d.get("name"))
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string()),
                                 reference,
                             });
                         }
@@ -624,7 +971,7 @@ fn extract_message(value: Option<&Value>) -> (String, Vec<IngressAttachment>, Op
         _ => {}
     }
 
-    (text.trim().to_string(), attachments, reply_id)
+    (text.trim().to_string(), attachments)
 }
 
 fn extract_reference(data: Option<&Value>) -> Option<MediaReference> {
@@ -641,7 +988,7 @@ fn extract_reference(data: Option<&Value>) -> Option<MediaReference> {
     None
 }
 
-fn extract_cq_faces(message: &str, attachments: &mut Vec<IngressAttachment>) -> String {
+fn extract_cq_faces(message: &str) -> String {
     let mut output = String::with_capacity(message.len());
     let mut remaining = message;
     loop {
@@ -658,14 +1005,13 @@ fn extract_cq_faces(message: &str, attachments: &mut Vec<IngressAttachment>) -> 
         };
         let segment = &rest[..=end];
         if let Some(face_id) = parse_cq_face_id(segment) {
-            if push_face_attachment(&face_id, attachments) {
-                let after = &rest[end + 1..];
-                if needs_space(&output, after) {
-                    output.push(' ');
-                }
-                remaining = after;
-                continue;
+            if let Some(placeholder) = face_inline_placeholder(&face_id) {
+                output.push_str(&placeholder);
+            } else {
+                output.push_str(&format!("[face:{}]", face_id));
             }
+            remaining = &rest[end + 1..];
+            continue;
         }
 
         output.push_str(segment);
@@ -692,29 +1038,13 @@ fn parse_cq_face_id(segment: &str) -> Option<String> {
     None
 }
 
-fn needs_space(prefix: &str, suffix: &str) -> bool {
-    let left_space = prefix.chars().last().map(|c| c.is_whitespace()).unwrap_or(false);
-    let right_space = suffix.chars().next().map(|c| c.is_whitespace()).unwrap_or(false);
-    !left_space && !right_space
-}
-
-fn push_face_attachment(face_id: &str, attachments: &mut Vec<IngressAttachment>) -> bool {
-    let Some(face_id) = normalize_face_id(face_id) else {
-        return false;
-    };
+fn face_inline_placeholder(face_id: &str) -> Option<String> {
+    let face_id = normalize_face_id(face_id)?;
     let path = Path::new("res").join("face").join(format!("{}.png", face_id));
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(_) => return false,
-    };
-    let encoded = STANDARD.encode(bytes);
-    let url = format!("data:image/png;base64,{}", encoded);
-    attachments.push(IngressAttachment {
-        kind: MediaKind::Image,
-        name: Some(format!("face-{}.png", face_id)),
-        reference: MediaReference::RemoteUrl { url },
-    });
-    true
+    if !path.exists() {
+        return None;
+    }
+    Some(format!("[[face:{}]]", face_id))
 }
 
 fn normalize_face_id(raw: &str) -> Option<String> {
@@ -1024,7 +1354,8 @@ fn build_audit_message(
 }
 
 fn sanitize_summary_line(text: &str) -> Option<String> {
-    let flattened = text.replace('\n', " ");
+    let with_cq = replace_face_placeholders_with_cq(text);
+    let flattened = with_cq.replace('\n', " ");
     let normalized = flattened.split_whitespace().collect::<Vec<_>>().join(" ");
     let trimmed = normalized.trim();
     if trimmed.is_empty() {
@@ -1041,6 +1372,101 @@ fn sanitize_summary_line(text: &str) -> Option<String> {
         out.push_str("...");
     }
     Some(out)
+}
+
+fn replace_face_placeholders_with_cq(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        if bytes[idx] == b'[' && bytes.get(idx + 1) == Some(&b'[') {
+            let rest = &text[idx..];
+            if rest.starts_with("[[face:") {
+                let after_prefix = idx + "[[face:".len();
+                if after_prefix <= text.len() {
+                    if let Some(close) = text[after_prefix..].find("]]") {
+                        let face_id = &text[after_prefix..after_prefix + close];
+                        if !face_id.is_empty() && face_id.chars().all(|c| c.is_ascii_digit()) {
+                            out.push_str("[CQ:face,id=");
+                            out.push_str(face_id);
+                            out.push(']');
+                            idx = after_prefix + close + 2;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        let ch = text[idx..].chars().next().unwrap();
+        out.push(ch);
+        idx += ch.len_utf8();
+    }
+    out
+}
+
+fn message_segments_from_text(text: &str) -> Vec<Value> {
+    let mut segments = Vec::new();
+    let mut buffer = String::new();
+    let bytes = text.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        if bytes[idx] == b'[' {
+            let rest = &text[idx..];
+            if let Some((face_id, consumed)) = parse_face_marker(rest) {
+                flush_text_segment(&mut segments, &mut buffer);
+                segments.push(serde_json::json!({
+                    "type": "face",
+                    "data": { "id": face_id }
+                }));
+                idx += consumed;
+                continue;
+            }
+        }
+        let ch = text[idx..].chars().next().unwrap();
+        buffer.push(ch);
+        idx += ch.len_utf8();
+    }
+    flush_text_segment(&mut segments, &mut buffer);
+    segments
+}
+
+fn flush_text_segment(segments: &mut Vec<Value>, buffer: &mut String) {
+    if buffer.is_empty() {
+        return;
+    }
+    segments.push(serde_json::json!({
+        "type": "text",
+        "data": { "text": buffer.clone() }
+    }));
+    buffer.clear();
+}
+
+fn parse_face_marker(rest: &str) -> Option<(String, usize)> {
+    if let Some(found) = parse_face_placeholder(rest, "[[face:", "]]") {
+        return Some(found);
+    }
+    if let Some(found) = parse_face_placeholder(rest, "[face:", "]") {
+        return Some(found);
+    }
+    if rest.starts_with("[CQ:face") {
+        let end = rest.find(']')?;
+        let segment = &rest[..=end];
+        let face_id = parse_cq_face_id(segment)?;
+        let face_id = normalize_face_id(&face_id)?;
+        return Some((face_id, end + 1));
+    }
+    None
+}
+
+fn parse_face_placeholder(rest: &str, prefix: &str, suffix: &str) -> Option<(String, usize)> {
+    if !rest.starts_with(prefix) {
+        return None;
+    }
+    let after_prefix = prefix.len();
+    let close = rest[after_prefix..].find(suffix)?;
+    let face_id = &rest[after_prefix..after_prefix + close];
+    let face_id = normalize_face_id(face_id)?;
+    Some((face_id, after_prefix + close + suffix.len()))
 }
 
 fn attachment_placeholder(kind: MediaKind) -> &'static str {
@@ -1240,7 +1666,7 @@ async fn send_group_text(out_tx: &mpsc::Sender<String>, group_id: &str, text: &s
     let payload = serde_json::json!({
         "action": "send_group_msg",
         "params": {
-            "group_id": group_id,
+            "group_id": json_id(group_id),
             "message": [{"type": "text", "data": {"text": text}}]
         }
     });
@@ -1262,4 +1688,74 @@ fn value_opt_to_string(value: Option<&Value>) -> Option<String> {
 fn next_echo(state: &mut NapCatState) -> String {
     state.next_echo = state.next_echo.saturating_add(1);
     format!("echo-{}", state.next_echo)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_help_and_review_with_code() {
+        assert_eq!(
+            parse_audit_command("帮助", false),
+            Some(AuditCommand::Global(GlobalAction::Help))
+        );
+        assert_eq!(
+            parse_audit_command("help", false),
+            Some(AuditCommand::Global(GlobalAction::Help))
+        );
+        assert_eq!(
+            parse_audit_command("123 是", false),
+            Some(AuditCommand::Review {
+                review_code: Some(123),
+                action: ReviewAction::Approve,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_global_and_quick_reply_actions() {
+        assert_eq!(
+            parse_audit_command("调出 42", false),
+            Some(AuditCommand::Global(GlobalAction::Recall { review_code: 42 }))
+        );
+        assert_eq!(
+            parse_audit_command("快捷回复 添加 hi=hello", false),
+            Some(AuditCommand::Global(GlobalAction::QuickReplyAdd {
+                key: "hi".to_string(),
+                text: "hello".to_string(),
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_quick_reply_requires_reply_context() {
+        assert_eq!(parse_audit_command("谢谢", false), None);
+        assert_eq!(
+            parse_audit_command("谢谢", true),
+            Some(AuditCommand::Review {
+                review_code: None,
+                action: ReviewAction::QuickReply {
+                    key: "谢谢".to_string(),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn message_segments_from_text_parses_faces() {
+        let segments = message_segments_from_text("a[[face:12]]b[face:34]c[CQ:face,id=56]!");
+        assert_eq!(
+            segments,
+            vec![
+                serde_json::json!({"type": "text", "data": {"text": "a"}}),
+                serde_json::json!({"type": "face", "data": {"id": "12"}}),
+                serde_json::json!({"type": "text", "data": {"text": "b"}}),
+                serde_json::json!({"type": "face", "data": {"id": "34"}}),
+                serde_json::json!({"type": "text", "data": {"text": "c"}}),
+                serde_json::json!({"type": "face", "data": {"id": "56"}}),
+                serde_json::json!({"type": "text", "data": {"text": "!"}}),
+            ]
+        );
+    }
 }

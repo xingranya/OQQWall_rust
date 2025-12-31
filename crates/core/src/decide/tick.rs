@@ -1,11 +1,12 @@
 use crate::command::TickCommand;
 use crate::config::CoreConfig;
 use crate::decide::builder::build_draft_from_messages;
+use crate::decide::flush::build_group_flush_events;
 use crate::decide::scheduler::{day_index, minute_of_day};
 use crate::decide::sender::{choose_account, AccountChoice};
 use crate::event::{
-    DraftEvent, Event, GroupFlushReason, RenderEvent, RenderFormat, ScheduleEvent, SendEvent,
-    SendPriority, SessionEvent,
+    DraftEvent, Event, GroupFlushReason, RenderEvent, ScheduleEvent, SendEvent, SendPriority,
+    SessionEvent,
 };
 use crate::ids::derive_post_id;
 use crate::state::StateView;
@@ -21,7 +22,7 @@ pub fn decide_tick(state: &StateView, cmd: &TickCommand, config: &CoreConfig) ->
     events
 }
 
-fn close_due_sessions(state: &StateView, cmd: &TickCommand, config: &CoreConfig) -> Vec<Event> {
+fn close_due_sessions(state: &StateView, cmd: &TickCommand, _config: &CoreConfig) -> Vec<Event> {
     let mut due_sessions = state
         .sessions
         .values()
@@ -62,18 +63,9 @@ fn close_due_sessions(state: &StateView, cmd: &TickCommand, config: &CoreConfig)
         }));
         events.push(Event::Render(RenderEvent::RenderRequested {
             post_id,
-            format: RenderFormat::Svg,
             attempt: 1,
             requested_at_ms: cmd.now_ms,
         }));
-        if config.render_png {
-            events.push(Event::Render(RenderEvent::RenderRequested {
-                post_id,
-                format: RenderFormat::Png,
-                attempt: 1,
-                requested_at_ms: cmd.now_ms,
-            }));
-        }
     }
 
     events
@@ -116,6 +108,7 @@ fn trigger_group_flush(state: &StateView, cmd: &TickCommand, config: &CoreConfig
             day_index: day,
             reason: GroupFlushReason::Scheduled,
         }));
+        events.extend(build_group_flush_events(state, group_id, cmd.now_ms));
     }
 
     events

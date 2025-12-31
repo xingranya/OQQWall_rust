@@ -53,7 +53,6 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let access_token =
         prompt_optional("本组 NapCat access_token（留空则运行时用环境变量）")?;
     let process_waittime_sec = prompt_u64("聚合窗口秒数（process_waittime_sec）", 20)?;
-    let render_png = prompt_bool("是否渲染 PNG（render_png）", false)?;
     let tz_offset_minutes = prompt_i64("时区偏移分钟数（中国大陆=480）", 480)?;
 
     let max_post_stack = prompt_u64("最大暂存条数（max_post_stack）", 1)?;
@@ -66,7 +65,6 @@ pub fn run(args: &[String]) -> Result<(), String> {
         "process_waittime_sec".to_string(),
         Value::Number(process_waittime_sec.into()),
     );
-    common.insert("render_png".to_string(), Value::Bool(render_png));
     common.insert(
         "tz_offset_minutes".to_string(),
         Value::Number(tz_offset_minutes.into()),

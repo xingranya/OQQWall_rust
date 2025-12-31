@@ -151,7 +151,7 @@ sudo systemctl stop OQQWall_RUST
   * 打开 `http://<host>:<web_review_port>/` 查看：
 
     * 待审核 / 待发送 / 发送中 / 失败 / 人工介入
-    * 预览 SVG 链接
+    * 预览 PNG 图
 * 若仅群内：
 
   * 使用全局指令（参见 `docs/command.md`）
@@ -292,7 +292,7 @@ journalctl -u OQQWall_RUST -n 200 --no-pager
 
 1. 看是否有 `ReviewPublishRequested` 事件
 2. 若有但没有 `ReviewPublished`，看失败原因（会有 retry）
-3. 改为 `svg_link` 模式（零渲染），验证链路
+3. 临时关闭预览（只发摘要文本），验证链路
 
 ### 7.4 发送队列积压不动
 
@@ -329,19 +329,19 @@ journalctl -u OQQWall_RUST -n 200 --no-pager
 2. 降低自动重启频率（加冷却窗口）
 3. 收集 NapCat stderr 日志
 
-### 7.6 渲染失败（SVG/PNG）
+### 7.6 渲染失败（PNG）
 
 可能原因：
 
 * 字体缺失（度量/布局失败）
 * 资源图标缺失（匿名头像、file icons）
-* PNG 转换库问题（若启用）
+* 渲染库问题（resvg/usvg）
 
 处理：
 
-1. 优先切回 `svg_link` 以确保审核不断
+1. 优先切回“仅摘要文本”以确保审核不断
 2. 检查资源是否随二进制正确打包
-3. 对文本做 XML escape，避免非法字符导致 SVG 无效
+3. 对文本做 XML escape，避免非法字符导致渲染失败
 
 ---
 
@@ -365,7 +365,7 @@ journalctl -u OQQWall_RUST -n 200 --no-pager
 
 ### 9.1 对低配机（2c2g）
 
-* 默认审核预览：`svg_link`
+* 默认审核预览：`png_low`
 * PNG 渲染线程池：1
 * 下载附件并发：2（或 1）
 * journal flush：每 50ms 或 256KB

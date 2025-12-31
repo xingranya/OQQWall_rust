@@ -49,16 +49,21 @@ pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) {
         handle.subscribe(),
         MediaFetcherRuntimeConfig::default(),
     );
-    debug_log!("spawn renderer");
-    spawn_renderer(
-        handle.cmd_tx.clone(),
-        handle.subscribe(),
-        RendererRuntimeConfig::default(),
-    );
     let mut napcat_by_group = HashMap::new();
     for group in &config.groups {
         napcat_by_group.insert(group.group_id.clone(), group.napcat.clone());
     }
+    debug_log!("spawn renderer");
+    let renderer_config = RendererRuntimeConfig {
+        napcat_by_group: napcat_by_group.clone(),
+        default_napcat: config.fallback_napcat.clone(),
+        ..RendererRuntimeConfig::default()
+    };
+    spawn_renderer(
+        handle.cmd_tx.clone(),
+        handle.subscribe(),
+        renderer_config,
+    );
     let runtime = QzoneRuntimeConfig {
         napcat_by_group,
         default_napcat: config.fallback_napcat.clone(),

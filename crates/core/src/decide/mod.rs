@@ -3,6 +3,7 @@ mod tick;
 mod review;
 mod global;
 mod driver;
+mod flush;
 mod scheduler;
 mod sender;
 

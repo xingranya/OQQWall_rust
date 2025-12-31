@@ -171,51 +171,27 @@ fn reduce_media(state: &mut StateView, event: &MediaEvent) {
 
 fn reduce_render(state: &mut StateView, event: &RenderEvent) {
     match event {
-        RenderEvent::RenderRequested { post_id, format, .. } => {
-            let meta = state.render.entry(*post_id).or_insert(RenderMeta {
-                svg_blob: None,
+        RenderEvent::RenderRequested { post_id, .. } => {
+            state.render.entry(*post_id).or_insert(RenderMeta {
                 png_blob: None,
                 last_error: None,
-                last_format: None,
             });
-            meta.last_format = Some(*format);
             state.update_post_stage(*post_id, PostStage::RenderRequested);
-        }
-        RenderEvent::SvgReady { post_id, blob_id } => {
-            let meta = state.render.entry(*post_id).or_insert(RenderMeta {
-                svg_blob: None,
-                png_blob: None,
-                last_error: None,
-                last_format: None,
-            });
-            meta.svg_blob = Some(*blob_id);
-            meta.last_error = None;
-            state.update_post_stage(*post_id, PostStage::Rendered);
         }
         RenderEvent::PngReady { post_id, blob_id } => {
             let meta = state.render.entry(*post_id).or_insert(RenderMeta {
-                svg_blob: None,
                 png_blob: None,
                 last_error: None,
-                last_format: None,
             });
             meta.png_blob = Some(*blob_id);
             meta.last_error = None;
             state.update_post_stage(*post_id, PostStage::Rendered);
         }
-        RenderEvent::RenderFailed {
-            post_id,
-            format,
-            error,
-            ..
-        } => {
+        RenderEvent::RenderFailed { post_id, error, .. } => {
             let meta = state.render.entry(*post_id).or_insert(RenderMeta {
-                svg_blob: None,
                 png_blob: None,
                 last_error: None,
-                last_format: None,
             });
-            meta.last_format = Some(*format);
             meta.last_error = Some(error.clone());
             state.update_post_stage(*post_id, PostStage::Failed);
         }
@@ -239,6 +215,7 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
                     decision: None,
                     audit_msg_id: None,
                     delayed_until_ms: None,
+                    needs_republish: false,
                     decided_by: None,
                     decided_at_ms: None,
                 },
@@ -255,6 +232,7 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
             let post_id = state.reviews.get(review_id).map(|meta| meta.post_id);
             if let Some(meta) = state.reviews.get_mut(review_id) {
                 meta.delayed_until_ms = None;
+                meta.needs_republish = false;
             }
             if let Some(post_id) = post_id {
                 state.update_post_stage(post_id, PostStage::ReviewPending);
@@ -277,6 +255,13 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
         } => {
             if let Some(meta) = state.reviews.get_mut(review_id) {
                 meta.delayed_until_ms = Some(*not_before_ms);
+            }
+        }
+        ReviewEvent::ReviewRefreshRequested { review_id }
+        | ReviewEvent::ReviewRerenderRequested { review_id }
+        | ReviewEvent::ReviewSelectAllRequested { review_id } => {
+            if let Some(meta) = state.reviews.get_mut(review_id) {
+                meta.needs_republish = true;
             }
         }
         ReviewEvent::ReviewDecisionRecorded {
@@ -303,9 +288,6 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
         }
         ReviewEvent::ReviewCommentAdded { .. }
         | ReviewEvent::ReviewReplyRequested { .. }
-        | ReviewEvent::ReviewRefreshRequested { .. }
-        | ReviewEvent::ReviewRerenderRequested { .. }
-        | ReviewEvent::ReviewSelectAllRequested { .. }
         | ReviewEvent::ReviewAnonToggled { .. }
         | ReviewEvent::ReviewExpandRequested { .. }
         | ReviewEvent::ReviewDisplayRequested { .. }

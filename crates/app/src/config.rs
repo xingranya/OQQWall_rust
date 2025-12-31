@@ -73,17 +73,14 @@ impl AppConfig {
             })
             .unwrap_or(20_000);
 
-        let render_png = parse_bool(common.get("render_png")).unwrap_or(false);
         let tz_offset_minutes = parse_i64(common.get("tz_offset_minutes"))
             .unwrap_or(0) as i32;
         debug_log!(
-            "config parsed: render_png={} tz_offset_minutes={} default_process_waittime_ms={}",
-            render_png,
+            "config parsed: tz_offset_minutes={} default_process_waittime_ms={}",
             tz_offset_minutes,
             default_process_waittime_ms
         );
-        let core_config =
-            build_core_config(&common, &groups, default_process_waittime_ms, render_png);
+        let core_config = build_core_config(&common, &groups, default_process_waittime_ms);
         let fallback_napcat = parse_napcat_config_optional(&common);
 
         let mut group_configs = Vec::new();
@@ -217,10 +214,8 @@ fn build_core_config(
     common: &Value,
     groups: &HashMap<String, Value>,
     default_process_waittime_ms: i64,
-    render_png: bool,
 ) -> CoreConfig {
     let mut core = CoreConfig::default();
-    core.render_png = render_png;
     core.default_process_waittime_ms = default_process_waittime_ms;
     core.default_min_interval_ms = parse_duration_ms(common.get("min_interval_ms"))
         .or_else(|| parse_duration_ms(common.get("min_interval_sec")).map(|v| v.saturating_mul(1000)))

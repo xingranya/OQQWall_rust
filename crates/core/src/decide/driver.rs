@@ -1,39 +1,26 @@
 use crate::config::CoreConfig;
-use crate::event::{
-    Event, RenderEvent, ReviewEvent, ScheduleEvent, SendEvent, SendPriority,
-};
+use crate::event::{Event, RenderEvent, ReviewEvent, ScheduleEvent, SendEvent, SendPriority};
 use crate::ids::derive_review_id;
 use crate::state::StateView;
 
-pub fn decide_driver_event(state: &StateView, event: &Event, config: &CoreConfig) -> Vec<Event> {
-    match event {
-        Event::Render(RenderEvent::SvgReady { post_id, .. }) => {
-            if !state.posts.contains_key(post_id) {
-                return Vec::new();
-            }
-            let review_id = derive_review_id(&[&post_id.to_be_bytes()]);
-            if state.reviews.contains_key(&review_id) {
-                return Vec::new();
-            }
-            let review_code = state.next_review_code;
-            let mut events = vec![Event::Review(ReviewEvent::ReviewItemCreated {
-                review_id,
-                post_id: *post_id,
-                review_code,
-            })];
-            if !config.render_png {
-                events.push(Event::Review(ReviewEvent::ReviewPublishRequested { review_id }));
-            }
-            events
-        }
+pub fn decide_driver_event(state: &StateView, event: &Event, _config: &CoreConfig) -> Vec<Event> {
+    // Driver events come from IO drivers. They must flow into the event stream
+    // (reduce/broadcast), otherwise other drivers cannot observe key events like
+    // BlobPersisted / RenderReady / MediaFetchSucceeded / SendSucceeded.
+    // Pass through the original event and append any derived events as needed.
+    let mut out = vec![event.clone()];
+
+    let derived = match event {
         Event::Render(RenderEvent::PngReady { post_id, .. }) => {
-            if !config.render_png {
-                return Vec::new();
-            }
             if !state.posts.contains_key(post_id) {
-                return Vec::new();
+                return out;
             }
             let review_id = derive_review_id(&[&post_id.to_be_bytes()]);
+            let needs_republish = state
+                .reviews
+                .get(&review_id)
+                .map(|meta| meta.needs_republish)
+                .unwrap_or(false);
             let mut events = Vec::new();
             if !state.reviews.contains_key(&review_id) {
                 let review_code = state.next_review_code;
@@ -48,7 +35,7 @@ pub fn decide_driver_event(state: &StateView, event: &Event, config: &CoreConfig
                 .get(&review_id)
                 .and_then(|meta| meta.audit_msg_id.as_ref())
                 .is_some();
-            if !already_published {
+            if needs_republish || !already_published {
                 events.push(Event::Review(ReviewEvent::ReviewPublishRequested { review_id }));
             }
             events
@@ -73,5 +60,8 @@ pub fn decide_driver_event(state: &StateView, event: &Event, config: &CoreConfig
             })]
         }
         _ => Vec::new(),
-    }
+    };
+
+    out.extend(derived);
+    out
 }

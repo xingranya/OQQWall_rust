@@ -45,15 +45,16 @@ async fn main() {
     );
     let core_config = app_config.build_core_config();
     debug_log!(
-        "core config: render_png={} default_wait_ms={} default_min_interval_ms={} default_max_queue={} groups={}",
-        core_config.render_png,
+        "core config: default_wait_ms={} default_min_interval_ms={} default_max_queue={} groups={}",
         core_config.default_process_waittime_ms,
         core_config.default_min_interval_ms,
         core_config.default_max_queue,
         core_config.groups.len()
     );
-    let (engine, handle) = Engine::new(core_config);
-    debug_log!("engine created");
+    let data_dir = env::var("OQQWALL_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+    let (engine, handle) =
+        Engine::new(core_config, &data_dir).expect("failed to init engine");
+    debug_log!("engine created: data_dir={}", data_dir);
     let _status = status::spawn_status_logger(&handle);
     debug_log!("status logger spawned");
     spawn_napcat_drivers(&handle, &app_config);

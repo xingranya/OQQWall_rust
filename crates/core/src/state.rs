@@ -1,13 +1,14 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::draft::{Draft, IngressMessage, MediaReference};
-use crate::event::{RenderFormat, ReviewDecision, SendPriority};
+use crate::event::{ReviewDecision, SendPriority};
 use crate::ids::{
     AccountId, AuditMsgId, BlobId, EventId, GroupId, IngressId, PostId, ReviewCode, ReviewId,
     SessionId, TimestampMs,
 };
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngressMeta {
     pub profile_id: String,
     pub chat_id: String,
@@ -18,14 +19,14 @@ pub struct IngressMeta {
     pub received_at_ms: TimestampMs,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionKey {
     pub chat_id: String,
     pub user_id: String,
     pub group_id: GroupId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMeta {
     pub session_id: SessionId,
     pub key: SessionKey,
@@ -34,7 +35,7 @@ pub struct SessionMeta {
     pub close_at_ms: TimestampMs,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PostStage {
     Drafted,
     RenderRequested,
@@ -50,7 +51,7 @@ pub enum PostStage {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PostMeta {
     pub post_id: PostId,
     pub session_id: SessionId,
@@ -61,15 +62,13 @@ pub struct PostMeta {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenderMeta {
-    pub svg_blob: Option<BlobId>,
     pub png_blob: Option<BlobId>,
     pub last_error: Option<String>,
-    pub last_format: Option<RenderFormat>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewMeta {
     pub review_id: ReviewId,
     pub post_id: PostId,
@@ -77,11 +76,12 @@ pub struct ReviewMeta {
     pub decision: Option<ReviewDecision>,
     pub audit_msg_id: Option<AuditMsgId>,
     pub delayed_until_ms: Option<TimestampMs>,
+    pub needs_republish: bool,
     pub decided_by: Option<String>,
     pub decided_at_ms: Option<TimestampMs>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendPlan {
     pub post_id: PostId,
     pub group_id: GroupId,
@@ -90,7 +90,7 @@ pub struct SendPlan {
     pub seq: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendDueKey {
     pub not_before_ms: TimestampMs,
     pub priority: SendPriority,
@@ -111,7 +111,7 @@ impl PartialOrd for SendDueKey {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendingMeta {
     pub post_id: PostId,
     pub group_id: GroupId,
@@ -119,20 +119,20 @@ pub struct SendingMeta {
     pub started_at_ms: TimestampMs,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountRuntime {
     pub enabled: bool,
     pub cooldown_until_ms: Option<TimestampMs>,
     pub last_send_ms: Option<TimestampMs>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupRuntime {
     pub last_flush_mark: HashMap<u16, i64>,
     pub last_send_ms: Option<TimestampMs>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobMeta {
     pub blob_id: BlobId,
     pub size_bytes: u64,
@@ -140,7 +140,7 @@ pub struct BlobMeta {
     pub ref_count: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateView {
     pub last_event_id: Option<EventId>,
     pub last_ts_ms: Option<TimestampMs>,

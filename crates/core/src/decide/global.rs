@@ -1,5 +1,6 @@
 use crate::command::{GlobalAction, GlobalActionCommand};
 use crate::config::CoreConfig;
+use crate::decide::flush::build_group_flush_events;
 use crate::decide::scheduler::{day_index, minute_of_day};
 use crate::event::{Event, GroupFlushReason, ScheduleEvent};
 use crate::state::StateView;
@@ -10,12 +11,16 @@ pub fn decide_global_action(
     _config: &CoreConfig,
 ) -> Vec<Event> {
     match &cmd.action {
-        GlobalAction::SendQueueFlush => vec![Event::Schedule(ScheduleEvent::GroupFlushRequested {
-            group_id: cmd.group_id.clone(),
-            minute_of_day: minute_of_day(cmd.now_ms, cmd.tz_offset_minutes),
-            day_index: day_index(cmd.now_ms, cmd.tz_offset_minutes),
-            reason: GroupFlushReason::Manual,
-        })],
+        GlobalAction::SendQueueFlush => {
+            let mut events = vec![Event::Schedule(ScheduleEvent::GroupFlushRequested {
+                group_id: cmd.group_id.clone(),
+                minute_of_day: minute_of_day(cmd.now_ms, cmd.tz_offset_minutes),
+                day_index: day_index(cmd.now_ms, cmd.tz_offset_minutes),
+                reason: GroupFlushReason::Manual,
+            })];
+            events.extend(build_group_flush_events(state, &cmd.group_id, cmd.now_ms));
+            events
+        }
         GlobalAction::SendQueueClear => {
             let post_ids = state
                 .send_plans

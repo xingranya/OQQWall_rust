@@ -1,5 +1,7 @@
 use oqqwall_rust_core::decide::decide;
-use oqqwall_rust_core::event::{DraftEvent, RenderEvent, RenderFormat, SessionEvent};
+use oqqwall_rust_core::event::{
+    DraftEvent, GroupFlushReason, RenderEvent, ScheduleEvent, SendPriority, SessionEvent,
+};
 use oqqwall_rust_core::{
     Command, CoreConfig, Event, EventEnvelope, GroupConfig, Id128, IngressAttachment,
     IngressCommand, IngressMessage, MediaKind, MediaReference, StateView, TickCommand,
@@ -72,8 +74,7 @@ fn tick_closes_session_and_creates_draft() {
                 assert_eq!(ingress_ids.len(), 1);
                 saw_draft = true;
             }
-            Event::Render(RenderEvent::RenderRequested { format, .. }) => {
-                assert_eq!(format, RenderFormat::Svg);
+            Event::Render(RenderEvent::RenderRequested { .. }) => {
                 saw_render = true;
             }
             _ => {}
@@ -83,4 +84,108 @@ fn tick_closes_session_and_creates_draft() {
     assert!(saw_close);
     assert!(saw_draft);
     assert!(saw_render);
+}
+
+#[test]
+fn tick_group_flush_is_idempotent_for_same_minute() {
+    let mut config = CoreConfig::default();
+    config.groups.insert(
+        "group-a".to_string(),
+        GroupConfig {
+            group_id: "group-a".to_string(),
+            send_schedule_minutes: vec![0],
+            ..Default::default()
+        },
+    );
+
+    let state = StateView::default();
+    let tick = TickCommand {
+        now_ms: 0,
+        tz_offset_minutes: 0,
+    };
+
+    let events = decide(&state, &Command::Tick(tick.clone()), &config);
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        Event::Schedule(ScheduleEvent::GroupFlushRequested {
+            group_id,
+            minute_of_day,
+            day_index,
+            reason,
+        }) => {
+            assert_eq!(group_id, "group-a");
+            assert_eq!(*minute_of_day, 0);
+            assert_eq!(*day_index, 0);
+            assert_eq!(*reason, GroupFlushReason::Scheduled);
+        }
+        _ => panic!("expected GroupFlushRequested"),
+    }
+
+    let mut reduced = state;
+    for (idx, event) in events.into_iter().enumerate() {
+        reduced = reduced.reduce(&wrap(event, idx as u128 + 1));
+    }
+
+    let events_again = decide(&reduced, &Command::Tick(tick), &config);
+    assert!(events_again.is_empty());
+}
+
+#[test]
+fn tick_group_flush_reschedules_send_plans() {
+    let mut config = CoreConfig::default();
+    config.groups.insert(
+        "group-a".to_string(),
+        GroupConfig {
+            group_id: "group-a".to_string(),
+            send_schedule_minutes: vec![0],
+            ..Default::default()
+        },
+    );
+
+    let post_id = Id128(90);
+    let mut state = StateView::default();
+    state = state.reduce(&wrap(
+        Event::Schedule(ScheduleEvent::SendPlanCreated {
+            post_id,
+            group_id: "group-a".to_string(),
+            not_before_ms: 10_000,
+            priority: SendPriority::Normal,
+            seq: 3,
+        }),
+        1,
+    ));
+
+    let tick = TickCommand {
+        now_ms: 0,
+        tz_offset_minutes: 0,
+    };
+    let events = decide(&state, &Command::Tick(tick), &config);
+
+    let mut saw_flush = false;
+    let mut saw_reschedule = false;
+    for event in events {
+        match event {
+            Event::Schedule(ScheduleEvent::GroupFlushRequested { group_id, .. }) => {
+                assert_eq!(group_id, "group-a");
+                saw_flush = true;
+            }
+            Event::Schedule(ScheduleEvent::SendPlanRescheduled {
+                post_id: event_post_id,
+                group_id,
+                not_before_ms,
+                seq,
+                ..
+            }) => {
+                assert_eq!(event_post_id, post_id);
+                assert_eq!(group_id, "group-a");
+                assert_eq!(not_before_ms, 0);
+                assert_eq!(seq, 3);
+                saw_reschedule = true;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(saw_flush);
+    assert!(saw_reschedule);
 }

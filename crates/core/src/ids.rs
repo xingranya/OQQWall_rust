@@ -1,9 +1,11 @@
+use serde::{Deserialize, Serialize};
+
 pub type TimestampMs = i64;
 pub type GroupId = String;
 pub type AccountId = String;
 pub type ReviewCode = u32;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Id128(pub u128);
 
 impl Id128 {
