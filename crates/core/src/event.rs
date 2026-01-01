@@ -59,6 +59,17 @@ pub enum IngressEvent {
         received_at_ms: TimestampMs,
         message: IngressMessage,
     },
+    MessageSynced {
+        ingress_id: IngressId,
+        profile_id: String,
+        chat_id: String,
+        user_id: String,
+        sender_name: Option<String>,
+        group_id: GroupId,
+        platform_msg_id: String,
+        received_at_ms: TimestampMs,
+        message: IngressMessage,
+    },
     MessageIgnored {
         ingress_id: IngressId,
         reason: IngressIgnoreReason,
@@ -200,6 +211,11 @@ pub enum ReviewEvent {
     ReviewQuickReplyRequested {
         review_id: ReviewId,
         key: String,
+    },
+    ReviewInfoSynced {
+        review_id: ReviewId,
+        post_id: PostId,
+        review_code: ReviewCode,
     },
 }
 

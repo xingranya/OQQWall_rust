@@ -79,6 +79,9 @@ pub fn spawn_media_fetcher(
             match env.event {
                 Event::Ingress(IngressEvent::MessageAccepted {
                     ingress_id, message, ..
+                })
+                | Event::Ingress(IngressEvent::MessageSynced {
+                    ingress_id, message, ..
                 }) => {
                     let mut guard = state.lock().await;
                     guard.ingress_messages.insert(ingress_id, message);

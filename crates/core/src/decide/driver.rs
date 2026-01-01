@@ -16,26 +16,30 @@ pub fn decide_driver_event(state: &StateView, event: &Event, _config: &CoreConfi
                 return out;
             }
             let review_id = derive_review_id(&[&post_id.to_be_bytes()]);
-            let needs_republish = state
-                .reviews
-                .get(&review_id)
+            let review_meta = state.reviews.get(&review_id);
+            let needs_republish = review_meta
                 .map(|meta| meta.needs_republish)
                 .unwrap_or(false);
             let mut events = Vec::new();
-            if !state.reviews.contains_key(&review_id) {
-                let review_code = state.next_review_code;
+            let review_code = review_meta
+                .map(|meta| meta.review_code)
+                .unwrap_or(state.next_review_code);
+            if review_meta.is_none() {
                 events.push(Event::Review(ReviewEvent::ReviewItemCreated {
                     review_id,
                     post_id: *post_id,
                     review_code,
                 }));
             }
-            let already_published = state
-                .reviews
-                .get(&review_id)
+            let already_published = review_meta
                 .and_then(|meta| meta.audit_msg_id.as_ref())
                 .is_some();
             if needs_republish || !already_published {
+                events.push(Event::Review(ReviewEvent::ReviewInfoSynced {
+                    review_id,
+                    post_id: *post_id,
+                    review_code,
+                }));
                 events.push(Event::Review(ReviewEvent::ReviewPublishRequested { review_id }));
             }
             events

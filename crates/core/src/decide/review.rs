@@ -4,7 +4,8 @@ use crate::decide::builder::build_draft_from_messages;
 use crate::decide::flush::build_group_flush_events;
 use crate::decide::scheduler::{compute_not_before, day_index, minute_of_day};
 use crate::event::{
-    DraftEvent, Event, RenderEvent, ReviewDecision, ReviewEvent, ScheduleEvent, SendPriority,
+    DraftEvent, Event, IngressEvent, RenderEvent, ReviewDecision, ReviewEvent, ScheduleEvent,
+    SendPriority,
 };
 use crate::ids::ReviewId;
 use crate::state::StateView;
@@ -68,6 +69,7 @@ pub fn decide_review_action(
         ReviewAction::Immediate => build_immediate_events(state, cmd, config, review_id, post_id, group_id),
         ReviewAction::Refresh => {
             let mut events = Vec::new();
+            events.extend(build_ingress_sync_events(state, post_id));
             if let Some(draft_event) = rebuild_draft_event(state, post_id, cmd.now_ms) {
                 events.push(Event::Draft(draft_event));
             }
@@ -79,16 +81,19 @@ pub fn decide_review_action(
             }));
             events
         }
-        ReviewAction::Rerender => vec![
-            Event::Review(ReviewEvent::ReviewRerenderRequested { review_id }),
-            Event::Render(RenderEvent::RenderRequested {
+        ReviewAction::Rerender => {
+            let mut events = build_ingress_sync_events(state, post_id);
+            events.push(Event::Review(ReviewEvent::ReviewRerenderRequested { review_id }));
+            events.push(Event::Render(RenderEvent::RenderRequested {
                 post_id,
                 attempt: 1,
                 requested_at_ms: cmd.now_ms,
-            }),
-        ],
+            }));
+            events
+        }
         ReviewAction::SelectAllMessages => {
             let mut events = Vec::new();
+            events.extend(build_ingress_sync_events(state, post_id));
             if let Some(draft_event) = rebuild_draft_event(state, post_id, cmd.now_ms) {
                 events.push(Event::Draft(draft_event));
             }
@@ -266,4 +271,31 @@ fn rebuild_draft_event(
         draft,
         created_at_ms: now_ms,
     })
+}
+
+fn build_ingress_sync_events(state: &StateView, post_id: crate::ids::PostId) -> Vec<Event> {
+    let Some(ingress_ids) = state.post_ingress.get(&post_id) else {
+        return Vec::new();
+    };
+    let mut events = Vec::new();
+    for ingress_id in ingress_ids {
+        let Some(meta) = state.ingress_meta.get(ingress_id) else {
+            continue;
+        };
+        let Some(message) = state.ingress_messages.get(ingress_id) else {
+            continue;
+        };
+        events.push(Event::Ingress(IngressEvent::MessageSynced {
+            ingress_id: *ingress_id,
+            profile_id: meta.profile_id.clone(),
+            chat_id: meta.chat_id.clone(),
+            user_id: meta.user_id.clone(),
+            sender_name: meta.sender_name.clone(),
+            group_id: meta.group_id.clone(),
+            platform_msg_id: meta.platform_msg_id.clone(),
+            received_at_ms: meta.received_at_ms,
+            message: message.clone(),
+        }));
+    }
+    events
 }

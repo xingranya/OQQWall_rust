@@ -367,6 +367,13 @@ async fn build_action_from_event(
             sender_name,
             message,
             ..
+        })
+        | Event::Ingress(IngressEvent::MessageSynced {
+            ingress_id,
+            user_id,
+            sender_name,
+            message,
+            ..
         }) => {
             let mut guard = state.lock().await;
             guard.ingress_summary.insert(
@@ -383,6 +390,22 @@ async fn build_action_from_event(
         Event::Draft(DraftEvent::PostDraftCreated { post_id, ingress_ids, .. }) => {
             let mut guard = state.lock().await;
             guard.post_ingress.insert(post_id, ingress_ids);
+            None
+        }
+        Event::Review(ReviewEvent::ReviewInfoSynced {
+            review_id,
+            post_id,
+            review_code,
+        }) => {
+            let mut guard = state.lock().await;
+            guard.review_info.insert(
+                review_id,
+                ReviewInfo {
+                    review_code,
+                    post_id,
+                },
+            );
+            guard.review_by_code.insert(review_code, review_id);
             None
         }
         Event::Review(ReviewEvent::ReviewItemCreated {
@@ -581,44 +604,50 @@ async fn parse_inbound_event(
             reply_id.is_some()
         );
         let chat_group_id = value_opt_to_string(value.get("group_id"))?;
-        if runtime.audit_group_id.as_deref() == Some(chat_group_id.as_str()) {
-            if let Some(command) = parse_audit_command(&text, reply_id.is_some()) {
-                if !is_admin_sender(value) {
-                    send_group_text(out_tx, &chat_group_id, "无权限执行指令").await;
+        let is_audit_group =
+            runtime.audit_group_id.as_deref() == Some(chat_group_id.as_str());
+        if let Some(command) = parse_audit_command(&text, reply_id.is_some()) {
+            if !is_admin_sender(value) {
+                send_group_text(out_tx, &chat_group_id, "无权限执行指令").await;
+                return None;
+            }
+            if runtime.audit_group_id.is_some() && !is_audit_group {
+                send_group_text(out_tx, &chat_group_id, "当前群未配置为审核群").await;
+                return None;
+            }
+            match command {
+                AuditCommand::Global(GlobalAction::Help) => {
+                    send_group_text(out_tx, &chat_group_id, "已收到指令").await;
+                    send_group_text(out_tx, &chat_group_id, HELP_TEXT).await;
                     return None;
                 }
-                match command {
-                    AuditCommand::Global(GlobalAction::Help) => {
-                        send_group_text(out_tx, &chat_group_id, "已收到指令").await;
-                        send_group_text(out_tx, &chat_group_id, HELP_TEXT).await;
-                        return None;
-                    }
-                    AuditCommand::Global(action) => {
-                        send_group_text(out_tx, &chat_group_id, "已收到指令").await;
-                        return Some(Command::GlobalAction(GlobalActionCommand {
-                            group_id: runtime.group_id.clone(),
-                            action,
-                            operator_id: user_id.to_string(),
-                            now_ms: timestamp_ms,
-                            tz_offset_minutes: runtime.tz_offset_minutes,
-                        }));
-                    }
-                    AuditCommand::Review { review_code, action } => {
-                        return parse_review_command(
-                            runtime,
-                            state,
-                            out_tx,
-                            &user_id,
-                            &chat_group_id,
-                            review_code,
-                            action,
-                            reply_id,
-                            timestamp_ms,
-                        )
-                        .await;
-                    }
+                AuditCommand::Global(action) => {
+                    send_group_text(out_tx, &chat_group_id, "已收到指令").await;
+                    return Some(Command::GlobalAction(GlobalActionCommand {
+                        group_id: runtime.group_id.clone(),
+                        action,
+                        operator_id: user_id.to_string(),
+                        now_ms: timestamp_ms,
+                        tz_offset_minutes: runtime.tz_offset_minutes,
+                    }));
+                }
+                AuditCommand::Review { review_code, action } => {
+                    return parse_review_command(
+                        runtime,
+                        state,
+                        out_tx,
+                        &user_id,
+                        &chat_group_id,
+                        review_code,
+                        action,
+                        reply_id,
+                        timestamp_ms,
+                    )
+                    .await;
                 }
             }
+        }
+        if is_audit_group {
             return None;
         }
         debug_log!(
@@ -1067,7 +1096,7 @@ async fn parse_review_command(
 
     if let Some(reply_id) = reply_id.as_ref() {
         let guard = state.lock().await;
-        if let Some(mapped) = guard.audit_msg_to_review.get(&reply_id) {
+        if let Some(mapped) = guard.audit_msg_to_review.get(reply_id.as_str()) {
             review_id = Some(*mapped);
             review_code = None;
         }

@@ -199,6 +199,13 @@ pub fn spawn_qzone_sender(
                     sender_name,
                     message,
                     ..
+                })
+                | Event::Ingress(IngressEvent::MessageSynced {
+                    ingress_id,
+                    user_id,
+                    sender_name,
+                    message,
+                    ..
                 }) => {
                     let mut guard = state.lock().await;
                     guard.ingress_messages.insert(ingress_id, message);
@@ -239,6 +246,14 @@ pub fn spawn_qzone_sender(
                     guard.post_ingress.insert(post_id, ingress_ids);
                 }
                 Event::Review(ReviewEvent::ReviewItemCreated {
+                    post_id,
+                    review_code,
+                    ..
+                }) => {
+                    let mut guard = state.lock().await;
+                    guard.review_codes.insert(post_id, review_code);
+                }
+                Event::Review(ReviewEvent::ReviewInfoSynced {
                     post_id,
                     review_code,
                     ..

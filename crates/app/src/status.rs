@@ -33,6 +33,7 @@ pub fn spawn_status_logger(handle: &EngineHandle) -> JoinHandle<()> {
                         group_id, user_id, attachment_count, text
                     );
                 }
+                Event::Ingress(IngressEvent::MessageSynced { .. }) => {}
                 Event::Draft(DraftEvent::PostDraftCreated {
                     post_id,
                     group_id,

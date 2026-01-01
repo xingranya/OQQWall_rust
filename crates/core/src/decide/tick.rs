@@ -76,6 +76,11 @@ fn trigger_review_delays(state: &StateView, cmd: &TickCommand) -> Vec<Event> {
     for review in state.reviews.values() {
         if let Some(delay_until) = review.delayed_until_ms {
             if cmd.now_ms >= delay_until {
+                events.push(Event::Review(crate::event::ReviewEvent::ReviewInfoSynced {
+                    review_id: review.review_id,
+                    post_id: review.post_id,
+                    review_code: review.review_code,
+                }));
                 events.push(Event::Review(crate::event::ReviewEvent::ReviewPublishRequested {
                     review_id: review.review_id,
                 }));

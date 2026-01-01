@@ -51,6 +51,17 @@ fn reduce_ingress(state: &mut StateView, event: &IngressEvent) {
             platform_msg_id,
             received_at_ms,
             message,
+        }
+        | IngressEvent::MessageSynced {
+            ingress_id,
+            profile_id,
+            chat_id,
+            user_id,
+            sender_name,
+            group_id,
+            platform_msg_id,
+            received_at_ms,
+            message,
         } => {
             state.ingress_seen.insert(*ingress_id);
             state.ingress_meta.insert(
@@ -292,7 +303,8 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
         | ReviewEvent::ReviewExpandRequested { .. }
         | ReviewEvent::ReviewDisplayRequested { .. }
         | ReviewEvent::ReviewBlacklistRequested { .. }
-        | ReviewEvent::ReviewQuickReplyRequested { .. } => {}
+        | ReviewEvent::ReviewQuickReplyRequested { .. }
+        | ReviewEvent::ReviewInfoSynced { .. } => {}
     }
 }
 
