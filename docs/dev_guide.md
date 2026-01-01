@@ -191,6 +191,7 @@
 
 * `ingress_seen`（去重）+ `ingress store`（消息内容/附件状态）
 * `sessions` + `session_by_key` + `session_close_index`
+* `input_status`（按 `(chat,user)` 记录最新状态与时间戳，用于延迟成稿）
 * `posts` + `posts_by_stage`
 * `drafts` / `render` / `review` / `send_plans` / `sending`
 * `review_by_code` / `review_by_audit_msg`
@@ -213,6 +214,7 @@
 ## 7.1 Command 类型
 
 * `OneBotMessage{ profile, chat, user, msg_id, ts, text, attachments }`
+* `InputStatus{ profile, chat, user, status, ts }`（来自 `notice.notify.input_status`）
 * `TimerTick{ now_ms }`
 * Driver 产出 `EventEnvelope`，并通过 `Command::DriverEvent(EventEnvelope)` 送回引擎（Driver 不直接写 journal/改 state）
 
@@ -221,7 +223,12 @@
 输出事件组合：
 
 1. 去重：seen → `IngressMessageIgnored`；否则 `IngressMessageAccepted`
-2. session 聚合：按 `(chat,user)` open/append，计算 `close_at = last_msg + waittime`
+2. session 聚合：按 `(chat,user)` open/append，计算 `close_at = last_activity + waittime`
+   * `last_activity` 取消息时间与输入状态时间的较新值
+   * 若 `input_status=typing`，在 waittime 内不允许成稿（持续延后 close_at）
+   * 若 `input_status=stopped`，从停止时间开始重新计时 waittime
+   * 若 `input_status` 连续超过 30 分钟仍为 typing，则判定异常并忽略输入状态，直接成稿
+   * 若收到消息前从未出现 `input_status`，认为终端不支持 typing，上述 waittime 改为 `waittime * 2`
 3. 审核指令解析：仅审核群 + 命令格式 → `ReviewApproved/Rejected/Delayed/Route/Send…`
 4. 附件下载请求：对有 URL 且尚未请求的 attachment → `MediaFetchRequested`
 
@@ -231,7 +238,7 @@
 
 tick 做三类事情：
 
-1. **关闭到期 session**：`now>=close_at` → `DraftSessionClosed`
+1. **关闭到期 session**：`now>=close_at` 且 `input_status` 非 typing → `DraftSessionClosed`
    然后对刚关闭 session：创建 `PostDraftCreated` + `RenderRequested`
 2. **审核发布重试**：`review_publish.failed && now>=retry_at` → `ReviewPublishRequested`
 3. **发送启动**：

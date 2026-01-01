@@ -57,6 +57,7 @@ pub enum ReviewAction {
     Reply { text: String },
     Blacklist { reason: Option<String> },
     QuickReply { key: String },
+    Merge { review_code: ReviewCode },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

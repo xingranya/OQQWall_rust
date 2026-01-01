@@ -5,11 +5,13 @@ use crate::decide::flush::build_group_flush_events;
 use crate::decide::scheduler::{day_index, minute_of_day};
 use crate::decide::sender::{choose_account, AccountChoice};
 use crate::event::{
-    DraftEvent, Event, GroupFlushReason, RenderEvent, ScheduleEvent, SendEvent, SendPriority,
-    SessionEvent,
+    DraftEvent, Event, GroupFlushReason, InputStatusKind, RenderEvent, ScheduleEvent, SendEvent,
+    SendPriority, SessionEvent,
 };
-use crate::ids::derive_post_id;
-use crate::state::StateView;
+use crate::ids::{derive_post_id, TimestampMs};
+use crate::state::{SessionMeta, StateView};
+
+const INPUT_STATUS_ACTIVE_MAX_MS: i64 = 30 * 60 * 1000;
 
 pub fn decide_tick(state: &StateView, cmd: &TickCommand, config: &CoreConfig) -> Vec<Event> {
     let mut events = Vec::new();
@@ -22,11 +24,13 @@ pub fn decide_tick(state: &StateView, cmd: &TickCommand, config: &CoreConfig) ->
     events
 }
 
-fn close_due_sessions(state: &StateView, cmd: &TickCommand, _config: &CoreConfig) -> Vec<Event> {
+fn close_due_sessions(state: &StateView, cmd: &TickCommand, config: &CoreConfig) -> Vec<Event> {
     let mut due_sessions = state
         .sessions
         .values()
-        .filter(|meta| cmd.now_ms >= meta.close_at_ms)
+        .filter(|meta| session_due_at_ms(state, meta, cmd.now_ms, config).is_some_and(|due_at| {
+            cmd.now_ms >= due_at
+        }))
         .map(|meta| meta.session_id)
         .collect::<Vec<_>>();
     due_sessions.sort();
@@ -69,6 +73,48 @@ fn close_due_sessions(state: &StateView, cmd: &TickCommand, _config: &CoreConfig
     }
 
     events
+}
+
+fn session_due_at_ms(
+    state: &StateView,
+    meta: &SessionMeta,
+    now_ms: TimestampMs,
+    config: &CoreConfig,
+) -> Option<TimestampMs> {
+    let last_message_ms = state
+        .ingress_meta
+        .get(&meta.last_ingress_id)
+        .map(|meta| meta.received_at_ms)?;
+    let wait_ms = config.process_waittime_ms(&meta.key.group_id);
+
+    let Some(input_status) = state.input_status.get(&meta.key) else {
+        return Some(last_message_ms.saturating_add(wait_ms.saturating_mul(2)));
+    };
+
+    let mut active = input_status_active(input_status.status);
+    let mut ignore_status = false;
+    if active {
+        let active_since = input_status
+            .active_since_ms
+            .unwrap_or(input_status.updated_at_ms);
+        if now_ms.saturating_sub(active_since) > INPUT_STATUS_ACTIVE_MAX_MS {
+            active = false;
+            ignore_status = true;
+        }
+    }
+    if active {
+        return None;
+    }
+    if ignore_status {
+        return Some(last_message_ms.saturating_add(wait_ms));
+    }
+
+    let activity_ms = std::cmp::max(last_message_ms, input_status.updated_at_ms);
+    Some(activity_ms.saturating_add(wait_ms))
+}
+
+fn input_status_active(status: InputStatusKind) -> bool {
+    matches!(status, InputStatusKind::Typing | InputStatusKind::Speaking)
 }
 
 fn trigger_review_delays(state: &StateView, cmd: &TickCommand) -> Vec<Event> {

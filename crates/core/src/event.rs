@@ -46,6 +46,14 @@ pub enum ConfigEvent {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InputStatusKind {
+    Speaking,
+    Typing,
+    Unknown(u8),
+    Stopped,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IngressEvent {
     MessageAccepted {
@@ -73,6 +81,14 @@ pub enum IngressEvent {
     MessageIgnored {
         ingress_id: IngressId,
         reason: IngressIgnoreReason,
+    },
+    InputStatusUpdated {
+        profile_id: String,
+        chat_id: String,
+        user_id: String,
+        group_id: GroupId,
+        status: InputStatusKind,
+        received_at_ms: TimestampMs,
     },
 }
 

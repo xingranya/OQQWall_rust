@@ -7,7 +7,7 @@ use crate::event::{
     DraftEvent, Event, IngressEvent, RenderEvent, ReviewDecision, ReviewEvent, ScheduleEvent,
     SendPriority,
 };
-use crate::ids::ReviewId;
+use crate::ids::{IngressId, PostId, ReviewCode, ReviewId};
 use crate::state::StateView;
 
 pub fn decide_review_action(
@@ -132,6 +132,9 @@ pub fn decide_review_action(
                 key: key.clone(),
             },
         )],
+        ReviewAction::Merge { review_code } => {
+            build_merge_events(state, cmd, review_id, *review_code)
+        }
     }
 }
 
@@ -298,4 +301,122 @@ fn build_ingress_sync_events(state: &StateView, post_id: crate::ids::PostId) -> 
         }));
     }
     events
+}
+
+fn build_merge_events(
+    state: &StateView,
+    cmd: &ReviewActionCommand,
+    review_id: ReviewId,
+    target_review_code: ReviewCode,
+) -> Vec<Event> {
+    let Some(target_review_id) = state.review_by_code.get(&target_review_code).copied() else {
+        return Vec::new();
+    };
+    if target_review_id == review_id {
+        return Vec::new();
+    }
+    let Some(review_meta) = state.reviews.get(&review_id) else {
+        return Vec::new();
+    };
+    let Some(target_review_meta) = state.reviews.get(&target_review_id) else {
+        return Vec::new();
+    };
+    let post_id = review_meta.post_id;
+    let target_post_id = target_review_meta.post_id;
+    let Some(post_meta) = state.posts.get(&post_id) else {
+        return Vec::new();
+    };
+    let Some(target_post_meta) = state.posts.get(&target_post_id) else {
+        return Vec::new();
+    };
+    if post_meta.group_id != target_post_meta.group_id {
+        return Vec::new();
+    }
+
+    let Some(sender_key) = post_sender_key(state, post_id) else {
+        return Vec::new();
+    };
+    let Some(target_sender_key) = post_sender_key(state, target_post_id) else {
+        return Vec::new();
+    };
+    if sender_key != target_sender_key {
+        return Vec::new();
+    }
+
+    let Some(ingress_ids) = merge_ingress_ids(state, post_id, target_post_id) else {
+        return Vec::new();
+    };
+    let mut messages = Vec::new();
+    for ingress_id in &ingress_ids {
+        if let Some(message) = state.ingress_messages.get(ingress_id) {
+            messages.push(message.clone());
+        }
+    }
+    let draft = build_draft_from_messages(&messages);
+
+    let mut events = Vec::new();
+    events.extend(build_ingress_sync_events(state, post_id));
+    events.extend(build_ingress_sync_events(state, target_post_id));
+    events.push(Event::Draft(DraftEvent::PostDraftCreated {
+        post_id,
+        session_id: post_meta.session_id,
+        group_id: post_meta.group_id.clone(),
+        ingress_ids,
+        draft,
+        created_at_ms: cmd.now_ms,
+    }));
+    events.push(Event::Review(ReviewEvent::ReviewRefreshRequested { review_id }));
+    events.push(Event::Render(RenderEvent::RenderRequested {
+        post_id,
+        attempt: 1,
+        requested_at_ms: cmd.now_ms,
+    }));
+    events.push(Event::Review(ReviewEvent::ReviewDecisionRecorded {
+        review_id: target_review_id,
+        decision: ReviewDecision::Skipped,
+        decided_by: cmd.operator_id.clone(),
+        decided_at_ms: cmd.now_ms,
+    }));
+    if state.send_plans.contains_key(&target_post_id) {
+        events.push(Event::Schedule(ScheduleEvent::SendPlanCanceled {
+            post_id: target_post_id,
+        }));
+    }
+
+    events
+}
+
+fn merge_ingress_ids(
+    state: &StateView,
+    post_id: PostId,
+    target_post_id: PostId,
+) -> Option<Vec<IngressId>> {
+    let mut ingress_ids = state.post_ingress.get(&post_id)?.clone();
+    ingress_ids.extend_from_slice(state.post_ingress.get(&target_post_id)?);
+    ingress_ids.sort_by(|left, right| {
+        let left_ms = state
+            .ingress_meta
+            .get(left)
+            .map(|meta| meta.received_at_ms)
+            .unwrap_or(0);
+        let right_ms = state
+            .ingress_meta
+            .get(right)
+            .map(|meta| meta.received_at_ms)
+            .unwrap_or(0);
+        (left_ms, left.0).cmp(&(right_ms, right.0))
+    });
+    ingress_ids.dedup();
+    Some(ingress_ids)
+}
+
+fn post_sender_key(state: &StateView, post_id: PostId) -> Option<(String, String, String)> {
+    let ingress_ids = state.post_ingress.get(&post_id)?;
+    let first_ingress_id = ingress_ids.first()?;
+    let meta = state.ingress_meta.get(first_ingress_id)?;
+    Some((
+        meta.chat_id.clone(),
+        meta.user_id.clone(),
+        meta.group_id.clone(),
+    ))
 }

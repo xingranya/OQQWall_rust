@@ -329,7 +329,17 @@ journalctl -u OQQWall_RUST -n 200 --no-pager
 2. 降低自动重启频率（加冷却窗口）
 3. 收集 NapCat stderr 日志
 
-### 7.6 渲染失败（PNG）
+### 7.6 journal 查看（TUI）
+
+用于快速浏览事件，定位某段错误/缺失或确认回放顺序：
+
+```bash
+cargo run -p OQQWall_RUST --bin journal_tui -- [data_dir]
+```
+
+常用按键：`q/esc` 退出，`r` 重载，`t` 切换视图，`u` 用户视图，`a` 全量视图，方向键或 `j/k` 移动，`PgUp/PgDn` 翻页，`g/G` 或 `Home/End` 跳转，`Tab` 或 `h/l` 切换焦点（用户视图），`Ctrl+u/d` 滚动详情。鼠标：点击选择/切换，详情面板左键拖拽复制（OSC52），滚轮滚动列表/详情。
+
+### 7.7 渲染失败（PNG）
 
 可能原因：
 

@@ -1,17 +1,22 @@
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::future::Future;
 use std::fs;
 use std::pin::Pin;
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use oqqwall_rust_core::command::{
     GlobalAction, GlobalActionCommand, ReviewAction, ReviewActionCommand,
 };
 use oqqwall_rust_core::draft::{IngressAttachment, IngressMessage, MediaKind, MediaReference};
-use oqqwall_rust_core::event::{DraftEvent, Event, IngressEvent, ReviewEvent};
+use oqqwall_rust_core::event::{
+    DraftEvent, Event, IngressEvent, InputStatusKind, ReviewDecision, ReviewEvent,
+};
 use oqqwall_rust_core::ids::{IngressId, PostId, ReviewCode, ReviewId};
-use oqqwall_rust_core::{derive_blob_id, Command, IngressCommand};
+use oqqwall_rust_core::{derive_blob_id, Command, IngressCommand, StateView};
+use oqqwall_rust_infra::{LocalJournal, SnapshotStore};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -107,8 +112,85 @@ struct NapCatState {
     ingress_summary: HashMap<IngressId, IngressSummary>,
     post_ingress: HashMap<PostId, Vec<IngressId>>,
     audit_msg_to_review: HashMap<String, ReviewId>,
+    processed_reviews: HashSet<ReviewId>,
     pending: HashMap<String, PendingAction>,
     next_echo: u64,
+}
+
+fn load_state_view_cached() -> StateView {
+    static CACHE: OnceLock<StateView> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let data_dir = env::var("OQQWALL_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+            let journal = match LocalJournal::open(&data_dir) {
+                Ok(journal) => journal,
+                Err(err) => {
+                    debug_log!(
+                        "napcat preload skipped: journal open failed: {}",
+                        err
+                    );
+                    return StateView::default();
+                }
+            };
+            let snapshot = match SnapshotStore::open(&data_dir) {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    debug_log!(
+                        "napcat preload skipped: snapshot open failed: {}",
+                        err
+                    );
+                    return StateView::default();
+                }
+            };
+
+            let mut state = StateView::default();
+            let mut cursor = None;
+            match snapshot.load() {
+                Ok(Some(loaded)) => {
+                    state = loaded.state;
+                    cursor = loaded.journal_cursor;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    debug_log!("napcat preload: snapshot load failed: {}", err);
+                }
+            }
+
+            if let Err(err) = journal.replay(cursor, |env| {
+                state = state.reduce(env);
+            }) {
+                debug_log!("napcat preload: journal replay failed: {}", err);
+            }
+
+            state
+        })
+        .clone()
+}
+
+fn build_state_from_view(view: &StateView) -> NapCatState {
+    let mut state = NapCatState::default();
+    for (review_id, review) in &view.reviews {
+        state.review_info.insert(
+            *review_id,
+            ReviewInfo {
+                review_code: review.review_code,
+                post_id: review.post_id,
+            },
+        );
+        state.review_by_code.insert(review.review_code, *review_id);
+        if let Some(audit_msg_id) = review.audit_msg_id.as_ref() {
+            state
+                .audit_msg_to_review
+                .insert(audit_msg_id.clone(), *review_id);
+        }
+        if matches!(
+            review.decision,
+            Some(ReviewDecision::Approved | ReviewDecision::Rejected | ReviewDecision::Skipped)
+        ) {
+            state.processed_reviews.insert(*review_id);
+        }
+    }
+    state
 }
 
 pub fn spawn_napcat_ws(
@@ -124,7 +206,8 @@ pub fn spawn_napcat_ws(
             ws_url_for_log(&runtime.napcat.ws_url),
             runtime.napcat.access_token.is_some()
         );
-        let state = Arc::new(Mutex::new(NapCatState::default()));
+        let state_view = load_state_view_cached();
+        let state = Arc::new(Mutex::new(build_state_from_view(&state_view)));
         let bus_rx = bus_rx;
 
         loop {
@@ -361,6 +444,7 @@ async fn build_action_from_event(
     event: Event,
 ) -> Option<String> {
     match event {
+        Event::Ingress(IngressEvent::InputStatusUpdated { .. }) => None,
         Event::Ingress(IngressEvent::MessageAccepted {
             ingress_id,
             user_id,
@@ -441,6 +525,22 @@ async fn build_action_from_event(
             );
             let mut guard = state.lock().await;
             guard.audit_msg_to_review.insert(audit_msg_id, review_id);
+            None
+        }
+        Event::Review(ReviewEvent::ReviewDecisionRecorded {
+            review_id,
+            decision,
+            ..
+        }) => {
+            let mut guard = state.lock().await;
+            match decision {
+                ReviewDecision::Approved | ReviewDecision::Rejected | ReviewDecision::Skipped => {
+                    guard.processed_reviews.insert(review_id);
+                }
+                ReviewDecision::Deferred => {
+                    guard.processed_reviews.remove(&review_id);
+                }
+            }
             None
         }
         Event::Review(ReviewEvent::ReviewPublishRequested { review_id }) => {
@@ -555,6 +655,9 @@ async fn parse_inbound_event(
     value: &Value,
 ) -> Option<Command> {
     let post_type = value.get("post_type").and_then(|v| v.as_str())?;
+    if post_type == "notice" {
+        return parse_notice_event(runtime, value);
+    }
     if post_type != "message" && post_type != "message_sent" {
         return None;
     }
@@ -571,11 +674,7 @@ async fn parse_inbound_event(
     let message_id =
         value_opt_to_string(value.get("message_id")).unwrap_or_else(|| "0".to_string());
     let sender_name = extract_sender_name(value);
-    let timestamp_ms = value
-        .get("time")
-        .and_then(|v| v.as_i64())
-        .map(|sec| sec.saturating_mul(1000))
-        .unwrap_or(0);
+    let timestamp_ms = inbound_timestamp_ms(value);
 
     if message_type == "group" {
         let mut forward_resolver = if message_has_forward(value.get("message")) {
@@ -612,7 +711,6 @@ async fn parse_inbound_event(
                 return None;
             }
             if runtime.audit_group_id.is_some() && !is_audit_group {
-                send_group_text(out_tx, &chat_group_id, "当前群未配置为审核群").await;
                 return None;
             }
             match command {
@@ -622,6 +720,12 @@ async fn parse_inbound_event(
                     return None;
                 }
                 AuditCommand::Global(action) => {
+                    if let GlobalAction::Recall { review_code } = &action {
+                        let mut guard = state.lock().await;
+                        if let Some(review_id) = guard.review_by_code.get(review_code).copied() {
+                            guard.processed_reviews.remove(&review_id);
+                        }
+                    }
                     send_group_text(out_tx, &chat_group_id, "已收到指令").await;
                     return Some(Command::GlobalAction(GlobalActionCommand {
                         group_id: runtime.group_id.clone(),
@@ -677,6 +781,44 @@ async fn parse_inbound_event(
     }
 
     None
+}
+
+fn parse_notice_event(runtime: &NapCatRuntimeConfig, value: &Value) -> Option<Command> {
+    let notice_type = value.get("notice_type").and_then(|v| v.as_str());
+    let sub_type = value.get("sub_type").and_then(|v| v.as_str());
+    let is_input_status = (matches!(notice_type, Some("notify"))
+        && matches!(sub_type, Some("input_status")))
+        || matches!(notice_type, Some("input_status"))
+        || matches!(sub_type, Some("input_status"));
+    if !is_input_status {
+        return None;
+    }
+
+    let user_id = value_opt_to_string(value.get("user_id"))
+        .or_else(|| value.get("data").and_then(|data| value_opt_to_string(data.get("user_id"))))?;
+    let status_raw = value_opt_to_u8(value.get("event_type"))
+        .or_else(|| value.get("status").and_then(|status| value_opt_to_u8(status.get("event_type"))))
+        .or_else(|| value.get("data").and_then(|data| value_opt_to_u8(data.get("event_type"))))?;
+    let status = match status_raw {
+        0 => InputStatusKind::Speaking,
+        1 => InputStatusKind::Typing,
+        2 => InputStatusKind::Stopped,
+        other => InputStatusKind::Unknown(other),
+    };
+    let profile_id =
+        value_opt_to_string(value.get("self_id")).unwrap_or_else(|| "napcat".to_string());
+    let timestamp_ms = inbound_timestamp_ms(value);
+
+    Some(Command::DriverEvent(Event::Ingress(
+        IngressEvent::InputStatusUpdated {
+            profile_id,
+            chat_id: user_id.clone(),
+            user_id,
+            group_id: runtime.group_id.clone(),
+            status,
+            received_at_ms: timestamp_ms,
+        },
+    )))
 }
 
 fn message_has_forward(value: Option<&Value>) -> bool {
@@ -1093,28 +1235,39 @@ async fn parse_review_command(
     let mut review_code = review_code;
     let mut review_id = None;
     let mut audit_msg_id = reply_id.clone();
+    let mut is_processed = false;
 
-    if let Some(reply_id) = reply_id.as_ref() {
+    {
         let guard = state.lock().await;
-        if let Some(mapped) = guard.audit_msg_to_review.get(reply_id.as_str()) {
-            review_id = Some(*mapped);
-            review_code = None;
-        }
-    }
-
-    if review_id.is_none() {
-        if let Some(code) = review_code {
-            let guard = state.lock().await;
-            if let Some(mapped) = guard.review_by_code.get(&code).copied() {
-                review_id = Some(mapped);
+        if let Some(reply_id) = reply_id.as_ref() {
+            if let Some(mapped) = guard.audit_msg_to_review.get(reply_id.as_str()) {
+                review_id = Some(*mapped);
                 review_code = None;
-                audit_msg_id = None;
             }
+        }
+
+        if review_id.is_none() {
+            if let Some(code) = review_code {
+                if let Some(mapped) = guard.review_by_code.get(&code).copied() {
+                    review_id = Some(mapped);
+                    review_code = None;
+                    audit_msg_id = None;
+                }
+            }
+        }
+
+        if let Some(resolved_id) = review_id {
+            is_processed = guard.processed_reviews.contains(&resolved_id);
         }
     }
 
     if review_id.is_none() && audit_msg_id.is_none() && review_code.is_none() {
         send_group_text(out_tx, group_id, "请回复审核消息或提供编号").await;
+        return None;
+    }
+
+    if is_processed {
+        send_group_text(out_tx, group_id, "此稿件已被处理").await;
         return None;
     }
 
@@ -1199,6 +1352,11 @@ fn parse_review_action(command: &str, rest: &str, allow_quick_reply: bool) -> Op
         "回复" => ReviewAction::Reply {
             text: rest.to_string(),
         },
+        "合并" => {
+            let target = rest.split_whitespace().next()?;
+            let review_code = target.parse::<ReviewCode>().ok()?;
+            ReviewAction::Merge { review_code }
+        }
         "拉黑" => ReviewAction::Blacklist {
             reason: if rest.is_empty() {
                 None
@@ -1709,6 +1867,29 @@ fn value_opt_to_string(value: Option<&Value>) -> Option<String> {
     value.and_then(value_to_string)
 }
 
+fn value_opt_to_u8(value: Option<&Value>) -> Option<u8> {
+    match value? {
+        Value::Number(n) => n.as_u64().and_then(|v| u8::try_from(v).ok()),
+        Value::String(s) => s.parse::<u8>().ok(),
+        _ => None,
+    }
+}
+
+fn inbound_timestamp_ms(value: &Value) -> i64 {
+    value
+        .get("time")
+        .and_then(|v| v.as_i64())
+        .map(|sec| sec.saturating_mul(1000))
+        .unwrap_or_else(now_ms)
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 fn next_echo(state: &mut NapCatState) -> String {
     state.next_echo = state.next_echo.saturating_add(1);
     format!("echo-{}", state.next_echo)
@@ -1733,6 +1914,13 @@ mod tests {
             Some(AuditCommand::Review {
                 review_code: Some(123),
                 action: ReviewAction::Approve,
+            })
+        );
+        assert_eq!(
+            parse_audit_command("123 合并 456", false),
+            Some(AuditCommand::Review {
+                review_code: Some(123),
+                action: ReviewAction::Merge { review_code: 456 },
             })
         );
     }

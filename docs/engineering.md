@@ -15,7 +15,9 @@
 ### 1.1 MVP（第一可运行版本）必须满足
 
 * ✅ OneBot 入站（群/私聊投稿）可接入
-* ✅ `(chat_id, user_id)` 维度按 `process_waittime_sec` 聚合，超时自动成稿
+* ✅ `(chat_id, user_id)` 维度按 `process_waittime_sec` 聚合，受输入状态影响（typing/stop），满足“停更等待”后成稿
+  * typing 连续超过 30 分钟视为异常并忽略
+  * 未出现 typing 上报则使用 `process_waittime_sec * 2`
 * ✅ 默认生成 PNG（不依赖浏览器/外部渲染器）
 * ✅ 审核群发布（先文本+链接即可）
 * ✅ 审核指令：参考command.md,至少实现 是 否 等 删

@@ -20,9 +20,7 @@ pub fn decide_ingress(state: &StateView, cmd: &IngressCommand, config: &CoreConf
         })];
     }
 
-    let close_at_ms = cmd
-        .received_at_ms
-        .saturating_add(config.process_waittime_ms(&cmd.group_id));
+    let close_at_ms = initial_close_at(state, cmd, config);
     let key = SessionKey {
         chat_id: cmd.chat_id.clone(),
         user_id: cmd.user_id.clone(),
@@ -79,4 +77,21 @@ pub fn decide_ingress(state: &StateView, cmd: &IngressCommand, config: &CoreConf
     }
 
     events
+}
+
+fn initial_close_at(state: &StateView, cmd: &IngressCommand, config: &CoreConfig) -> i64 {
+    let wait_ms = config.process_waittime_ms(&cmd.group_id);
+    let key = SessionKey {
+        chat_id: cmd.chat_id.clone(),
+        user_id: cmd.user_id.clone(),
+        group_id: cmd.group_id.clone(),
+    };
+    let (multiplier, last_status_ms) = match state.input_status.get(&key) {
+        Some(meta) => (1, Some(meta.updated_at_ms)),
+        None => (2, None),
+    };
+    let last_activity_ms = last_status_ms
+        .map(|status_ms| status_ms.max(cmd.received_at_ms))
+        .unwrap_or(cmd.received_at_ms);
+    last_activity_ms.saturating_add(wait_ms.saturating_mul(multiplier))
 }

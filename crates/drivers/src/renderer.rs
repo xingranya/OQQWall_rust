@@ -3,6 +3,7 @@ use std::future::Future;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD;
@@ -12,6 +13,7 @@ use oqqwall_rust_core::event::{BlobEvent, Event, RenderEvent};
 use oqqwall_rust_core::{derive_blob_id, Command, Draft, DraftBlock, PostId, StateView};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use skia_safe::canvas::SrcRectConstraint;
 use skia_safe::textlayout::{
@@ -20,11 +22,16 @@ use skia_safe::textlayout::{
 use skia_safe::font_style::{Slant, Weight, Width};
 use skia_safe::{
     image_filters, Canvas, ClipOp, Color4f, Data, EncodedImageFormat, FontStyle, Image, Paint,
-    PathBuilder, Rect, RRect, SamplingOptions,
+    PathBuilder, Rect, RRect, SamplingOptions, Typeface,
 };
+use skia_safe::utils::OrderedFontMgr;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::sync::broadcast::error::RecvError;
+
+mod embedded_resources {
+    include!(concat!(env!("OUT_DIR"), "/embedded_resources.rs"));
+}
 
 #[cfg(debug_assertions)]
 macro_rules! debug_log {
@@ -41,14 +48,17 @@ macro_rules! debug_log {
 const FORWARD_PREFIX: &str = "[合并转发:";
 const MAX_FORWARD_DEPTH: u32 = 4;
 const MEASURE_MAX_WIDTH: f32 = 10_000.0;
-const FONT_FAMILIES: [&str; 6] = [
+const EMOJI_FONT_ALIAS: &str = "OQQWall Emoji";
+const FONT_FAMILIES: [&str; 3] = [
     "PingFang SC",
+    EMOJI_FONT_ALIAS,
     "Apple Color Emoji",
-    "Noto Color Emoji",
-    "Noto Emoji",
-    "Segoe UI Emoji",
-    "sans-serif",
 ];
+const EMOJI_FONT_FAMILIES: [&str; 2] = [
+    EMOJI_FONT_ALIAS,
+    "Apple Color Emoji",
+];
+static FONT_BYTES_CACHE: OnceLock<Vec<FontBytes>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct RendererRuntimeConfig {
@@ -188,14 +198,17 @@ impl TextMeasurer {
         if let Some(width) = self.cache.get(&key) {
             return *width;
         }
-        let mut ps = ParagraphStyle::new();
-        let ts = build_text_style(font_size, font_weight, Color4f::new(0.0, 0.0, 0.0, 1.0));
-        ps.set_text_style(&ts);
-        let mut builder = ParagraphBuilder::new(&ps, self.font_collection.clone());
-        builder.add_text(text);
-        let mut paragraph = builder.build();
-        paragraph.layout(MEASURE_MAX_WIDTH);
-        let width_px = paragraph.max_intrinsic_width().ceil().max(0.0) as u32;
+        let width_px = if let Some((paragraph, _)) = build_line_paragraph(
+            &self.font_collection,
+            text,
+            font_size,
+            font_weight,
+            Color4f::new(0.0, 0.0, 0.0, 1.0),
+        ) {
+            paragraph.max_intrinsic_width().ceil().max(0.0) as u32
+        } else {
+            0
+        };
         self.cache.insert(key, width_px);
         width_px
     }
@@ -207,6 +220,9 @@ pub fn spawn_renderer(
     bus_rx: broadcast::Receiver<oqqwall_rust_core::EventEnvelope>,
     config: RendererRuntimeConfig,
 ) -> JoinHandle<()> {
+    let font_dir = resolve_font_dir();
+    init_font_bytes_cache(&font_dir);
+    let _ = emoji_png_store();
     tokio::spawn(async move {
         debug_log!(
             "renderer task start: blob_root={} canvas_width={} max_height={}",
@@ -580,11 +596,18 @@ fn render_png(
     let file_meta_gap = 2u32;
     let file_icon_size = 40u32;
     let file_icon_gap = 6u32;
-    let font_dir = Path::new("res/fonts");
-    let font_collection = build_font_collection(font_dir);
+    let font_dir = resolve_font_dir();
+    let font_collection = build_font_collection(&font_dir);
     let mut text_measurer = TextMeasurer::new(font_collection.clone());
 
     let scale = 4u32;
+    debug_log!(
+        "render start: blocks={} canvas_width={} max_height={} scale={}",
+        draft.blocks.len(),
+        config.canvas_width_px,
+        config.max_height_px,
+        scale
+    );
     let content_width = config.canvas_width_px.saturating_sub(padding.saturating_mul(2));
     let header_x = padding;
     let header_y = padding;
@@ -616,6 +639,12 @@ fn render_png(
         meta_size,
         font_weight_body,
         &mut text_measurer,
+    );
+    debug_log!(
+        "render header: title={} meta={} header_text_width={}",
+        title_text,
+        meta_text,
+        header_text_width
     );
     let title_y = header_y + title_size;
     let meta_y = title_y + meta_size + 4;
@@ -779,6 +808,48 @@ fn render_png(
                 }
             }
         };
+        match &layout.kind {
+            BlockKind::Text { lines } => {
+                debug_log!(
+                    "layout block: idx={} kind=text width={} height={} lines={}",
+                    block_idx,
+                    layout.width,
+                    layout.height,
+                    lines.len()
+                );
+            }
+            BlockKind::Image { image } => {
+                let size = image
+                    .as_ref()
+                    .and_then(|img| img.width.zip(img.height));
+                debug_log!(
+                    "layout block: idx={} kind=image width={} height={} image_size={:?}",
+                    block_idx,
+                    layout.width,
+                    layout.height,
+                    size
+                );
+            }
+            BlockKind::MediaCard { lines, media_kind, .. } => {
+                debug_log!(
+                    "layout block: idx={} kind=media width={} height={} lines={} media_kind={:?}",
+                    block_idx,
+                    layout.width,
+                    layout.height,
+                    lines.len(),
+                    media_kind
+                );
+            }
+            BlockKind::FileCard { name_lines, .. } => {
+                debug_log!(
+                    "layout block: idx={} kind=file width={} height={} name_lines={}",
+                    block_idx,
+                    layout.width,
+                    layout.height,
+                    name_lines.len()
+                );
+            }
+        }
 
         let layout_height = layout.height;
         let mut next_bottom = layout
@@ -810,6 +881,7 @@ fn render_png(
             let trunc_height = bubble_pad_top + bubble_pad_bottom + line_height;
             let trunc_bottom = cursor_y.saturating_add(trunc_height).saturating_add(padding);
             if trunc_bottom <= config.max_height_px {
+                debug_log!("layout truncate: adding truncation block");
                 blocks.push(BlockLayout {
                     x: padding,
                     y: cursor_y,
@@ -847,6 +919,12 @@ fn render_png(
 
     let output_width = config.canvas_width_px.saturating_mul(scale);
     let output_height = background_height.saturating_mul(scale);
+    debug_log!(
+        "render canvas: background_height={} output={}x{}",
+        background_height,
+        output_width,
+        output_height
+    );
 
     let mut surface = skia_safe::surfaces::raster_n32_premul((
         output_width as i32,
@@ -900,9 +978,11 @@ fn render_png(
         }
     }
 
+    let mut emoji_cache = EmojiRenderCache::new();
     draw_text_line(
         canvas,
         &font_collection,
+        &mut emoji_cache,
         &title_text,
         header_text_x as f32,
         title_y as f32,
@@ -913,6 +993,7 @@ fn render_png(
     draw_text_line(
         canvas,
         &font_collection,
+        &mut emoji_cache,
         &meta_text,
         header_text_x as f32,
         meta_y as f32,
@@ -971,6 +1052,7 @@ fn render_png(
                                     draw_text_line(
                                         canvas,
                                         &font_collection,
+                                        &mut emoji_cache,
                                         text,
                                         cursor_x as f32,
                                         baseline_y as f32,
@@ -1010,6 +1092,7 @@ fn render_png(
                                         draw_text_line(
                                             canvas,
                                             &font_collection,
+                                            &mut emoji_cache,
                                             &fallback,
                                             cursor_x as f32,
                                             baseline_y as f32,
@@ -1024,6 +1107,7 @@ fn render_png(
                                     draw_text_line(
                                         canvas,
                                         &font_collection,
+                                        &mut emoji_cache,
                                         &fallback,
                                         cursor_x as f32,
                                         baseline_y as f32,
@@ -1072,6 +1156,7 @@ fn render_png(
                     draw_text_line(
                         canvas,
                         &font_collection,
+                        &mut emoji_cache,
                         "Image",
                         text_x as f32,
                         text_y as f32,
@@ -1179,6 +1264,7 @@ fn render_png(
                     draw_text_line(
                         canvas,
                         &font_collection,
+                        &mut emoji_cache,
                         line,
                         text_x as f32,
                         baseline as f32,
@@ -1265,6 +1351,7 @@ fn render_png(
                     draw_text_line(
                         canvas,
                         &font_collection,
+                        &mut emoji_cache,
                         line,
                         text_x as f32,
                         baseline as f32,
@@ -1278,6 +1365,7 @@ fn render_png(
                     draw_text_line(
                         canvas,
                         &font_collection,
+                        &mut emoji_cache,
                         &meta,
                         text_x as f32,
                         meta_y as f32,
@@ -1311,7 +1399,144 @@ struct LineMetricsSnapshot {
     width: f32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct EmojiGlyphMeta {
+    width: u8,
+    height: u8,
+    bearing_x: i8,
+    bearing_y: i8,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct EmojiGlyphRecord {
+    glyph_id: u16,
+    width: u8,
+    height: u8,
+    bearing_x: i8,
+    bearing_y: i8,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct EmojiPngMetadata {
+    strike_ppem: u8,
+    glyphs: Vec<EmojiGlyphRecord>,
+}
+
+#[derive(Debug)]
+struct EmojiPngStore {
+    res_prefix: &'static str,
+    strike_ppem: u8,
+    glyphs: HashMap<u16, EmojiGlyphMeta>,
+    png_cache: HashMap<u16, &'static [u8]>,
+}
+
+struct EmojiRenderCache {
+    store: Option<&'static Mutex<EmojiPngStore>>,
+    image_cache: HashMap<u16, Option<Image>>,
+}
+
+impl EmojiRenderCache {
+    fn new() -> Self {
+        Self {
+            store: emoji_png_store(),
+            image_cache: HashMap::new(),
+        }
+    }
+
+    fn draw_over_paragraph(
+        &mut self,
+        canvas: &Canvas,
+        paragraph: &mut Paragraph,
+        origin_x: f32,
+        origin_y: f32,
+    ) {
+        let Some(store) = self.store else { return; };
+        let mut store = match store.lock() {
+            Ok(guard) => guard,
+            Err(guard) => guard.into_inner(),
+        };
+        if store.strike_ppem == 0 {
+            return;
+        }
+        let strike_ppem = store.strike_ppem as f32;
+        let image_cache = &mut self.image_cache;
+        paragraph.visit(|_, info| {
+            let Some(info) = info else { return; };
+            let font = info.font();
+            if font.size() <= 0.0 {
+                return;
+            }
+            let typeface = font.typeface();
+            if !is_emoji_typeface(&typeface) {
+                return;
+            }
+            let scale = font.size() / strike_ppem;
+            let origin = info.origin();
+            let positions = info.positions();
+            let glyphs = info.glyphs();
+            let sampling = SamplingOptions {
+                filter: skia_safe::FilterMode::Linear,
+                mipmap: skia_safe::MipmapMode::None,
+                ..SamplingOptions::default()
+            };
+            let paint = Paint::default();
+            for (idx, glyph_id) in glyphs.iter().enumerate() {
+                let glyph_id = *glyph_id as u16;
+                let meta = match store.glyphs.get(&glyph_id).copied() {
+                    Some(meta) => meta,
+                    None => continue,
+                };
+                let png_bytes = match store.png_cache.get(&glyph_id).copied() {
+                    Some(bytes) => bytes,
+                    None => {
+                        let path = emoji_png_resource_path(store.res_prefix, glyph_id);
+                        let bytes = match embedded_resource_bytes(&path) {
+                            Some(bytes) => bytes,
+                            None => continue,
+                        };
+                        store.png_cache.insert(glyph_id, bytes);
+                        bytes
+                    }
+                };
+                let image = image_cache
+                    .entry(glyph_id)
+                    .or_insert_with(|| decode_emoji_image(png_bytes));
+                let Some(image) = image.as_ref() else { continue; };
+                let pos = positions.get(idx).copied().unwrap_or_default();
+                let width = meta.width as f32 * scale;
+                let height = meta.height as f32 * scale;
+                if width <= 0.0 || height <= 0.0 {
+                    continue;
+                }
+                let x = origin_x + origin.x + pos.x + meta.bearing_x as f32 * scale;
+                let y = origin_y + origin.y + pos.y - meta.bearing_y as f32 * scale;
+                let dst = Rect::from_xywh(x, y, width, height);
+                canvas.draw_image_rect_with_sampling_options(image, None, dst, sampling, &paint);
+            }
+        });
+    }
+}
+
+fn decode_emoji_image(bytes: &[u8]) -> Option<Image> {
+    let data = Data::new_copy(bytes);
+    Image::from_encoded(data)
+}
+
+fn is_emoji_typeface(typeface: &Typeface) -> bool {
+    match typeface.family_name().as_str() {
+        "Apple Color Emoji" | "OQQWall Emoji" => true,
+        _ => false,
+    }
+}
+
 fn build_text_style(font_size: u32, font_weight: u32, color: Color4f) -> TextStyle {
+    debug_log!(
+        "text style: size={} weight={} color={:?} families={:?}",
+        font_size,
+        font_weight,
+        color,
+        FONT_FAMILIES
+    );
     let mut ts = TextStyle::new();
     ts.set_font_size(font_size as f32);
     ts.set_font_families(&FONT_FAMILIES);
@@ -1327,6 +1552,222 @@ fn build_text_style(font_size: u32, font_weight: u32, color: Color4f) -> TextSty
     ts
 }
 
+fn build_emoji_text_style(font_size: u32, font_weight: u32, color: Color4f) -> TextStyle {
+    let mut ts = TextStyle::new();
+    ts.set_font_size(font_size as f32);
+    let mut paint = Paint::default();
+    paint.set_color4f(color, None);
+    ts.set_foreground_paint(&paint);
+    if let Some(tf) = emoji_typeface() {
+        debug_log!(
+            "emoji style: size={} weight={} typeface_family={} postscript={:?}",
+            font_size,
+            font_weight,
+            tf.family_name(),
+            tf.post_script_name()
+        );
+        ts.set_font_style(tf.font_style());
+        ts.set_typeface(Some(tf));
+    } else {
+        debug_log!(
+            "emoji style: size={} weight={} families={:?}",
+            font_size,
+            font_weight,
+            EMOJI_FONT_FAMILIES
+        );
+        ts.set_font_families(&EMOJI_FONT_FAMILIES);
+        let font_style = FontStyle::new(
+            Weight::from(font_weight as i32),
+            Width::NORMAL,
+            Slant::Upright,
+        );
+        ts.set_font_style(font_style);
+    }
+    ts
+}
+
+fn emoji_typeface() -> Option<Typeface> {
+    static EMOJI_TF: OnceLock<Option<Typeface>> = OnceLock::new();
+    EMOJI_TF
+        .get_or_init(|| {
+            let bytes = match embedded_resource_bytes("fonts/AppleColorEmoji.ttf") {
+                Some(bytes) => bytes,
+                None => {
+                    debug_log!("emoji typeface: missing embedded AppleColorEmoji.ttf");
+                    return None;
+                }
+            };
+            let mgr = skia_safe::FontMgr::new();
+            let tf = mgr.new_from_data(bytes, 0usize);
+            if let Some(ref tf) = tf {
+                debug_log!(
+                    "emoji typeface loaded: family={} postscript={:?} bytes={}",
+                    tf.family_name(),
+                    tf.post_script_name(),
+                    bytes.len()
+                );
+            } else {
+                debug_log!("emoji typeface load failed");
+            }
+            tf
+        })
+        .clone()
+}
+
+const EMOJI_PNG_RES_PREFIX: &str = "emoji_png/apple_color_emoji";
+const EMOJI_PNG_METADATA_PATH: &str = "emoji_png/apple_color_emoji/metadata.json";
+
+fn emoji_png_store() -> Option<&'static Mutex<EmojiPngStore>> {
+    static EMOJI_PNG_STORE: OnceLock<Option<Mutex<EmojiPngStore>>> = OnceLock::new();
+    EMOJI_PNG_STORE
+        .get_or_init(init_emoji_png_store_inner)
+        .as_ref()
+}
+
+fn init_emoji_png_store_inner() -> Option<Mutex<EmojiPngStore>> {
+    let metadata = match load_embedded_emoji_png_metadata() {
+        Some(metadata) => metadata,
+        None => {
+            debug_log!(
+                "emoji png: metadata missing; run scripts/extract_apple_emoji_pngs.py"
+            );
+            return None;
+        }
+    };
+    let glyphs = metadata
+        .glyphs
+        .into_iter()
+        .map(|record| {
+            (
+                record.glyph_id,
+                EmojiGlyphMeta {
+                    width: record.width,
+                    height: record.height,
+                    bearing_x: record.bearing_x,
+                    bearing_y: record.bearing_y,
+                },
+            )
+        })
+        .collect();
+    Some(Mutex::new(EmojiPngStore {
+        res_prefix: EMOJI_PNG_RES_PREFIX,
+        strike_ppem: metadata.strike_ppem,
+        glyphs,
+        png_cache: HashMap::new(),
+    }))
+}
+
+fn emoji_png_resource_path(prefix: &str, glyph_id: u16) -> String {
+    format!("{}/gid_{:04x}.png", prefix, glyph_id)
+}
+
+fn load_embedded_emoji_png_metadata() -> Option<EmojiPngMetadata> {
+    let bytes = embedded_resource_bytes(EMOJI_PNG_METADATA_PATH)?;
+    serde_json::from_slice(bytes).ok()
+}
+
+fn append_text_with_emoji_runs(
+    builder: &mut ParagraphBuilder,
+    text: &str,
+    base_style: &TextStyle,
+    emoji_style: &TextStyle,
+) {
+    if !contains_emoji(text) {
+        builder.add_text(text);
+        return;
+    }
+    for (run, is_emoji) in split_emoji_runs(text) {
+        if run.is_empty() {
+            continue;
+        }
+        if is_emoji {
+            builder.push_style(emoji_style);
+        } else {
+            builder.push_style(base_style);
+        }
+        builder.add_text(&run);
+        builder.pop();
+    }
+}
+
+fn contains_emoji(text: &str) -> bool {
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        let next = chars.peek().copied();
+        if is_emoji_char_with_next(ch, next) {
+            return true;
+        }
+    }
+    false
+}
+
+fn split_emoji_runs(text: &str) -> Vec<(String, bool)> {
+    let mut runs = Vec::new();
+    let mut current = String::new();
+    let mut current_is_emoji: Option<bool> = None;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        let next = chars.peek().copied();
+        let is_emoji = is_emoji_char_with_next(ch, next);
+        match current_is_emoji {
+            Some(flag) if flag == is_emoji => {
+                current.push(ch);
+            }
+            Some(flag) => {
+                runs.push((std::mem::take(&mut current), flag));
+                current.push(ch);
+                current_is_emoji = Some(is_emoji);
+            }
+            None => {
+                current.push(ch);
+                current_is_emoji = Some(is_emoji);
+            }
+        }
+    }
+    if let Some(flag) = current_is_emoji {
+        if !current.is_empty() {
+            runs.push((current, flag));
+        }
+    }
+    runs
+}
+
+fn is_emoji_char_with_next(ch: char, next: Option<char>) -> bool {
+    if is_emoji_like(ch) {
+        return true;
+    }
+    if matches!(ch, '#' | '*' | '0'..='9') {
+        return matches!(next, Some('\u{FE0F}') | Some('\u{20E3}'));
+    }
+    false
+}
+
+fn is_emoji_like(ch: char) -> bool {
+    let code = ch as u32;
+    matches!(
+        code,
+        0x00A9
+            | 0x00AE
+            | 0x2122
+            | 0x2934
+            | 0x2935
+            | 0x3030
+            | 0x303D
+            | 0x3297
+            | 0x3299
+            | 0xFE0E
+            | 0xFE0F
+            | 0x200D
+            | 0x20E3
+    ) || (0x1F000..=0x1FAFF).contains(&code)
+        || (0x1F1E6..=0x1F1FF).contains(&code)
+        || (0x1F3FB..=0x1F3FF).contains(&code)
+        || (0x2300..=0x23FF).contains(&code)
+        || (0x2600..=0x27BF).contains(&code)
+        || (0x2B00..=0x2BFF).contains(&code)
+        || (0xE0020..=0xE007F).contains(&code)
+}
+
 fn build_line_paragraph(
     font_collection: &FontCollection,
     text: &str,
@@ -1337,15 +1778,30 @@ fn build_line_paragraph(
     if text.is_empty() {
         return None;
     }
+    debug_log!(
+        "paragraph build: text_len={} size={} weight={}",
+        text.len(),
+        font_size,
+        font_weight
+    );
     let mut ps = ParagraphStyle::new();
     let ts = build_text_style(font_size, font_weight, color);
+    let emoji_ts = build_emoji_text_style(font_size, font_weight, color);
     ps.set_text_style(&ts);
     let mut builder = ParagraphBuilder::new(&ps, font_collection.clone());
-    builder.add_text(text);
+    append_text_with_emoji_runs(&mut builder, text, &ts, &emoji_ts);
     let mut paragraph = builder.build();
     paragraph.layout(MEASURE_MAX_WIDTH);
     let line_metrics = paragraph.get_line_metrics();
     let metrics = line_metrics.get(0)?;
+    debug_log!(
+        "paragraph metrics: text_len={} baseline={} ascent={} descent={} width={}",
+        text.len(),
+        metrics.baseline,
+        metrics.ascent,
+        metrics.descent,
+        metrics.width
+    );
     let snapshot = LineMetricsSnapshot {
         baseline: metrics.baseline as f32,
         ascent: metrics.ascent as f32,
@@ -1375,6 +1831,7 @@ fn draw_shadowed_rrect(canvas: &Canvas, rr: RRect, blur: f32, alpha: f32) {
 fn draw_text_line(
     canvas: &Canvas,
     font_collection: &FontCollection,
+    emoji_cache: &mut EmojiRenderCache,
     text: &str,
     x: f32,
     baseline_y: f32,
@@ -1382,11 +1839,22 @@ fn draw_text_line(
     font_weight: u32,
     color: Color4f,
 ) {
-    if let Some((paragraph, metrics)) =
+    debug_log!(
+        "text draw: text_len={} size={} weight={} x={} baseline_y={}",
+        text.len(),
+        font_size,
+        font_weight,
+        x,
+        baseline_y
+    );
+    if let Some((mut paragraph, metrics)) =
         build_line_paragraph(font_collection, text, font_size, font_weight, color)
     {
         let top_y = baseline_y - metrics.baseline;
         paragraph.paint(canvas, (x, top_y));
+        if contains_emoji(text) {
+            emoji_cache.draw_over_paragraph(canvas, &mut paragraph, x, top_y);
+        }
     }
 }
 
@@ -1396,6 +1864,7 @@ fn center_baseline(center_y: f32, metrics: &LineMetricsSnapshot) -> f32 {
 
 fn decode_image(image: &ResolvedImage) -> Option<Image> {
     let bytes = image.bytes.as_ref()?;
+    debug_log!("image decode: bytes={}", bytes.len());
     let data = Data::new_copy(bytes);
     Image::from_encoded(data)
 }
@@ -1403,6 +1872,16 @@ fn decode_image(image: &ResolvedImage) -> Option<Image> {
 fn draw_image_cover_rounded(canvas: &Canvas, img: &Image, dst: Rect, radius: f32) {
     let sw = img.width() as f32;
     let sh = img.height() as f32;
+    debug_log!(
+        "image draw: src=({}x{}) dst=({},{} {}x{}) radius={}",
+        sw,
+        sh,
+        dst.x(),
+        dst.y(),
+        dst.width(),
+        dst.height(),
+        radius
+    );
     if sw <= 0.0 || sh <= 0.0 || dst.width() <= 0.0 || dst.height() <= 0.0 {
         return;
     }
@@ -1474,9 +1953,11 @@ async fn resolve_media_reference_for_image(
 ) -> Option<ResolvedImage> {
     match reference {
         oqqwall_rust_core::MediaReference::Blob { blob_id } => {
+            debug_log!("media image: blob_id={:?}", blob_id);
             resolve_blob_image(state, *blob_id)
         }
         oqqwall_rust_core::MediaReference::RemoteUrl { url } => {
+            debug_log!("media image: remote url={}", url);
             resolve_url_to_image(url, client).await
         }
     }
@@ -1494,9 +1975,11 @@ fn resolve_media_reference_for_label(
 
 fn resolve_face_image(id: &str, cache: &mut HashMap<String, ResolvedImage>) -> Option<ResolvedImage> {
     if let Some(found) = cache.get(id) {
+        debug_log!("face cache hit: id={}", id);
         return Some(found.clone());
     }
     let path = Path::new("res").join("face").join(format!("{}.png", id));
+    debug_log!("face load: id={} path={}", id, path.display());
     let path_str = path.to_string_lossy();
     let resolved = resolved_image_from_path(&path_str)?;
     cache.insert(id.to_string(), resolved.clone());
@@ -1508,20 +1991,25 @@ fn resolve_blob_image(state: &StateView, blob_id: oqqwall_rust_core::BlobId) -> 
         .blobs
         .get(&blob_id)
         .and_then(|meta| meta.persisted_path.clone())?;
+    debug_log!("blob image path: blob_id={:?} path={}", blob_id, path);
     resolved_image_from_path(&path)
 }
 
 async fn resolve_url_to_image(url: &str, client: &mut Option<Client>) -> Option<ResolvedImage> {
     if url.starts_with("data:") {
+        debug_log!("image load data url");
         return resolved_image_from_data_url(url);
     }
     if let Some(path) = url.strip_prefix("file://") {
+        debug_log!("image load file url: {}", path);
         return resolved_image_from_path(path);
     }
     if Path::new(url).exists() {
+        debug_log!("image load local path: {}", url);
         return resolved_image_from_path(url);
     }
     if url.starts_with("http://") || url.starts_with("https://") {
+        debug_log!("image load remote: {}", url);
         if client.is_none() {
             let built = Client::builder()
                 .timeout(Duration::from_secs(6))
@@ -1538,6 +2026,12 @@ async fn resolve_url_to_image(url: &str, client: &mut Option<Client>) -> Option<
 }
 
 fn resolved_image_from_path(path: &str) -> Option<ResolvedImage> {
+    let path_obj = Path::new(path);
+    if let Some(bytes) = embedded_bytes_for_path(path_obj) {
+        debug_log!("image load embedded: {}", path);
+        return Some(ResolvedImage::from_bytes(bytes.to_vec()));
+    }
+    debug_log!("image load disk: {}", path);
     let bytes = fs::read(path).ok()?;
     Some(ResolvedImage::from_bytes(bytes))
 }
@@ -1567,8 +2061,10 @@ fn parse_data_url(source: &str) -> Option<(Option<String>, Vec<u8>)> {
 }
 
 async fn fetch_remote_bytes(client: &Client, url: &str) -> Option<(Vec<u8>, Option<String>)> {
+    debug_log!("http fetch: {}", url);
     let response = client.get(url).send().await.ok()?;
     if !response.status().is_success() {
+        debug_log!("http fetch failed: {}", url);
         return None;
     }
     let content_type = response
@@ -2029,9 +2525,17 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-fn build_font_collection(font_dir: &Path) -> FontCollection {
-    let mut asset_mgr = TypefaceFontProvider::new();
-    let sys_mgr = skia_safe::FontMgr::new();
+#[derive(Debug, Clone)]
+struct FontBytes {
+    path: PathBuf,
+    bytes: Vec<u8>,
+}
+
+fn init_font_bytes_cache(font_dir: &Path) {
+    if FONT_BYTES_CACHE.get().is_some() {
+        return;
+    }
+    let mut fonts = Vec::new();
     if font_dir.exists() {
         if let Ok(entries) = fs::read_dir(font_dir) {
             for entry in entries.flatten() {
@@ -2040,20 +2544,284 @@ fn build_font_collection(font_dir: &Path) -> FontCollection {
                 if !matches!(ext.to_ascii_lowercase().as_str(), "ttf" | "otf") {
                     continue;
                 }
-                if let Ok(bytes) = fs::read(&path) {
-                    if let Some(tf) = sys_mgr.new_from_data(&bytes, 0) {
-                        asset_mgr.register_typeface(tf, None);
+                match fs::read(&path) {
+                    Ok(bytes) => fonts.push(FontBytes { path, bytes }),
+                    Err(err) => {
+                        debug_log!("font cache read failed: {} err={}", path.display(), err);
                     }
                 }
             }
         }
+    }
+    debug_log!("font cache: disk_fonts={}", fonts.len());
+    let _ = FONT_BYTES_CACHE.set(fonts);
+}
+
+fn font_bytes_cache() -> Option<&'static [FontBytes]> {
+    FONT_BYTES_CACHE.get().map(|fonts| fonts.as_slice())
+}
+
+fn build_font_collection(font_dir: &Path) -> FontCollection {
+    let mut asset_mgr = TypefaceFontProvider::new();
+    let sys_mgr = skia_safe::FontMgr::new();
+    debug_log!("font init: font_dir={}", font_dir.display());
+    let embedded_count = register_embedded_fonts(&mut asset_mgr, &sys_mgr);
+    debug_log!("font init: embedded_fonts={}", embedded_count);
+    if let Some(fonts) = font_bytes_cache() {
+        let mut disk_count = 0usize;
+        for font in fonts {
+            let ext = font
+                .path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("");
+            if !matches!(ext.to_ascii_lowercase().as_str(), "ttf" | "otf") {
+                debug_log!("font skip non-ttf/otf: {}", font.path.display());
+                continue;
+            }
+            if let Some(tf) = sys_mgr.new_from_data(&font.bytes, 0) {
+                let alias = font_alias_for_path(&font.path);
+                let family = tf.family_name();
+                debug_log!(
+                    "font disk load: path={} family={} alias={:?}",
+                    font.path.display(),
+                    family,
+                    alias
+                );
+                register_typeface_with_alias(&mut asset_mgr, tf, alias);
+                disk_count += 1;
+            } else {
+                debug_log!("font disk load failed: {}", font.path.display());
+            }
+        }
+        debug_log!("font init: disk_fonts={}", disk_count);
+    } else if font_dir.exists() {
+        if let Ok(entries) = fs::read_dir(font_dir) {
+            let mut disk_count = 0usize;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("");
+                if !matches!(ext.to_ascii_lowercase().as_str(), "ttf" | "otf") {
+                    debug_log!("font skip non-ttf/otf: {}", path.display());
+                    continue;
+                }
+                if let Ok(bytes) = fs::read(&path) {
+                    if let Some(tf) = sys_mgr.new_from_data(&bytes, 0) {
+                        let alias = font_alias_for_path(&path);
+                        let family = tf.family_name();
+                        debug_log!(
+                            "font disk load: path={} family={} alias={:?}",
+                            path.display(),
+                            family,
+                            alias
+                        );
+                        register_typeface_with_alias(&mut asset_mgr, tf, alias);
+                        disk_count += 1;
+                    } else {
+                        debug_log!("font disk load failed: {}", path.display());
+                    }
+                } else {
+                    debug_log!("font disk read failed: {}", path.display());
+                }
+            }
+            debug_log!("font init: disk_fonts={}", disk_count);
+        }
     } else {
         debug_log!("font dir not found: {}", font_dir.display());
     }
+    let mut ordered_mgr = OrderedFontMgr::new();
+    ordered_mgr.append(asset_mgr.clone());
     let mut fc = FontCollection::new();
     fc.set_asset_font_manager(Some(asset_mgr.into()));
-    fc.set_dynamic_font_manager(Some(sys_mgr));
+    fc.set_default_font_manager_and_family_names(Some(ordered_mgr.into()), &FONT_FAMILIES);
+    fc.disable_font_fallback();
+    debug_log!(
+        "font collection: managers={} fallback_enabled={}",
+        fc.font_managers_count(),
+        fc.font_fallback_enabled()
+    );
+    let debug_style = FontStyle::new(Weight::NORMAL, Width::NORMAL, Slant::Upright);
+    let emoji_typefaces = fc.find_typefaces(&[EMOJI_FONT_ALIAS], debug_style);
+    debug_log!(
+        "font collection: emoji_alias_typefaces={}",
+        emoji_typefaces.len()
+    );
+    for tf in emoji_typefaces {
+        debug_log!(
+            "font collection: emoji_alias family={} postscript={:?}",
+            tf.family_name(),
+            tf.post_script_name()
+        );
+    }
+    let emoji_char: skia_safe::Unichar = 0x1F602;
+    if let Some(tf) = fc.default_emoji_fallback(emoji_char, debug_style, "") {
+        debug_log!(
+            "font collection: emoji_fallback family={} postscript={:?}",
+            tf.family_name(),
+            tf.post_script_name()
+        );
+    } else {
+        debug_log!("font collection: emoji_fallback none");
+    }
     fc
+}
+
+fn register_embedded_fonts(
+    asset_mgr: &mut TypefaceFontProvider,
+    sys_mgr: &skia_safe::FontMgr,
+) -> usize {
+    let mut count = 0usize;
+    for entry in embedded_resources::RESOURCES {
+        if !entry.path.starts_with("fonts/") {
+            continue;
+        }
+        let path = Path::new(entry.path);
+        let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("");
+        if !matches!(ext.to_ascii_lowercase().as_str(), "ttf" | "otf") {
+            debug_log!("embedded font skip non-ttf/otf: {}", entry.path);
+            continue;
+        }
+        if let Some(tf) = sys_mgr.new_from_data(entry.bytes, 0usize) {
+            let alias = font_alias_for_path(path);
+            let family = tf.family_name();
+            debug_log!(
+                "embedded font load: path={} family={} alias={:?} bytes={}",
+                entry.path,
+                family,
+                alias,
+                entry.bytes.len()
+            );
+            register_typeface_with_alias(asset_mgr, tf, alias);
+            count += 1;
+        } else {
+            debug_log!("embedded font load failed: {}", entry.path);
+        }
+    }
+    count
+}
+
+fn register_typeface_with_alias(
+    asset_mgr: &mut TypefaceFontProvider,
+    typeface: Typeface,
+    alias: Option<&'static str>,
+) {
+    if let Some(alias) = alias {
+        asset_mgr.register_typeface(typeface.clone(), Some(alias));
+    }
+    asset_mgr.register_typeface(typeface, None);
+}
+
+fn font_alias_for_path(path: &Path) -> Option<&'static str> {
+    let stem = path.file_stem()?.to_str()?;
+    if stem.eq_ignore_ascii_case("AppleColorEmoji") {
+        Some(EMOJI_FONT_ALIAS)
+    } else {
+        None
+    }
+}
+
+fn embedded_bytes_for_path(path: &Path) -> Option<&'static [u8]> {
+    let rel = match path_to_res_relative(path) {
+        Some(rel) => rel,
+        None => {
+            debug_log!("embedded lookup: no res-relative path: {}", path.display());
+            return None;
+        }
+    };
+    let found = embedded_resource_bytes(&rel);
+    if let Some(bytes) = found {
+        debug_log!("embedded lookup hit: {} bytes={}", rel, bytes.len());
+    } else {
+        debug_log!("embedded lookup miss: {}", rel);
+    }
+    found
+}
+
+fn embedded_resource_bytes(path: &str) -> Option<&'static [u8]> {
+    static RES_MAP: OnceLock<HashMap<&'static str, &'static [u8]>> = OnceLock::new();
+    let map = RES_MAP.get_or_init(|| {
+        let mut map = HashMap::new();
+        debug_log!(
+            "embedded resources init: count={}",
+            embedded_resources::RESOURCES.len()
+        );
+        for entry in embedded_resources::RESOURCES {
+            debug_log!(
+                "embedded resource: {} bytes={}",
+                entry.path,
+                entry.bytes.len()
+            );
+            map.insert(entry.path, entry.bytes);
+        }
+        map
+    });
+    map.get(path).copied()
+}
+
+fn path_to_res_relative(path: &Path) -> Option<String> {
+    if path.is_relative() {
+        let rel = path.strip_prefix("res").ok()?;
+        return path_to_slash(rel);
+    }
+    let res_dir = resolve_res_dir();
+    let rel = path.strip_prefix(&res_dir).ok()?;
+    path_to_slash(rel)
+}
+
+fn path_to_slash(path: &Path) -> Option<String> {
+    let mut out = String::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => {
+                let part = part.to_str()?;
+                if !out.is_empty() {
+                    out.push('/');
+                }
+                out.push_str(part);
+            }
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn resolve_res_dir() -> PathBuf {
+    if let Ok(res_dir) = std::env::var("OQQWALL_RES_DIR") {
+        let resolved = PathBuf::from(res_dir);
+        debug_log!("res dir from env: {}", resolved.display());
+        return resolved;
+    }
+    let cwd_candidate = PathBuf::from("res");
+    if cwd_candidate.exists() {
+        debug_log!("res dir from cwd: {}", cwd_candidate.display());
+        return cwd_candidate;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let candidates = [
+                exe_dir.join("res"),
+                exe_dir.join("..").join("res"),
+                exe_dir.join("..").join("..").join("res"),
+            ];
+            for candidate in candidates {
+                if candidate.exists() {
+                    debug_log!("res dir from exe: {}", candidate.display());
+                    return candidate;
+                }
+            }
+        }
+    }
+    debug_log!("res dir fallback: {}", cwd_candidate.display());
+    cwd_candidate
+}
+
+fn resolve_font_dir() -> PathBuf {
+    resolve_res_dir().join("fonts")
 }
 
 async fn render_png_async(

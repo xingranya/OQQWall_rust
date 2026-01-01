@@ -2,12 +2,12 @@ use std::collections::HashMap;
 
 use crate::event::{
     AccountEvent, BlobEvent, ConfigEvent, DraftEvent, Event, EventEnvelope, GroupFlushReason,
-    IngressEvent, ManualEvent, MediaEvent, RenderEvent, ReviewEvent, ScheduleEvent, SendEvent,
-    SessionEvent,
+    IngressEvent, InputStatusKind, ManualEvent, MediaEvent, RenderEvent, ReviewEvent,
+    ScheduleEvent, SendEvent, SessionEvent,
 };
 use crate::state::{
-    AccountRuntime, BlobMeta, GroupRuntime, PostMeta, PostStage, RenderMeta, ReviewMeta, SendDueKey,
-    SendPlan, SendingMeta, SessionKey, SessionMeta, StateView,
+    AccountRuntime, BlobMeta, GroupRuntime, InputStatusMeta, PostMeta, PostStage, RenderMeta,
+    ReviewMeta, SendDueKey, SendPlan, SendingMeta, SessionKey, SessionMeta, StateView,
 };
 
 pub fn reduce(state: &StateView, env: &EventEnvelope) -> StateView {
@@ -81,7 +81,44 @@ fn reduce_ingress(state: &mut StateView, event: &IngressEvent) {
         IngressEvent::MessageIgnored { ingress_id, .. } => {
             state.ingress_seen.insert(*ingress_id);
         }
+        IngressEvent::InputStatusUpdated {
+            chat_id,
+            user_id,
+            group_id,
+            status,
+            received_at_ms,
+            ..
+        } => {
+            let key = SessionKey {
+                chat_id: chat_id.clone(),
+                user_id: user_id.clone(),
+                group_id: group_id.clone(),
+            };
+            let is_active = input_status_active(*status);
+            let active_since_ms = if is_active {
+                match state.input_status.get(&key) {
+                    Some(meta) if input_status_active(meta.status) => {
+                        Some(meta.active_since_ms.unwrap_or(*received_at_ms))
+                    }
+                    _ => Some(*received_at_ms),
+                }
+            } else {
+                None
+            };
+            state.input_status.insert(
+                key,
+                InputStatusMeta {
+                    status: *status,
+                    updated_at_ms: *received_at_ms,
+                    active_since_ms,
+                },
+            );
+        }
     }
+}
+
+fn input_status_active(status: InputStatusKind) -> bool {
+    matches!(status, InputStatusKind::Typing | InputStatusKind::Speaking)
 }
 
 fn reduce_session(state: &mut StateView, event: &SessionEvent) {

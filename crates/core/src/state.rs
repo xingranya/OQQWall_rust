@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::draft::{Draft, IngressMessage, MediaReference};
-use crate::event::{ReviewDecision, SendPriority};
+use crate::event::{InputStatusKind, ReviewDecision, SendPriority};
 use crate::ids::{
     AccountId, AuditMsgId, BlobId, EventId, GroupId, IngressId, PostId, ReviewCode, ReviewId,
     SessionId, TimestampMs,
@@ -24,6 +24,13 @@ pub struct SessionKey {
     pub chat_id: String,
     pub user_id: String,
     pub group_id: GroupId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputStatusMeta {
+    pub status: InputStatusKind,
+    pub updated_at_ms: TimestampMs,
+    pub active_since_ms: Option<TimestampMs>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +156,7 @@ pub struct StateView {
     pub ingress_seen: HashSet<IngressId>,
     pub ingress_meta: HashMap<IngressId, IngressMeta>,
     pub ingress_messages: HashMap<IngressId, IngressMessage>,
+    pub input_status: HashMap<SessionKey, InputStatusMeta>,
 
     pub sessions: HashMap<SessionId, SessionMeta>,
     pub session_by_key: HashMap<SessionKey, SessionId>,
@@ -186,6 +194,7 @@ impl Default for StateView {
             ingress_seen: HashSet::new(),
             ingress_meta: HashMap::new(),
             ingress_messages: HashMap::new(),
+            input_status: HashMap::new(),
             sessions: HashMap::new(),
             session_by_key: HashMap::new(),
             session_ingress: HashMap::new(),

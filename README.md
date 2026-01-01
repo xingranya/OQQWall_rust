@@ -66,6 +66,15 @@ cargo run -p OQQWall_RUST
 cargo test
 ```
 
+## 调试工具
+- `journal_tui`：终端查看 journal（默认读取 `data/`）。
+
+```bash
+cargo run -p OQQWall_RUST --bin journal_tui -- [data_dir]
+```
+
+常用按键：`q/esc` 退出，`r` 重载，`t` 切换视图，`u` 用户视图，`a` 全量视图，方向键或 `j/k` 移动，`PgUp/PgDn` 翻页，`g/G` 或 `Home/End` 跳转，`Tab` 或 `h/l` 切换焦点（用户视图），`Ctrl+u/d` 滚动详情。鼠标：点击选择/切换，详情面板左键拖拽复制（OSC52），滚轮滚动列表/详情。
+
 ## 文档索引
 - `docs/oobe.md`：OOBE（从 0 到首次跑通）
 - `docs/engineering.md`：工程落地与架构约束
