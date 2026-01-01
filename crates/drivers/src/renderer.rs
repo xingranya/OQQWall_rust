@@ -48,16 +48,7 @@ macro_rules! debug_log {
 const FORWARD_PREFIX: &str = "[合并转发:";
 const MAX_FORWARD_DEPTH: u32 = 4;
 const MEASURE_MAX_WIDTH: f32 = 10_000.0;
-const EMOJI_FONT_ALIAS: &str = "OQQWall Emoji";
-const FONT_FAMILIES: [&str; 3] = [
-    "PingFang SC",
-    EMOJI_FONT_ALIAS,
-    "Apple Color Emoji",
-];
-const EMOJI_FONT_FAMILIES: [&str; 2] = [
-    EMOJI_FONT_ALIAS,
-    "Apple Color Emoji",
-];
+const FONT_FAMILIES: [&str; 1] = ["PingFang SC"];
 static FONT_BYTES_CACHE: OnceLock<Vec<FontBytes>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
@@ -118,12 +109,14 @@ struct InlineLine {
 enum InlineRun {
     Text(String),
     Face { id: String },
+    Emoji { glyph_id: u16 },
 }
 
 #[derive(Debug, Clone)]
 enum InlineAtom {
     Char(char),
     Face(String),
+    Emoji(u16),
 }
 
 #[derive(Debug, Clone)]
@@ -599,6 +592,7 @@ fn render_png(
     let font_dir = resolve_font_dir();
     let font_collection = build_font_collection(&font_dir);
     let mut text_measurer = TextMeasurer::new(font_collection.clone());
+    let mut emoji_cache = EmojiRenderCache::new();
 
     let scale = 4u32;
     debug_log!(
@@ -627,6 +621,7 @@ fn render_png(
         title_size,
         font_weight_title,
         &mut text_measurer,
+        &emoji_cache,
     );
     let meta_source = if header.user_id == "unknown" {
         header.post_id_hex.clone()
@@ -639,6 +634,7 @@ fn render_png(
         meta_size,
         font_weight_body,
         &mut text_measurer,
+        &emoji_cache,
     );
     debug_log!(
         "render header: title={} meta={} header_text_width={}",
@@ -666,6 +662,7 @@ fn render_png(
                     face_size,
                     font_weight_body,
                     &mut text_measurer,
+                    &emoji_cache,
                 );
                 let mut max_line_w = 0u32;
                 for line in &lines {
@@ -742,6 +739,7 @@ fn render_png(
                             font_size,
                             font_weight_body,
                             &mut text_measurer,
+                            &emoji_cache,
                         );
                         name_lines = limit_lines(
                             name_lines,
@@ -750,6 +748,7 @@ fn render_png(
                             font_size,
                             font_weight_body,
                             &mut text_measurer,
+                            &emoji_cache,
                         );
                         let meta_line = Some("Size: unknown".to_string());
                         let name_height = name_lines.len() as u32 * file_line_height;
@@ -788,6 +787,7 @@ fn render_png(
                                 font_size,
                                 font_weight_body,
                                 &mut text_measurer,
+                                &emoji_cache,
                             );
                             if !detail_line.is_empty() {
                                 lines.push(detail_line);
@@ -870,6 +870,7 @@ fn render_png(
                 face_size,
                 font_weight_body,
                 &mut text_measurer,
+                &emoji_cache,
             );
             let mut max_line_w = 0u32;
             for line in &trunc_lines {
@@ -978,7 +979,6 @@ fn render_png(
         }
     }
 
-    let mut emoji_cache = EmojiRenderCache::new();
     draw_text_line(
         canvas,
         &font_collection,
@@ -1060,10 +1060,13 @@ fn render_png(
                                         font_weight_body,
                                         color_text,
                                     );
-                                    cursor_x = cursor_x.saturating_add(
-                                        text_measurer
-                                            .measure_text_width(text, font_size, font_weight_body),
-                                    );
+                                    cursor_x = cursor_x.saturating_add(measure_inline_text_width(
+                                        text,
+                                        font_size,
+                                        font_weight_body,
+                                        &mut text_measurer,
+                                        &emoji_cache,
+                                    ));
                                 }
                             }
                             InlineRun::Face { id } => {
@@ -1115,11 +1118,33 @@ fn render_png(
                                         font_weight_body,
                                         color_text,
                                     );
-                                    cursor_x = cursor_x.saturating_add(
-                                        text_measurer
-                                            .measure_text_width(&fallback, font_size, font_weight_body),
+                                    cursor_x = cursor_x.saturating_add(measure_inline_text_width(
+                                        &fallback,
+                                        font_size,
+                                        font_weight_body,
+                                        &mut text_measurer,
+                                        &emoji_cache,
+                                    ));
+                                }
+                            }
+                            InlineRun::Emoji { glyph_id } => {
+                                let line_top = baseline_y.saturating_sub(font_size);
+                                let emoji_y = line_top
+                                    .saturating_add(line_height.saturating_sub(face_size) / 2);
+                                let emoji_x = cursor_x;
+                                if let Some(image) = emoji_cache.resolve_image_by_gid(*glyph_id) {
+                                    draw_image_stretch(
+                                        canvas,
+                                        &image,
+                                        Rect::from_xywh(
+                                            emoji_x as f32,
+                                            emoji_y as f32,
+                                            face_size as f32,
+                                            face_size as f32,
+                                        ),
                                     );
                                 }
+                                cursor_x = cursor_x.saturating_add(face_size);
                             }
                         }
                     }
@@ -1399,14 +1424,6 @@ struct LineMetricsSnapshot {
     width: f32,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct EmojiGlyphMeta {
-    width: u8,
-    height: u8,
-    bearing_x: i8,
-    bearing_y: i8,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 struct EmojiGlyphRecord {
     glyph_id: u16,
@@ -1420,101 +1437,148 @@ struct EmojiGlyphRecord {
 struct EmojiPngMetadata {
     strike_ppem: u8,
     glyphs: Vec<EmojiGlyphRecord>,
+    #[serde(default)]
+    codepoints: HashMap<String, u16>,
+    #[serde(default)]
+    sequences: HashMap<String, u16>,
+}
+
+#[derive(Debug, Clone)]
+struct EmojiSequence {
+    seq: String,
+    glyph_id: u16,
+    len_bytes: usize,
 }
 
 #[derive(Debug)]
 struct EmojiPngStore {
     res_prefix: &'static str,
-    strike_ppem: u8,
-    glyphs: HashMap<u16, EmojiGlyphMeta>,
+    codepoints: HashMap<char, u16>,
+    sequences: HashMap<String, u16>,
     png_cache: HashMap<u16, &'static [u8]>,
 }
 
 struct EmojiRenderCache {
     store: Option<&'static Mutex<EmojiPngStore>>,
+    codepoints: HashMap<char, u16>,
+    sequences_by_first: HashMap<char, Vec<EmojiSequence>>,
+    keycap_map: HashMap<char, u16>,
     image_cache: HashMap<u16, Option<Image>>,
 }
 
 impl EmojiRenderCache {
     fn new() -> Self {
+        let store = emoji_png_store();
+        let mut codepoints = HashMap::new();
+        let mut sequences_by_first = HashMap::new();
+        let mut keycap_map = HashMap::new();
+        let mut keycap_prefers_vs: HashMap<char, bool> = HashMap::new();
+        if let Some(store_ref) = store {
+            let guard = match store_ref.lock() {
+                Ok(guard) => guard,
+                Err(guard) => guard.into_inner(),
+            };
+            codepoints = guard.codepoints.clone();
+            for (seq, glyph_id) in &guard.sequences {
+                if seq.is_empty() {
+                    continue;
+                }
+                if let Some(first) = seq.chars().next() {
+                    let entry = sequences_by_first.entry(first).or_insert_with(Vec::new);
+                    entry.push(EmojiSequence {
+                        seq: seq.clone(),
+                        glyph_id: *glyph_id,
+                        len_bytes: seq.len(),
+                    });
+                }
+                if let Some((base, has_vs)) = keycap_sequence_base(seq) {
+                    let replace = match keycap_prefers_vs.get(&base) {
+                        None => true,
+                        Some(existing_has_vs) => !*existing_has_vs && has_vs,
+                    };
+                    if replace {
+                        keycap_map.insert(base, *glyph_id);
+                        keycap_prefers_vs.insert(base, has_vs);
+                    }
+                }
+            }
+        }
+        for entries in sequences_by_first.values_mut() {
+            entries.sort_by_key(|item| std::cmp::Reverse(item.len_bytes));
+        }
         Self {
-            store: emoji_png_store(),
+            store,
+            codepoints,
+            sequences_by_first,
+            keycap_map,
             image_cache: HashMap::new(),
         }
     }
 
-    fn draw_over_paragraph(
-        &mut self,
-        canvas: &Canvas,
-        paragraph: &mut Paragraph,
-        origin_x: f32,
-        origin_y: f32,
-    ) {
-        let Some(store) = self.store else { return; };
-        let mut store = match store.lock() {
+    fn is_emoji_char(&self, ch: char) -> bool {
+        if ch.is_ascii() {
+            return false;
+        }
+        self.codepoints.contains_key(&ch)
+    }
+
+    fn glyph_id_for_char(&self, ch: char) -> Option<u16> {
+        self.codepoints.get(&ch).copied()
+    }
+
+    fn match_sequence(&self, text: &str, idx: usize) -> Option<(u16, usize)> {
+        let rest = text.get(idx..)?;
+        let mut chars = rest.chars();
+        let first = chars.next()?;
+        if let Some(glyph_id) = self.keycap_map.get(&first).copied() {
+            let mut consumed = first.len_utf8();
+            if let Some(next) = chars.next() {
+                if next == '\u{FE0F}' || next == '\u{FE0E}' {
+                    consumed += next.len_utf8();
+                    if let Some(after) = chars.next() {
+                        if after == '\u{20E3}' {
+                            consumed += after.len_utf8();
+                            return Some((glyph_id, consumed));
+                        }
+                    }
+                } else if next == '\u{20E3}' {
+                    consumed += next.len_utf8();
+                    return Some((glyph_id, consumed));
+                }
+            }
+        }
+        let entries = self.sequences_by_first.get(&first)?;
+        for entry in entries {
+            if rest.starts_with(&entry.seq) {
+                return Some((entry.glyph_id, entry.len_bytes));
+            }
+        }
+        None
+    }
+
+    fn resolve_image_by_gid(&mut self, glyph_id: u16) -> Option<Image> {
+        if let Some(entry) = self.image_cache.get(&glyph_id) {
+            return entry.clone();
+        }
+        let Some(store_ref) = self.store else { return None; };
+        let mut store = match store_ref.lock() {
             Ok(guard) => guard,
             Err(guard) => guard.into_inner(),
         };
-        if store.strike_ppem == 0 {
-            return;
-        }
-        let strike_ppem = store.strike_ppem as f32;
-        let image_cache = &mut self.image_cache;
-        paragraph.visit(|_, info| {
-            let Some(info) = info else { return; };
-            let font = info.font();
-            if font.size() <= 0.0 {
-                return;
+        let png_bytes = match store.png_cache.get(&glyph_id).copied() {
+            Some(bytes) => bytes,
+            None => {
+                let path = emoji_png_resource_path(store.res_prefix, glyph_id);
+                let bytes = embedded_resource_bytes(&path)?;
+                store.png_cache.insert(glyph_id, bytes);
+                bytes
             }
-            let typeface = font.typeface();
-            if !is_emoji_typeface(&typeface) {
-                return;
-            }
-            let scale = font.size() / strike_ppem;
-            let origin = info.origin();
-            let positions = info.positions();
-            let glyphs = info.glyphs();
-            let sampling = SamplingOptions {
-                filter: skia_safe::FilterMode::Linear,
-                mipmap: skia_safe::MipmapMode::None,
-                ..SamplingOptions::default()
-            };
-            let paint = Paint::default();
-            for (idx, glyph_id) in glyphs.iter().enumerate() {
-                let glyph_id = *glyph_id as u16;
-                let meta = match store.glyphs.get(&glyph_id).copied() {
-                    Some(meta) => meta,
-                    None => continue,
-                };
-                let png_bytes = match store.png_cache.get(&glyph_id).copied() {
-                    Some(bytes) => bytes,
-                    None => {
-                        let path = emoji_png_resource_path(store.res_prefix, glyph_id);
-                        let bytes = match embedded_resource_bytes(&path) {
-                            Some(bytes) => bytes,
-                            None => continue,
-                        };
-                        store.png_cache.insert(glyph_id, bytes);
-                        bytes
-                    }
-                };
-                let image = image_cache
-                    .entry(glyph_id)
-                    .or_insert_with(|| decode_emoji_image(png_bytes));
-                let Some(image) = image.as_ref() else { continue; };
-                let pos = positions.get(idx).copied().unwrap_or_default();
-                let width = meta.width as f32 * scale;
-                let height = meta.height as f32 * scale;
-                if width <= 0.0 || height <= 0.0 {
-                    continue;
-                }
-                let x = origin_x + origin.x + pos.x + meta.bearing_x as f32 * scale;
-                let y = origin_y + origin.y + pos.y - meta.bearing_y as f32 * scale;
-                let dst = Rect::from_xywh(x, y, width, height);
-                canvas.draw_image_rect_with_sampling_options(image, None, dst, sampling, &paint);
-            }
-        });
+        };
+        let image = decode_emoji_image(png_bytes);
+        self.image_cache.insert(glyph_id, image.clone());
+        image
     }
+
 }
 
 fn decode_emoji_image(bytes: &[u8]) -> Option<Image> {
@@ -1522,11 +1586,24 @@ fn decode_emoji_image(bytes: &[u8]) -> Option<Image> {
     Image::from_encoded(data)
 }
 
-fn is_emoji_typeface(typeface: &Typeface) -> bool {
-    match typeface.family_name().as_str() {
-        "Apple Color Emoji" | "OQQWall Emoji" => true,
-        _ => false,
+fn keycap_sequence_base(seq: &str) -> Option<(char, bool)> {
+    let mut chars = seq.chars();
+    let base = chars.next()?;
+    if !matches!(base, '0'..='9' | '#' | '*') {
+        return None;
     }
+    let second = chars.next()?;
+    if second == '\u{FE0F}' || second == '\u{FE0E}' {
+        let third = chars.next()?;
+        if third != '\u{20E3}' || chars.next().is_some() {
+            return None;
+        }
+        return Some((base, true));
+    }
+    if second == '\u{20E3}' && chars.next().is_none() {
+        return Some((base, false));
+    }
+    None
 }
 
 fn build_text_style(font_size: u32, font_weight: u32, color: Color4f) -> TextStyle {
@@ -1552,68 +1629,6 @@ fn build_text_style(font_size: u32, font_weight: u32, color: Color4f) -> TextSty
     ts
 }
 
-fn build_emoji_text_style(font_size: u32, font_weight: u32, color: Color4f) -> TextStyle {
-    let mut ts = TextStyle::new();
-    ts.set_font_size(font_size as f32);
-    let mut paint = Paint::default();
-    paint.set_color4f(color, None);
-    ts.set_foreground_paint(&paint);
-    if let Some(tf) = emoji_typeface() {
-        debug_log!(
-            "emoji style: size={} weight={} typeface_family={} postscript={:?}",
-            font_size,
-            font_weight,
-            tf.family_name(),
-            tf.post_script_name()
-        );
-        ts.set_font_style(tf.font_style());
-        ts.set_typeface(Some(tf));
-    } else {
-        debug_log!(
-            "emoji style: size={} weight={} families={:?}",
-            font_size,
-            font_weight,
-            EMOJI_FONT_FAMILIES
-        );
-        ts.set_font_families(&EMOJI_FONT_FAMILIES);
-        let font_style = FontStyle::new(
-            Weight::from(font_weight as i32),
-            Width::NORMAL,
-            Slant::Upright,
-        );
-        ts.set_font_style(font_style);
-    }
-    ts
-}
-
-fn emoji_typeface() -> Option<Typeface> {
-    static EMOJI_TF: OnceLock<Option<Typeface>> = OnceLock::new();
-    EMOJI_TF
-        .get_or_init(|| {
-            let bytes = match embedded_resource_bytes("fonts/AppleColorEmoji.ttf") {
-                Some(bytes) => bytes,
-                None => {
-                    debug_log!("emoji typeface: missing embedded AppleColorEmoji.ttf");
-                    return None;
-                }
-            };
-            let mgr = skia_safe::FontMgr::new();
-            let tf = mgr.new_from_data(bytes, 0usize);
-            if let Some(ref tf) = tf {
-                debug_log!(
-                    "emoji typeface loaded: family={} postscript={:?} bytes={}",
-                    tf.family_name(),
-                    tf.post_script_name(),
-                    bytes.len()
-                );
-            } else {
-                debug_log!("emoji typeface load failed");
-            }
-            tf
-        })
-        .clone()
-}
-
 const EMOJI_PNG_RES_PREFIX: &str = "emoji_png/apple_color_emoji";
 const EMOJI_PNG_METADATA_PATH: &str = "emoji_png/apple_color_emoji/metadata.json";
 
@@ -1634,25 +1649,27 @@ fn init_emoji_png_store_inner() -> Option<Mutex<EmojiPngStore>> {
             return None;
         }
     };
-    let glyphs = metadata
-        .glyphs
-        .into_iter()
-        .map(|record| {
-            (
-                record.glyph_id,
-                EmojiGlyphMeta {
-                    width: record.width,
-                    height: record.height,
-                    bearing_x: record.bearing_x,
-                    bearing_y: record.bearing_y,
-                },
-            )
-        })
-        .collect();
+    let mut codepoints = HashMap::new();
+    for (emoji, glyph_id) in metadata.codepoints {
+        let mut chars = emoji.chars();
+        if let (Some(ch), None) = (chars.next(), chars.next()) {
+            codepoints.insert(ch, glyph_id);
+        }
+    }
+    if codepoints.is_empty() {
+        debug_log!("emoji png: codepoint map missing; rerun extract script");
+        return None;
+    }
+    let mut sequences = HashMap::new();
+    for (sequence, glyph_id) in metadata.sequences {
+        if sequence.chars().count() >= 2 {
+            sequences.insert(sequence, glyph_id);
+        }
+    }
     Some(Mutex::new(EmojiPngStore {
         res_prefix: EMOJI_PNG_RES_PREFIX,
-        strike_ppem: metadata.strike_ppem,
-        glyphs,
+        codepoints,
+        sequences,
         png_cache: HashMap::new(),
     }))
 }
@@ -1664,108 +1681,6 @@ fn emoji_png_resource_path(prefix: &str, glyph_id: u16) -> String {
 fn load_embedded_emoji_png_metadata() -> Option<EmojiPngMetadata> {
     let bytes = embedded_resource_bytes(EMOJI_PNG_METADATA_PATH)?;
     serde_json::from_slice(bytes).ok()
-}
-
-fn append_text_with_emoji_runs(
-    builder: &mut ParagraphBuilder,
-    text: &str,
-    base_style: &TextStyle,
-    emoji_style: &TextStyle,
-) {
-    if !contains_emoji(text) {
-        builder.add_text(text);
-        return;
-    }
-    for (run, is_emoji) in split_emoji_runs(text) {
-        if run.is_empty() {
-            continue;
-        }
-        if is_emoji {
-            builder.push_style(emoji_style);
-        } else {
-            builder.push_style(base_style);
-        }
-        builder.add_text(&run);
-        builder.pop();
-    }
-}
-
-fn contains_emoji(text: &str) -> bool {
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        let next = chars.peek().copied();
-        if is_emoji_char_with_next(ch, next) {
-            return true;
-        }
-    }
-    false
-}
-
-fn split_emoji_runs(text: &str) -> Vec<(String, bool)> {
-    let mut runs = Vec::new();
-    let mut current = String::new();
-    let mut current_is_emoji: Option<bool> = None;
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        let next = chars.peek().copied();
-        let is_emoji = is_emoji_char_with_next(ch, next);
-        match current_is_emoji {
-            Some(flag) if flag == is_emoji => {
-                current.push(ch);
-            }
-            Some(flag) => {
-                runs.push((std::mem::take(&mut current), flag));
-                current.push(ch);
-                current_is_emoji = Some(is_emoji);
-            }
-            None => {
-                current.push(ch);
-                current_is_emoji = Some(is_emoji);
-            }
-        }
-    }
-    if let Some(flag) = current_is_emoji {
-        if !current.is_empty() {
-            runs.push((current, flag));
-        }
-    }
-    runs
-}
-
-fn is_emoji_char_with_next(ch: char, next: Option<char>) -> bool {
-    if is_emoji_like(ch) {
-        return true;
-    }
-    if matches!(ch, '#' | '*' | '0'..='9') {
-        return matches!(next, Some('\u{FE0F}') | Some('\u{20E3}'));
-    }
-    false
-}
-
-fn is_emoji_like(ch: char) -> bool {
-    let code = ch as u32;
-    matches!(
-        code,
-        0x00A9
-            | 0x00AE
-            | 0x2122
-            | 0x2934
-            | 0x2935
-            | 0x3030
-            | 0x303D
-            | 0x3297
-            | 0x3299
-            | 0xFE0E
-            | 0xFE0F
-            | 0x200D
-            | 0x20E3
-    ) || (0x1F000..=0x1FAFF).contains(&code)
-        || (0x1F1E6..=0x1F1FF).contains(&code)
-        || (0x1F3FB..=0x1F3FF).contains(&code)
-        || (0x2300..=0x23FF).contains(&code)
-        || (0x2600..=0x27BF).contains(&code)
-        || (0x2B00..=0x2BFF).contains(&code)
-        || (0xE0020..=0xE007F).contains(&code)
 }
 
 fn build_line_paragraph(
@@ -1786,10 +1701,9 @@ fn build_line_paragraph(
     );
     let mut ps = ParagraphStyle::new();
     let ts = build_text_style(font_size, font_weight, color);
-    let emoji_ts = build_emoji_text_style(font_size, font_weight, color);
     ps.set_text_style(&ts);
     let mut builder = ParagraphBuilder::new(&ps, font_collection.clone());
-    append_text_with_emoji_runs(&mut builder, text, &ts, &emoji_ts);
+    builder.add_text(text);
     let mut paragraph = builder.build();
     paragraph.layout(MEASURE_MAX_WIDTH);
     let line_metrics = paragraph.get_line_metrics();
@@ -1847,14 +1761,109 @@ fn draw_text_line(
         x,
         baseline_y
     );
-    if let Some((mut paragraph, metrics)) =
+    let mut cursor_x = x;
+    let mut buffer = String::new();
+    let emoji_size = font_size as f32;
+    let bytes = text.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        if let Some((glyph_id, consumed)) = emoji_cache.match_sequence(text, idx) {
+            if !buffer.is_empty() {
+                cursor_x += draw_text_segment(
+                    canvas,
+                    font_collection,
+                    &buffer,
+                    cursor_x,
+                    baseline_y,
+                    font_size,
+                    font_weight,
+                    color,
+                );
+                buffer.clear();
+            }
+            let top_y = baseline_y - font_size as f32;
+            if let Some(image) = emoji_cache.resolve_image_by_gid(glyph_id) {
+                draw_image_stretch(
+                    canvas,
+                    &image,
+                    Rect::from_xywh(cursor_x, top_y, emoji_size, emoji_size),
+                );
+                cursor_x += emoji_size;
+            }
+            idx += consumed;
+            continue;
+        }
+        let ch = text[idx..].chars().next().unwrap();
+        if should_skip_emoji_char(ch) {
+            idx += ch.len_utf8();
+            continue;
+        }
+        if emoji_cache.is_emoji_char(ch) {
+            if !buffer.is_empty() {
+                cursor_x += draw_text_segment(
+                    canvas,
+                    font_collection,
+                    &buffer,
+                    cursor_x,
+                    baseline_y,
+                    font_size,
+                    font_weight,
+                    color,
+                );
+                buffer.clear();
+            }
+            let top_y = baseline_y - font_size as f32;
+            if let Some(glyph_id) = emoji_cache.glyph_id_for_char(ch) {
+                if let Some(image) = emoji_cache.resolve_image_by_gid(glyph_id) {
+                    draw_image_stretch(
+                        canvas,
+                        &image,
+                        Rect::from_xywh(cursor_x, top_y, emoji_size, emoji_size),
+                    );
+                    cursor_x += emoji_size;
+                } else {
+                    buffer.push(ch);
+                }
+            } else {
+                buffer.push(ch);
+            }
+        } else {
+            buffer.push(ch);
+        }
+        idx += ch.len_utf8();
+    }
+    if !buffer.is_empty() {
+        let _ = draw_text_segment(
+            canvas,
+            font_collection,
+            &buffer,
+            cursor_x,
+            baseline_y,
+            font_size,
+            font_weight,
+            color,
+        );
+    }
+}
+
+fn draw_text_segment(
+    canvas: &Canvas,
+    font_collection: &FontCollection,
+    text: &str,
+    x: f32,
+    baseline_y: f32,
+    font_size: u32,
+    font_weight: u32,
+    color: Color4f,
+) -> f32 {
+    if let Some((paragraph, metrics)) =
         build_line_paragraph(font_collection, text, font_size, font_weight, color)
     {
         let top_y = baseline_y - metrics.baseline;
         paragraph.paint(canvas, (x, top_y));
-        if contains_emoji(text) {
-            emoji_cache.draw_over_paragraph(canvas, &mut paragraph, x, top_y);
-        }
+        metrics.width
+    } else {
+        0.0
     }
 }
 
@@ -1910,6 +1919,19 @@ fn draw_image_cover_rounded(canvas: &Canvas, img: &Image, dst: Rect, radius: f32
         &paint,
     );
     canvas.restore();
+}
+
+fn draw_image_stretch(canvas: &Canvas, img: &Image, dst: Rect) {
+    if dst.width() <= 0.0 || dst.height() <= 0.0 {
+        return;
+    }
+    let sampling = SamplingOptions {
+        filter: skia_safe::FilterMode::Linear,
+        mipmap: skia_safe::MipmapMode::None,
+        ..SamplingOptions::default()
+    };
+    let paint = Paint::default();
+    canvas.draw_image_rect_with_sampling_options(img, None, dst, sampling, &paint);
 }
 
 async fn resolve_image_sources(
@@ -2121,12 +2143,66 @@ fn media_icon_text(kind: oqqwall_rust_core::MediaKind) -> String {
     }
 }
 
+fn measure_inline_text_width(
+    text: &str,
+    font_size: u32,
+    font_weight: u32,
+    measurer: &mut TextMeasurer,
+    emoji_cache: &EmojiRenderCache,
+) -> u32 {
+    if text.is_empty() {
+        return 0;
+    }
+    let emoji_size = font_size;
+    let mut width = 0u32;
+    let mut segment = String::new();
+    let bytes = text.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        if let Some((_glyph_id, consumed)) = emoji_cache.match_sequence(text, idx) {
+            if !segment.is_empty() {
+                width = width.saturating_add(
+                    measurer.measure_text_width(&segment, font_size, font_weight),
+                );
+                segment.clear();
+            }
+            width = width.saturating_add(emoji_size);
+            idx += consumed;
+            continue;
+        }
+        let ch = text[idx..].chars().next().unwrap();
+        if should_skip_emoji_char(ch) {
+            idx += ch.len_utf8();
+            continue;
+        }
+        if emoji_cache.is_emoji_char(ch) {
+            if !segment.is_empty() {
+                width = width.saturating_add(
+                    measurer.measure_text_width(&segment, font_size, font_weight),
+                );
+                segment.clear();
+            }
+            width = width.saturating_add(emoji_size);
+        } else {
+            segment.push(ch);
+        }
+        idx += ch.len_utf8();
+    }
+    if !segment.is_empty() {
+        width = width.saturating_add(
+            measurer.measure_text_width(&segment, font_size, font_weight),
+        );
+    }
+    width
+}
+
 fn truncate_text(
     text: &str,
     max_width: u32,
     font_size: u32,
     font_weight: u32,
     measurer: &mut TextMeasurer,
+    emoji_cache: &EmojiRenderCache,
 ) -> String {
     if text.is_empty() {
         return String::new();
@@ -2134,11 +2210,23 @@ fn truncate_text(
     let mut out = String::new();
     for ch in text.chars() {
         out.push(ch);
-        let width = measurer.measure_text_width(&out, font_size, font_weight);
+        let width = measure_inline_text_width(
+            &out,
+            font_size,
+            font_weight,
+            measurer,
+            emoji_cache,
+        );
         if width > max_width {
             out.pop();
             let ellipsis_width = measurer.measure_text_width("...", font_size, font_weight);
-            let base_width = measurer.measure_text_width(&out, font_size, font_weight);
+            let base_width = measure_inline_text_width(
+                &out,
+                font_size,
+                font_weight,
+                measurer,
+                emoji_cache,
+            );
             if base_width + ellipsis_width <= max_width && !out.is_empty() {
                 out.push_str("...");
             }
@@ -2155,6 +2243,7 @@ fn limit_lines(
     font_size: u32,
     font_weight: u32,
     measurer: &mut TextMeasurer,
+    emoji_cache: &EmojiRenderCache,
 ) -> Vec<String> {
     if lines.len() <= max_lines {
         return lines;
@@ -2162,7 +2251,14 @@ fn limit_lines(
     lines.truncate(max_lines);
     if let Some(last) = lines.last_mut() {
         let padded = format!("{}...", last);
-        *last = truncate_text(&padded, max_width, font_size, font_weight, measurer);
+        *last = truncate_text(
+            &padded,
+            max_width,
+            font_size,
+            font_weight,
+            measurer,
+            emoji_cache,
+        );
     }
     lines
 }
@@ -2174,8 +2270,10 @@ fn wrap_inline_text(
     face_size: u32,
     font_weight: u32,
     measurer: &mut TextMeasurer,
+    emoji_cache: &EmojiRenderCache,
 ) -> Vec<InlineLine> {
     let mut lines = Vec::new();
+    let emoji_size = face_size;
     for raw_line in text.lines() {
         if raw_line.is_empty() {
             lines.push(InlineLine {
@@ -2184,7 +2282,7 @@ fn wrap_inline_text(
             });
             continue;
         }
-        let atoms = parse_inline_atoms(raw_line);
+        let atoms = parse_inline_atoms(raw_line, emoji_cache, true);
         let mut current: Vec<InlineAtom> = Vec::new();
         let mut segment_text = String::new();
         let mut base_width = 0u32;
@@ -2204,6 +2302,17 @@ fn wrap_inline_text(
                     }
                     base_width = base_width.saturating_add(face_size);
                 }
+                InlineAtom::Emoji(_) => {
+                    if !segment_text.is_empty() {
+                        base_width = base_width.saturating_add(measurer.measure_text_width(
+                            &segment_text,
+                            font_size,
+                            font_weight,
+                        ));
+                        segment_text.clear();
+                    }
+                    base_width = base_width.saturating_add(emoji_size);
+                }
             }
             current.push(atom);
             let segment_width =
@@ -2217,6 +2326,7 @@ fn wrap_inline_text(
                         &line_atoms,
                         font_size,
                         face_size,
+                        emoji_size,
                         font_weight,
                         measurer,
                     ));
@@ -2230,6 +2340,7 @@ fn wrap_inline_text(
                         &line_atoms,
                         font_size,
                         face_size,
+                        emoji_size,
                         font_weight,
                         measurer,
                     ));
@@ -2239,6 +2350,7 @@ fn wrap_inline_text(
                     &current,
                     font_size,
                     face_size,
+                    emoji_size,
                     font_weight,
                     measurer,
                 );
@@ -2260,6 +2372,7 @@ fn wrap_inline_text(
                 &current,
                 font_size,
                 face_size,
+                emoji_size,
                 font_weight,
                 measurer,
             ));
@@ -2278,6 +2391,7 @@ fn rebuild_inline_measure_state(
     atoms: &[InlineAtom],
     font_size: u32,
     face_size: u32,
+    emoji_size: u32,
     font_weight: u32,
     measurer: &mut TextMeasurer,
 ) -> (String, u32) {
@@ -2297,6 +2411,17 @@ fn rebuild_inline_measure_state(
                 }
                 base_width = base_width.saturating_add(face_size);
             }
+            InlineAtom::Emoji(_) => {
+                if !segment_text.is_empty() {
+                    base_width = base_width.saturating_add(measurer.measure_text_width(
+                        &segment_text,
+                        font_size,
+                        font_weight,
+                    ));
+                    segment_text.clear();
+                }
+                base_width = base_width.saturating_add(emoji_size);
+            }
         }
     }
     (segment_text, base_width)
@@ -2308,6 +2433,7 @@ fn wrap_text(
     font_size: u32,
     font_weight: u32,
     measurer: &mut TextMeasurer,
+    emoji_cache: &EmojiRenderCache,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     for raw_line in text.lines() {
@@ -2321,8 +2447,13 @@ fn wrap_text(
         for ch in raw_line.chars() {
             current.push(ch);
             current_text.push(ch);
-            let current_width =
-                measurer.measure_text_width(&current_text, font_size, font_weight);
+            let current_width = measure_inline_text_width(
+                &current_text,
+                font_size,
+                font_weight,
+                measurer,
+                emoji_cache,
+            );
             if current_width > max_width && current.len() > 1 {
                 if let Some(break_idx) = last_break {
                     let line: String = current[..break_idx].iter().collect();
@@ -2361,12 +2492,16 @@ fn wrap_text(
     lines
 }
 
-fn parse_inline_atoms(line: &str) -> Vec<InlineAtom> {
+fn parse_inline_atoms(
+    line: &str,
+    emoji_cache: &EmojiRenderCache,
+    parse_faces: bool,
+) -> Vec<InlineAtom> {
     let mut atoms = Vec::new();
     let bytes = line.as_bytes();
     let mut idx = 0usize;
     while idx < bytes.len() {
-        if bytes[idx] == b'[' && bytes.get(idx + 1) == Some(&b'[') {
+        if parse_faces && bytes[idx] == b'[' {
             let rest = &line[idx..];
             if rest.starts_with("[[face:") {
                 let after_prefix = idx + "[[face:".len();
@@ -2380,9 +2515,39 @@ fn parse_inline_atoms(line: &str) -> Vec<InlineAtom> {
                         }
                     }
                 }
+            } else if rest.starts_with("[face:") {
+                let after_prefix = idx + "[face:".len();
+                if after_prefix <= line.len() {
+                    if let Some(close) = line[after_prefix..].find(']') {
+                        let face_id = &line[after_prefix..after_prefix + close];
+                        if !face_id.is_empty() && face_id.chars().all(|c| c.is_ascii_digit()) {
+                            atoms.push(InlineAtom::Face(face_id.to_string()));
+                            idx = after_prefix + close + 1;
+                            continue;
+                        }
+                    }
+                }
             }
         }
+        if let Some((glyph_id, consumed)) = emoji_cache.match_sequence(line, idx) {
+            atoms.push(InlineAtom::Emoji(glyph_id));
+            idx += consumed;
+            continue;
+        }
         let ch = line[idx..].chars().next().unwrap();
+        if should_skip_emoji_char(ch) {
+            idx += ch.len_utf8();
+            continue;
+        }
+        if emoji_cache.is_emoji_char(ch) {
+            if let Some(glyph_id) = emoji_cache.glyph_id_for_char(ch) {
+                atoms.push(InlineAtom::Emoji(glyph_id));
+            } else {
+                atoms.push(InlineAtom::Char(ch));
+            }
+            idx += ch.len_utf8();
+            continue;
+        }
         atoms.push(InlineAtom::Char(ch));
         idx += ch.len_utf8();
     }
@@ -2392,7 +2557,7 @@ fn parse_inline_atoms(line: &str) -> Vec<InlineAtom> {
 fn inline_atom_is_break(atom: &InlineAtom) -> bool {
     match atom {
         InlineAtom::Char(ch) => is_break_char(*ch),
-        InlineAtom::Face(_) => false,
+        InlineAtom::Face(_) | InlineAtom::Emoji(_) => false,
     }
 }
 
@@ -2416,6 +2581,7 @@ fn build_inline_line(
     atoms: &[InlineAtom],
     font_size: u32,
     face_size: u32,
+    emoji_size: u32,
     font_weight: u32,
     measurer: &mut TextMeasurer,
 ) -> InlineLine {
@@ -2438,6 +2604,17 @@ fn build_inline_line(
                 runs.push(InlineRun::Face { id: id.clone() });
                 width = width.saturating_add(face_size);
             }
+            InlineAtom::Emoji(glyph_id) => {
+                if !current.is_empty() {
+                    width = width.saturating_add(
+                        measurer.measure_text_width(&current, font_size, font_weight),
+                    );
+                    runs.push(InlineRun::Text(current.clone()));
+                    current.clear();
+                }
+                runs.push(InlineRun::Emoji { glyph_id: *glyph_id });
+                width = width.saturating_add(emoji_size);
+            }
         }
     }
     if !current.is_empty() {
@@ -2456,6 +2633,11 @@ fn is_break_char(ch: char) -> bool {
         ch,
         '-' | '/' | '_' | '.' | ',' | ';' | ':' | '?' | '!' | '，' | '。' | '；' | '、' | '：'
     )
+}
+
+fn should_skip_emoji_char(ch: char) -> bool {
+    matches!(ch, '\u{FE0F}' | '\u{FE0E}' | '\u{200D}' | '\u{20E3}')
+        || (0xE0020..=0xE007F).contains(&(ch as u32))
 }
 
 
@@ -2640,29 +2822,6 @@ fn build_font_collection(font_dir: &Path) -> FontCollection {
         fc.font_managers_count(),
         fc.font_fallback_enabled()
     );
-    let debug_style = FontStyle::new(Weight::NORMAL, Width::NORMAL, Slant::Upright);
-    let emoji_typefaces = fc.find_typefaces(&[EMOJI_FONT_ALIAS], debug_style);
-    debug_log!(
-        "font collection: emoji_alias_typefaces={}",
-        emoji_typefaces.len()
-    );
-    for tf in emoji_typefaces {
-        debug_log!(
-            "font collection: emoji_alias family={} postscript={:?}",
-            tf.family_name(),
-            tf.post_script_name()
-        );
-    }
-    let emoji_char: skia_safe::Unichar = 0x1F602;
-    if let Some(tf) = fc.default_emoji_fallback(emoji_char, debug_style, "") {
-        debug_log!(
-            "font collection: emoji_fallback family={} postscript={:?}",
-            tf.family_name(),
-            tf.post_script_name()
-        );
-    } else {
-        debug_log!("font collection: emoji_fallback none");
-    }
     fc
 }
 
@@ -2711,13 +2870,8 @@ fn register_typeface_with_alias(
     asset_mgr.register_typeface(typeface, None);
 }
 
-fn font_alias_for_path(path: &Path) -> Option<&'static str> {
-    let stem = path.file_stem()?.to_str()?;
-    if stem.eq_ignore_ascii_case("AppleColorEmoji") {
-        Some(EMOJI_FONT_ALIAS)
-    } else {
-        None
-    }
+fn font_alias_for_path(_path: &Path) -> Option<&'static str> {
+    None
 }
 
 fn embedded_bytes_for_path(path: &Path) -> Option<&'static [u8]> {

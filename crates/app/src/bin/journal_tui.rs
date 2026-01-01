@@ -21,6 +21,7 @@ use oqqwall_rust_core::event::{
 use oqqwall_rust_core::ids::Id128;
 use oqqwall_rust_infra::{JournalCorruption, LocalJournal};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use unicode_width::UnicodeWidthChar;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -31,7 +32,6 @@ use ratatui::{Frame, Terminal};
 struct EventEntry {
     summary: String,
     detail: String,
-    detail_lines: usize,
 }
 
 struct UserEntry {
@@ -57,6 +57,12 @@ enum ViewMode {
 enum UserFocus {
     Users,
     Events,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DetailKey {
+    All(usize),
+    Users { user: usize, event: usize },
 }
 
 #[derive(Clone, Copy, Default)]
@@ -109,6 +115,9 @@ struct App {
     detail_height: usize,
     detail_select_anchor: Option<usize>,
     detail_select_end: Option<usize>,
+    detail_wrapped: Vec<String>,
+    detail_wrap_width: u16,
+    detail_wrap_key: Option<DetailKey>,
     layout: AppLayout,
     load_error: Option<String>,
     corruption: Option<JournalCorruption>,
@@ -135,6 +144,9 @@ impl App {
             detail_height: 0,
             detail_select_anchor: None,
             detail_select_end: None,
+            detail_wrapped: Vec::new(),
+            detail_wrap_width: 0,
+            detail_wrap_key: None,
             layout: AppLayout::default(),
             load_error: None,
             corruption: None,
@@ -246,6 +258,33 @@ impl App {
         }
     }
 
+    fn current_detail_key(&self) -> Option<DetailKey> {
+        match self.view {
+            ViewMode::All => self.selected.map(DetailKey::All),
+            ViewMode::Users => {
+                let user = self.user_selected?;
+                let event = self.user_event_selected?;
+                Some(DetailKey::Users { user, event })
+            }
+        }
+    }
+
+    fn ensure_detail_wrapped(&mut self) {
+        let width = self.layout.detail.width.saturating_sub(2).max(1);
+        let key = self.current_detail_key();
+        if self.detail_wrap_width == width && self.detail_wrap_key == key {
+            return;
+        }
+        self.detail_wrap_width = width;
+        self.detail_wrap_key = key;
+        self.detail_wrapped = if let Some(entry) = self.selected_detail_entry() {
+            wrap_detail_text(&entry.detail, width as usize)
+        } else {
+            Vec::new()
+        };
+        self.clamp_detail_selection();
+    }
+
     fn clear_detail_selection(&mut self) {
         self.detail_select_anchor = None;
         self.detail_select_end = None;
@@ -266,6 +305,20 @@ impl App {
         let start = self.detail_select_anchor?;
         let end = self.detail_select_end.unwrap_or(start);
         Some((start.min(end), start.max(end)))
+    }
+
+    fn clamp_detail_selection(&mut self) {
+        let len = self.detail_wrapped.len();
+        if len == 0 {
+            self.clear_detail_selection();
+            return;
+        }
+        if let Some(anchor) = self.detail_select_anchor {
+            self.detail_select_anchor = Some(anchor.min(len - 1));
+        }
+        if let Some(end) = self.detail_select_end {
+            self.detail_select_end = Some(end.min(len - 1));
+        }
     }
 
     fn ensure_visible(&mut self) {
@@ -345,16 +398,15 @@ impl App {
         }
     }
 
-    fn max_detail_scroll(&self) -> u16 {
-        let Some(entry) = self.selected_detail_entry() else {
-            return 0;
-        };
+    fn max_detail_scroll(&mut self) -> u16 {
+        self.ensure_detail_wrapped();
         if self.detail_height == 0 {
             return 0;
         }
         let height = self.detail_height as usize;
-        if entry.detail_lines > height {
-            (entry.detail_lines - height) as u16
+        let total = self.detail_wrapped.len();
+        if total > height {
+            (total - height) as u16
         } else {
             0
         }
@@ -725,8 +777,33 @@ fn handle_mouse_click(app: &mut App, x: u16, y: u16) {
     }
 }
 
-fn handle_mouse_drag(app: &mut App, _x: u16, y: u16) {
+fn handle_mouse_drag(app: &mut App, x: u16, y: u16) {
     if app.detail_select_anchor.is_none() {
+        return;
+    }
+    let rect = app.layout.detail;
+    if rect.width == 0 || rect.height < 2 {
+        return;
+    }
+    if x < rect.x || x >= rect.x.saturating_add(rect.width) {
+        return;
+    }
+    let top = rect.y.saturating_add(1);
+    let bottom = rect.y.saturating_add(rect.height).saturating_sub(2);
+    if y < top {
+        if app.detail_scroll > 0 {
+            app.detail_scroll = app.detail_scroll.saturating_sub(1);
+        }
+        app.update_detail_selection(app.detail_scroll as usize);
+        return;
+    }
+    if y > bottom {
+        let max_scroll = app.max_detail_scroll();
+        if app.detail_scroll < max_scroll {
+            app.detail_scroll = app.detail_scroll.saturating_add(1);
+        }
+        let line = app.detail_scroll as usize + app.detail_height.saturating_sub(1);
+        app.update_detail_selection(line);
         return;
     }
     if let Some(line) = detail_line_at_y(app, y, true) {
@@ -752,6 +829,11 @@ fn handle_mouse_scroll(app: &mut App, direction: isize, x: u16, y: u16) {
         ViewMode::All => {
             if rect_contains(app.layout.all_detail, x, y) {
                 app.scroll_detail_lines(detail_step);
+                if app.detail_select_anchor.is_some() {
+                    if let Some(line) = detail_line_at_y(app, y, true) {
+                        app.update_detail_selection(line);
+                    }
+                }
             } else if rect_contains(app.layout.all_list, x, y) {
                 app.move_selection(direction);
             }
@@ -759,6 +841,11 @@ fn handle_mouse_scroll(app: &mut App, direction: isize, x: u16, y: u16) {
         ViewMode::Users => {
             if rect_contains(app.layout.detail, x, y) {
                 app.scroll_detail_lines(detail_step);
+                if app.detail_select_anchor.is_some() {
+                    if let Some(line) = detail_line_at_y(app, y, true) {
+                        app.update_detail_selection(line);
+                    }
+                }
             } else if rect_contains(app.layout.user_events, x, y) {
                 app.focus_events();
                 app.move_user_event_selection(direction);
@@ -798,9 +885,9 @@ fn list_click_index(rect: Rect, y: u16, offset: usize, len: usize) -> Option<usi
     }
 }
 
-fn detail_line_at_y(app: &App, y: u16, clamp: bool) -> Option<usize> {
-    let entry = app.selected_detail_entry()?;
-    if entry.detail_lines == 0 || app.detail_height == 0 {
+fn detail_line_at_y(app: &mut App, y: u16, clamp: bool) -> Option<usize> {
+    app.ensure_detail_wrapped();
+    if app.detail_wrapped.is_empty() || app.detail_height == 0 {
         return None;
     }
     let rect = app.layout.detail;
@@ -825,9 +912,9 @@ fn detail_line_at_y(app: &App, y: u16, clamp: bool) -> Option<usize> {
         y.saturating_sub(start_y) as usize
     };
     let mut line = app.detail_scroll as usize + row;
-    if line >= entry.detail_lines {
+    if line >= app.detail_wrapped.len() {
         if clamp {
-            line = entry.detail_lines.saturating_sub(1);
+            line = app.detail_wrapped.len().saturating_sub(1);
         } else {
             return None;
         }
@@ -835,21 +922,15 @@ fn detail_line_at_y(app: &App, y: u16, clamp: bool) -> Option<usize> {
     Some(line)
 }
 
-fn detail_selection_text(app: &App) -> Option<String> {
-    let entry = app.selected_detail_entry()?;
+fn detail_selection_text(app: &mut App) -> Option<String> {
+    app.ensure_detail_wrapped();
     let (start, end) = app.detail_selection_range()?;
-    if entry.detail_lines == 0 || start >= entry.detail_lines {
+    if app.detail_wrapped.is_empty() || start >= app.detail_wrapped.len() {
         return None;
     }
-    let end = end.min(entry.detail_lines.saturating_sub(1));
+    let end = end.min(app.detail_wrapped.len().saturating_sub(1));
     let mut out = String::new();
-    for (idx, line) in entry.detail.lines().enumerate() {
-        if idx < start {
-            continue;
-        }
-        if idx > end {
-            break;
-        }
+    for line in &app.detail_wrapped[start..=end] {
         if !out.is_empty() {
             out.push('\n');
         }
@@ -860,6 +941,38 @@ fn detail_selection_text(app: &App) -> Option<String> {
     } else {
         Some(out)
     }
+}
+
+fn wrap_detail_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        let mut current_width = 0usize;
+        for ch in line.chars() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
+            if current_width + ch_width > width && !current.is_empty() {
+                out.push(current);
+                current = String::new();
+                current_width = 0;
+            }
+            current.push(ch);
+            current_width += ch_width;
+            if current_width >= width {
+                out.push(current);
+                current = String::new();
+                current_width = 0;
+            }
+        }
+        if !current.is_empty() {
+            out.push(current);
+        }
+    }
+    out
 }
 
 fn copy_to_clipboard_osc52(text: &str) -> io::Result<()> {
@@ -1145,15 +1258,16 @@ fn user_events_widget(app: &App) -> Paragraph<'_> {
     Paragraph::new(Text::from(lines)).block(Block::default().borders(Borders::ALL).title(title))
 }
 
-fn detail_widget(app: &App) -> Paragraph<'_> {
-    let Some(entry) = app.selected_detail_entry() else {
+fn detail_widget(app: &mut App) -> Paragraph<'_> {
+    app.ensure_detail_wrapped();
+    if app.detail_wrapped.is_empty() {
         return Paragraph::new("No event selected.")
             .block(Block::default().borders(Borders::ALL).title("Details"));
-    };
+    }
     let selection = app.detail_selection_range();
     let highlight = Style::default().add_modifier(Modifier::REVERSED);
     let mut lines = Vec::new();
-    for (idx, line) in entry.detail.lines().enumerate() {
+    for (idx, line) in app.detail_wrapped.iter().enumerate() {
         let style = if selection
             .map(|(start, end)| idx >= start && idx <= end)
             .unwrap_or(false)
@@ -1162,7 +1276,7 @@ fn detail_widget(app: &App) -> Paragraph<'_> {
         } else {
             Style::default()
         };
-        lines.push(Line::styled(line.to_string(), style));
+        lines.push(Line::styled(line.clone(), style));
     }
     Paragraph::new(Text::from(lines))
         .block(Block::default().borders(Borders::ALL).title("Details"))
@@ -1178,11 +1292,9 @@ fn load_events(data_dir: &str) -> Result<LoadResult, String> {
     let replay = journal.replay(None, |env| {
         let summary = summarize_event(env);
         let detail = detail_event(env);
-        let detail_lines = detail.lines().count();
         events.push(EventEntry {
             summary,
             detail,
-            detail_lines,
         });
 
         match &env.event {
@@ -1229,7 +1341,6 @@ fn load_events(data_dir: &str) -> Result<LoadResult, String> {
             }) => {
                 let summary = summarize_user_draft(env.ts_ms, draft);
                 let detail = detail_event(env);
-                let detail_lines = detail.lines().count();
                 let mut seen_users = HashSet::new();
                 for ingress_id in ingress_ids {
                     let Some(user_id) = ingress_user.get(ingress_id) else {
@@ -1249,7 +1360,6 @@ fn load_events(data_dir: &str) -> Result<LoadResult, String> {
                     entry.events.push(EventEntry {
                         summary: summary.clone(),
                         detail: detail.clone(),
-                        detail_lines,
                     });
                     entry.last_ts_ms = env.ts_ms;
                 }
@@ -1302,11 +1412,9 @@ fn ingest_user_event(
     }
     let summary = summarize_user_message(env.ts_ms, label, message);
     let detail = detail_event(env);
-    let detail_lines = detail.lines().count();
     entry.events.push(EventEntry {
         summary,
         detail,
-        detail_lines,
     });
     entry.last_ts_ms = env.ts_ms;
 }

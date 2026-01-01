@@ -10,9 +10,15 @@ fn main() {
     println!("cargo:rerun-if-changed={}", res_dir.display());
 
     let mut files = Vec::new();
+    let mut dirs = Vec::new();
     if res_dir.exists() {
-        collect_files(&res_dir, &mut files);
+        collect_files(&res_dir, &mut files, &mut dirs);
+        dirs.sort();
         files.sort();
+    }
+
+    for dir in dirs {
+        println!("cargo:rerun-if-changed={}", dir.display());
     }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR missing"));
@@ -46,14 +52,15 @@ fn main() {
         .expect("write embedded_resources.rs failed");
 }
 
-fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+fn collect_files(dir: &Path, files: &mut Vec<PathBuf>, dirs: &mut Vec<PathBuf>) {
+    dirs.push(dir.to_path_buf());
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                collect_files(&path, out);
+                collect_files(&path, files, dirs);
             } else if path.is_file() {
-                out.push(path);
+                files.push(path);
             }
         }
     }

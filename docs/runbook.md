@@ -339,6 +339,19 @@ cargo run -p OQQWall_RUST --bin journal_tui -- [data_dir]
 
 常用按键：`q/esc` 退出，`r` 重载，`t` 切换视图，`u` 用户视图，`a` 全量视图，方向键或 `j/k` 移动，`PgUp/PgDn` 翻页，`g/G` 或 `Home/End` 跳转，`Tab` 或 `h/l` 切换焦点（用户视图），`Ctrl+u/d` 滚动详情。鼠标：点击选择/切换，详情面板左键拖拽复制（OSC52），滚轮滚动列表/详情。
 
+OSC52 复制注意事项：
+
+* 终端需要支持 OSC52（Konsole/kitty/WezTerm/iTerm2 等）。
+* tmux 内需要允许剪贴板转发：
+
+```tmux
+set -g set-clipboard on
+set -as terminal-features ',xterm-256color:clipboard'
+set -as terminal-features ',tmux-256color:clipboard'
+```
+
+* Konsole 需在设置中允许 OSC52 写剪贴板。
+
 ### 7.7 渲染失败（PNG）
 
 可能原因：

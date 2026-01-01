@@ -12,9 +12,10 @@ use oqqwall_rust_core::command::{
 };
 use oqqwall_rust_core::draft::{IngressAttachment, IngressMessage, MediaKind, MediaReference};
 use oqqwall_rust_core::event::{
-    DraftEvent, Event, IngressEvent, InputStatusKind, ReviewDecision, ReviewEvent,
+    BlobEvent, DraftEvent, Event, IngressEvent, InputStatusKind, MediaEvent, ReviewDecision,
+    ReviewEvent,
 };
-use oqqwall_rust_core::ids::{IngressId, PostId, ReviewCode, ReviewId};
+use oqqwall_rust_core::ids::{BlobId, IngressId, PostId, ReviewCode, ReviewId};
 use oqqwall_rust_core::{derive_blob_id, Command, IngressCommand, StateView};
 use oqqwall_rust_infra::{LocalJournal, SnapshotStore};
 use std::path::{Path, PathBuf};
@@ -114,6 +115,7 @@ struct NapCatState {
     audit_msg_to_review: HashMap<String, ReviewId>,
     processed_reviews: HashSet<ReviewId>,
     pending: HashMap<String, PendingAction>,
+    blob_paths: HashMap<BlobId, String>,
     next_echo: u64,
 }
 
@@ -188,6 +190,11 @@ fn build_state_from_view(view: &StateView) -> NapCatState {
             Some(ReviewDecision::Approved | ReviewDecision::Rejected | ReviewDecision::Skipped)
         ) {
             state.processed_reviews.insert(*review_id);
+        }
+    }
+    for (blob_id, meta) in &view.blobs {
+        if let Some(path) = meta.persisted_path.as_ref() {
+            state.blob_paths.insert(*blob_id, path.clone());
         }
     }
     state
@@ -492,6 +499,30 @@ async fn build_action_from_event(
             guard.review_by_code.insert(review_code, review_id);
             None
         }
+        Event::Media(MediaEvent::MediaFetchSucceeded {
+            ingress_id,
+            attachment_index,
+            blob_id,
+        }) => {
+            let mut guard = state.lock().await;
+            if let Some(summary) = guard.ingress_summary.get_mut(&ingress_id) {
+                if let Some(attachment) = summary.attachments.get_mut(attachment_index) {
+                    attachment.reference = MediaReference::Blob { blob_id };
+                }
+            }
+            None
+        }
+        Event::Blob(BlobEvent::BlobPersisted { blob_id, path }) => {
+            let mut guard = state.lock().await;
+            guard.blob_paths.insert(blob_id, path.clone());
+            None
+        }
+        Event::Blob(BlobEvent::BlobReleased { blob_id })
+        | Event::Blob(BlobEvent::BlobGcRequested { blob_id }) => {
+            let mut guard = state.lock().await;
+            guard.blob_paths.remove(&blob_id);
+            None
+        }
         Event::Review(ReviewEvent::ReviewItemCreated {
             review_id,
             post_id,
@@ -564,6 +595,7 @@ async fn build_action_from_event(
                 &ingress_ids,
                 &guard.ingress_summary,
                 preview,
+                &guard.blob_paths,
             );
             let echo = next_echo(&mut guard);
             guard.pending.insert(
@@ -1107,11 +1139,9 @@ pub(crate) fn extract_message_lite(value: Option<&Value>) -> (String, Vec<Ingres
                     }
                     "image" | "video" | "file" | "record" => {
                         match segment_type {
-                            "image" => text.push_str("[图片]"),
-                            "video" => text.push_str("[视频]"),
                             "file" => text.push_str("[文件]"),
                             "record" => text.push_str("[语音]"),
-                            _ => {}
+                            "image" | "video" | _ => {}
                         }
                         if let Some(reference) = extract_reference(data) {
                             attachments.push(IngressAttachment {
@@ -1467,6 +1497,7 @@ fn build_audit_message(
     ingress_ids: &[IngressId],
     ingress_map: &HashMap<IngressId, IngressSummary>,
     preview_image: Option<String>,
+    blob_paths: &HashMap<BlobId, String>,
 ) -> AuditMessage {
     let mut images = Vec::new();
     if let Some(preview) = preview_image {
@@ -1497,8 +1528,10 @@ fn build_audit_message(
                 lines.push(line);
             }
             for attachment in &summary.attachments {
-                lines.push(attachment_placeholder(attachment.kind).to_string());
-                if let Some(image) = image_source_from_attachment(attachment) {
+                if attachment.kind != MediaKind::Image {
+                    lines.push(attachment_placeholder(attachment.kind).to_string());
+                }
+                if let Some(image) = image_source_from_attachment(attachment, blob_paths) {
                     images.push(image);
                 }
             }
@@ -1661,13 +1694,27 @@ fn attachment_placeholder(kind: MediaKind) -> &'static str {
     }
 }
 
-fn image_source_from_attachment(attachment: &IngressAttachment) -> Option<String> {
+fn image_source_from_attachment(
+    attachment: &IngressAttachment,
+    blob_paths: &HashMap<BlobId, String>,
+) -> Option<String> {
     if attachment.kind != MediaKind::Image {
         return None;
     }
     match &attachment.reference {
-        MediaReference::RemoteUrl { url } => Some(url.clone()),
-        MediaReference::Blob { .. } => None,
+        MediaReference::Blob { blob_id } => blob_paths
+            .get(blob_id)
+            .map(|path| file_uri_from_path(Path::new(path))),
+        MediaReference::RemoteUrl { url } => {
+            if url.starts_with("file://") || url.starts_with("data:") || url.starts_with("base64://")
+            {
+                return Some(url.clone());
+            }
+            if Path::new(url).exists() {
+                return Some(file_uri_from_path(Path::new(url)));
+            }
+            None
+        }
     }
 }
 
