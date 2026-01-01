@@ -1,6 +1,6 @@
 use crate::draft::IngressMessage;
 use crate::event::Event;
-use crate::ids::{GroupId, ReviewCode, ReviewId, TimestampMs};
+use crate::ids::{AuditMsgId, GroupId, ReviewCode, ReviewId, TimestampMs};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -33,6 +33,7 @@ pub struct TickCommand {
 pub struct ReviewActionCommand {
     pub review_id: Option<ReviewId>,
     pub review_code: Option<ReviewCode>,
+    pub audit_msg_id: Option<AuditMsgId>,
     pub action: ReviewAction,
     pub operator_id: String,
     pub now_ms: TimestampMs,

@@ -235,6 +235,11 @@ fn resolve_review_id(state: &StateView, cmd: &ReviewActionCommand) -> Option<Rev
     if let Some(review_id) = cmd.review_id {
         return Some(review_id);
     }
+    if let Some(audit_msg_id) = cmd.audit_msg_id.as_ref() {
+        if let Some(mapped) = state.review_by_audit_msg.get(audit_msg_id) {
+            return Some(*mapped);
+        }
+    }
     let code = cmd.review_code?;
     state.review_by_code.get(&code).copied()
 }

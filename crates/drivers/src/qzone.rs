@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 #[cfg(debug_assertions)]
 use std::io::{Read, Write};
@@ -15,9 +15,9 @@ use oqqwall_rust_core::draft::{
     Draft, DraftBlock, IngressMessage, MediaKind, MediaReference,
 };
 use oqqwall_rust_core::event::{
-    BlobEvent, DraftEvent, Event, IngressEvent, MediaEvent, RenderEvent, SendEvent,
+    BlobEvent, DraftEvent, Event, IngressEvent, MediaEvent, RenderEvent, ReviewEvent, SendEvent,
 };
-use oqqwall_rust_core::ids::{BlobId, IngressId, PostId, TimestampMs};
+use oqqwall_rust_core::ids::{BlobId, IngressId, PostId, ReviewCode, TimestampMs};
 use oqqwall_rust_core::{build_draft_from_messages, derive_blob_id, Command};
 use reqwest::Client;
 #[cfg(debug_assertions)]
@@ -104,6 +104,12 @@ impl QzoneError {
     }
 }
 
+#[derive(Debug, Clone)]
+struct IngressAuthor {
+    user_id: String,
+    sender_name: Option<String>,
+}
+
 #[derive(Default)]
 struct QzoneState {
     drafts: HashMap<PostId, Draft>,
@@ -111,7 +117,9 @@ struct QzoneState {
     cookie_cache: Option<CookieCache>,
     blob_paths: HashMap<BlobId, String>,
     ingress_messages: HashMap<IngressId, IngressMessage>,
+    ingress_authors: HashMap<IngressId, IngressAuthor>,
     post_ingress: HashMap<PostId, Vec<IngressId>>,
+    review_codes: HashMap<PostId, ReviewCode>,
     render_blobs: HashMap<PostId, RenderBlobs>,
 }
 
@@ -186,14 +194,26 @@ pub fn spawn_qzone_sender(
 
             match env.event {
                 Event::Ingress(IngressEvent::MessageAccepted {
-                    ingress_id, message, ..
+                    ingress_id,
+                    user_id,
+                    sender_name,
+                    message,
+                    ..
                 }) => {
                     let mut guard = state.lock().await;
                     guard.ingress_messages.insert(ingress_id, message);
+                    guard.ingress_authors.insert(
+                        ingress_id,
+                        IngressAuthor {
+                            user_id,
+                            sender_name,
+                        },
+                    );
                 }
                 Event::Ingress(IngressEvent::MessageIgnored { ingress_id, .. }) => {
                     let mut guard = state.lock().await;
                     guard.ingress_messages.remove(&ingress_id);
+                    guard.ingress_authors.remove(&ingress_id);
                 }
                 Event::Media(MediaEvent::MediaFetchSucceeded {
                     ingress_id,
@@ -217,6 +237,14 @@ pub fn spawn_qzone_sender(
                     let mut guard = state.lock().await;
                     guard.drafts.insert(post_id, draft);
                     guard.post_ingress.insert(post_id, ingress_ids);
+                }
+                Event::Review(ReviewEvent::ReviewItemCreated {
+                    post_id,
+                    review_code,
+                    ..
+                }) => {
+                    let mut guard = state.lock().await;
+                    guard.review_codes.insert(post_id, review_code);
                 }
                 Event::Blob(BlobEvent::BlobPersisted { blob_id, path }) => {
                     let mut guard = state.lock().await;
@@ -251,6 +279,21 @@ pub fn spawn_qzone_sender(
                         account_id,
                         started_at_ms
                     );
+                    let (draft, blob_paths, preview_blobs, publish_text) = {
+                        let guard = state.lock().await;
+                        let publish_text = build_publish_text(
+                            post_id,
+                            guard.review_codes.get(&post_id).copied(),
+                            guard.post_ingress.get(&post_id),
+                            &guard.ingress_authors,
+                        );
+                        (
+                            resolve_draft_for_send(&guard, post_id),
+                            guard.blob_paths.clone(),
+                            render_preview_blobs(&guard, post_id),
+                            publish_text,
+                        )
+                    };
                     #[cfg(debug_assertions)]
                     if runtime.use_virt_qzone {
                         let Some(emu_state) = emu_state.as_ref() else {
@@ -268,15 +311,7 @@ pub fn spawn_qzone_sender(
                             let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
                             continue;
                         };
-                        let (draft, blob_paths, preview_blobs) = {
-                            let guard = state.lock().await;
-                            (
-                                resolve_draft_for_send(&guard, post_id),
-                                guard.blob_paths.clone(),
-                                render_preview_blobs(&guard, post_id),
-                            )
-                        };
-                        let Some(draft) = draft else {
+                        let Some(draft) = draft.as_ref() else {
                             debug_log!("emuqzone send failed: missing draft post_id={}", post_id.0);
                             let err = QzoneError::unknown("missing draft");
                             let retry_at = started_at_ms
@@ -309,7 +344,7 @@ pub fn spawn_qzone_sender(
                             let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
                             continue;
                         }
-                        let content = draft_to_text(&draft);
+                        let content = publish_text.clone();
                         let images =
                             match collect_emuqzone_images(&draft, &blob_paths, &preview_blobs) {
                             Ok(images) => images,
@@ -419,15 +454,7 @@ pub fn spawn_qzone_sender(
                             continue;
                         }
                     };
-                    let (draft, blob_paths, preview_blobs) = {
-                        let guard = state.lock().await;
-                        (
-                            resolve_draft_for_send(&guard, post_id),
-                            guard.blob_paths.clone(),
-                            render_preview_blobs(&guard, post_id),
-                        )
-                    };
-                    let Some(draft) = draft else {
+                    let Some(draft) = draft.as_ref() else {
                         debug_log!("qzone send failed: missing draft post_id={}", post_id.0);
                         let err = QzoneError::unknown("missing draft");
                         let retry_at = started_at_ms
@@ -461,7 +488,7 @@ pub fn spawn_qzone_sender(
                         continue;
                     }
 
-                    let content = draft_to_text(&draft);
+                    let content = publish_text;
                     let images =
                         match collect_images(&draft, &blob_paths, &preview_blobs).await
                         {
@@ -733,30 +760,49 @@ impl QzoneClient {
 
 }
 
-fn draft_to_text(draft: &Draft) -> String {
-    let mut parts = Vec::new();
-    for block in &draft.blocks {
-        match block {
-            DraftBlock::Paragraph { text } => {
-                if !text.trim().is_empty() {
-                    parts.push(text.trim().to_string());
-                }
+fn build_publish_text(
+    post_id: PostId,
+    review_code: Option<ReviewCode>,
+    ingress_ids: Option<&Vec<IngressId>>,
+    ingress_authors: &HashMap<IngressId, IngressAuthor>,
+) -> String {
+    let code = review_code
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| post_id.0.to_string());
+    let mut text = format!("#{}", code);
+
+    let mut mentions = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(ingress_ids) = ingress_ids {
+        for ingress_id in ingress_ids {
+            let Some(author) = ingress_authors.get(ingress_id) else {
+                continue;
+            };
+            if !should_mention(author) {
+                continue;
             }
-            DraftBlock::Attachment { kind, .. } => {
-                let label = match kind {
-                    MediaKind::Image => None,
-                    MediaKind::Video => Some("[视频]"),
-                    MediaKind::File => Some("[文件]"),
-                    MediaKind::Audio => Some("[语音]"),
-                    MediaKind::Other => Some("[附件]"),
-                };
-                if let Some(label) = label {
-                    parts.push(label.to_string());
-                }
+            let user_id = author.user_id.trim();
+            if seen.insert(user_id.to_string()) {
+                mentions.push(format!("@{{uin:{},nick:,who:1}}", user_id));
             }
         }
     }
-    parts.join("\n\n")
+    if !mentions.is_empty() {
+        text.push(' ');
+        text.push_str(&mentions.join(", "));
+    }
+
+    text
+}
+
+fn should_mention(author: &IngressAuthor) -> bool {
+    let user_id = author.user_id.trim();
+    if user_id.is_empty() || user_id == "unknown" || user_id == "0" {
+        return false;
+    }
+    // Missing sender_name is treated as anonymous, so skip @.
+    let sender_name = author.sender_name.as_deref().unwrap_or("").trim();
+    !sender_name.is_empty()
 }
 
 fn resolve_draft_for_send(state: &QzoneState, post_id: PostId) -> Option<Draft> {

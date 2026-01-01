@@ -621,16 +621,11 @@ async fn parse_inbound_event(
             }
             return None;
         }
-        return Some(Command::Ingress(IngressCommand {
-            profile_id: self_id,
-            chat_id: chat_group_id.clone(),
-            user_id,
-            sender_name: sender_name.clone(),
-            group_id: runtime.group_id.clone(),
-            platform_msg_id: message_id,
-            message: IngressMessage { text, attachments },
-            received_at_ms: timestamp_ms,
-        }));
+        debug_log!(
+            "napcat inbound ignored group message for ingress: group_id={}",
+            chat_group_id
+        );
+        return None;
     }
 
     if message_type == "private" {
@@ -1068,8 +1063,9 @@ async fn parse_review_command(
 ) -> Option<Command> {
     let mut review_code = review_code;
     let mut review_id = None;
+    let mut audit_msg_id = reply_id.clone();
 
-    if let Some(reply_id) = reply_id {
+    if let Some(reply_id) = reply_id.as_ref() {
         let guard = state.lock().await;
         if let Some(mapped) = guard.audit_msg_to_review.get(&reply_id) {
             review_id = Some(*mapped);
@@ -1083,14 +1079,12 @@ async fn parse_review_command(
             if let Some(mapped) = guard.review_by_code.get(&code).copied() {
                 review_id = Some(mapped);
                 review_code = None;
-            } else {
-                send_group_text(out_tx, group_id, "找不到稿件").await;
-                return None;
+                audit_msg_id = None;
             }
         }
     }
 
-    if review_id.is_none() && review_code.is_none() {
+    if review_id.is_none() && audit_msg_id.is_none() && review_code.is_none() {
         send_group_text(out_tx, group_id, "请回复审核消息或提供编号").await;
         return None;
     }
@@ -1100,6 +1094,7 @@ async fn parse_review_command(
     Some(Command::ReviewAction(ReviewActionCommand {
         review_id,
         review_code,
+        audit_msg_id,
         action,
         operator_id: user_id.to_string(),
         now_ms,
