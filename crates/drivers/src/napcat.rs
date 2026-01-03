@@ -252,7 +252,12 @@ fn build_state_from_view(view: &StateView) -> NapCatState {
         }
         if matches!(
             review.decision,
-            Some(ReviewDecision::Approved | ReviewDecision::Rejected | ReviewDecision::Skipped)
+            Some(
+                ReviewDecision::Approved
+                    | ReviewDecision::Rejected
+                    | ReviewDecision::Skipped
+                    | ReviewDecision::Deleted
+            )
         ) {
             state.processed_reviews.insert(*review_id);
         }
@@ -695,7 +700,8 @@ async fn build_action_from_event(
                 match decision {
                     ReviewDecision::Approved
                     | ReviewDecision::Rejected
-                    | ReviewDecision::Skipped => {
+                    | ReviewDecision::Skipped
+                    | ReviewDecision::Deleted => {
                         guard.processed_reviews.insert(review_id);
                     }
                     ReviewDecision::Deferred => {
@@ -831,7 +837,7 @@ async fn build_action_from_event(
             let Some(audit_group_id) = audit_group_id else {
                 return None;
             };
-            let text = format!("{}（用于发送的账号{}）已发送", label, account_id);
+            let text = format!("{}已发送", account_id);
             let payload = serde_json::json!({
                 "action": "send_group_msg",
                 "params": {
@@ -1735,6 +1741,52 @@ fn normalize_face_id(raw: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
+async fn fetch_review_code_from_reply(
+    runtime: &NapCatRuntimeConfig,
+    reply_id: &str,
+) -> Option<ReviewCode> {
+    let api_base = napcat_http_base(&runtime.napcat.ws_url)?;
+    let client = Client::builder().timeout(Duration::from_secs(6)).build().ok()?;
+    let url = format!("{}/get_msg", api_base);
+    let mut req = client.post(url).json(&json!({ "message_id": reply_id }));
+    if let Some(token) = runtime.napcat.access_token.as_ref() {
+        req = req.header("Authorization", format!("Bearer {}", token));
+    }
+    let resp = req.send().await.ok()?;
+    let status = resp.status();
+    let body: Value = resp.json().await.ok()?;
+    if !status.is_success() {
+        debug_log!(
+            "napcat get_msg failed: message_id={} status={} body={}",
+            reply_id,
+            status,
+            body
+        );
+        return None;
+    }
+    if body.get("status").and_then(|v| v.as_str()) != Some("ok") {
+        debug_log!(
+            "napcat get_msg status not ok: message_id={} status={:?} body={}",
+            reply_id,
+            body.get("status"),
+            body
+        );
+        return None;
+    }
+    let data = body.get("data")?;
+    let message_value = data.get("message").or_else(|| data.get("raw_message"));
+    let extracted = extract_message_lite(message_value);
+    let review_code = parse_review_code(&extracted.text);
+    if review_code.is_none() {
+        debug_log!(
+            "napcat get_msg missing review code: message_id={} text_len={}",
+            reply_id,
+            extracted.text.len()
+        );
+    }
+    review_code
+}
+
 async fn parse_review_command(
     runtime: &NapCatRuntimeConfig,
     state: &Arc<Mutex<NapCatState>>,
@@ -1750,6 +1802,7 @@ async fn parse_review_command(
     let mut review_id = None;
     let mut audit_msg_id = reply_id.clone();
     let mut is_processed = false;
+    let mut reply_missing = false;
 
     {
         let guard = state.lock().await;
@@ -1757,6 +1810,8 @@ async fn parse_review_command(
             if let Some(mapped) = guard.audit_msg_to_review.get(reply_id.as_str()) {
                 review_id = Some(*mapped);
                 review_code = None;
+            } else {
+                reply_missing = true;
             }
         }
 
@@ -1770,14 +1825,45 @@ async fn parse_review_command(
             }
         }
 
-        if let Some(resolved_id) = review_id {
-            is_processed = guard.processed_reviews.contains(&resolved_id);
+    }
+
+    if review_id.is_none() && review_code.is_none() && reply_missing {
+        if let Some(reply_id) = reply_id.as_ref() {
+            if let Some(code) = fetch_review_code_from_reply(runtime, reply_id).await {
+                review_code = Some(code);
+                audit_msg_id = None;
+                reply_missing = false;
+            }
         }
+    }
+
+    if review_id.is_none() {
+        if let Some(code) = review_code {
+            let mapped = {
+                let guard = state.lock().await;
+                guard.review_by_code.get(&code).copied()
+            };
+            if let Some(mapped) = mapped {
+                review_id = Some(mapped);
+                review_code = None;
+                audit_msg_id = None;
+            }
+        }
+    }
+
+    if reply_missing && review_id.is_none() && review_code.is_none() {
+        send_group_text(out_tx, group_id, "找不到回复的消息").await;
+        return None;
     }
 
     if review_id.is_none() && audit_msg_id.is_none() && review_code.is_none() {
         send_group_text(out_tx, group_id, "请回复审核消息或提供编号").await;
         return None;
+    }
+
+    if let Some(resolved_id) = review_id {
+        let guard = state.lock().await;
+        is_processed = guard.processed_reviews.contains(&resolved_id);
     }
 
     if is_processed {
@@ -1852,7 +1938,8 @@ fn parse_review_action(command: &str, rest: &str, allow_quick_reply: bool) -> Op
         "是" => ReviewAction::Approve,
         "否" => ReviewAction::Skip,
         "等" => ReviewAction::Defer { delay_ms: 180_000 },
-        "删" | "拒" => ReviewAction::Reject,
+        "删" => ReviewAction::Delete,
+        "拒" => ReviewAction::Reject,
         "立即" => ReviewAction::Immediate,
         "刷新" => ReviewAction::Refresh,
         "重渲染" => ReviewAction::Rerender,
@@ -1948,7 +2035,9 @@ fn parse_quick_reply_action(rest: &str) -> Option<GlobalAction> {
 }
 
 fn parse_review_code(text: &str) -> Option<ReviewCode> {
-    text.split_whitespace().next()?.parse::<ReviewCode>().ok()
+    let token = text.split_whitespace().next()?;
+    let trimmed = token.strip_prefix('#').unwrap_or(token);
+    trimmed.parse::<ReviewCode>().ok()
 }
 
 fn parse_first_token(text: &str) -> Option<String> {
@@ -2607,6 +2696,20 @@ mod tests {
             })
         );
         assert_eq!(
+            parse_audit_command("123 删", false),
+            Some(AuditCommand::Review {
+                review_code: Some(123),
+                action: ReviewAction::Delete,
+            })
+        );
+        assert_eq!(
+            parse_audit_command("123 拒", false),
+            Some(AuditCommand::Review {
+                review_code: Some(123),
+                action: ReviewAction::Reject,
+            })
+        );
+        assert_eq!(
             parse_audit_command("123 合并 456", false),
             Some(AuditCommand::Review {
                 review_code: Some(123),
@@ -2619,6 +2722,10 @@ mod tests {
     fn parse_global_and_quick_reply_actions() {
         assert_eq!(
             parse_audit_command("调出 42", false),
+            Some(AuditCommand::Global(GlobalAction::Recall { review_code: 42 }))
+        );
+        assert_eq!(
+            parse_audit_command("调出 #42", false),
             Some(AuditCommand::Global(GlobalAction::Recall { review_code: 42 }))
         );
         assert_eq!(

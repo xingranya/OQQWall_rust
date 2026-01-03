@@ -44,6 +44,18 @@ pub fn decide_review_action(
             }
             events
         }
+        ReviewAction::Delete => {
+            let mut events = vec![Event::Review(ReviewEvent::ReviewDecisionRecorded {
+                review_id,
+                decision: ReviewDecision::Deleted,
+                decided_by: cmd.operator_id.clone(),
+                decided_at_ms: cmd.now_ms,
+            })];
+            if state.send_plans.contains_key(&post_id) {
+                events.push(Event::Schedule(ScheduleEvent::SendPlanCanceled { post_id }));
+            }
+            events
+        }
         ReviewAction::Defer { delay_ms } => vec![
             Event::Review(ReviewEvent::ReviewDecisionRecorded {
                 review_id,

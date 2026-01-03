@@ -48,6 +48,7 @@ macro_rules! debug_log {
 const EMOTION_PUBLISH_URL: &str =
     "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_publish_v6";
 const UPLOAD_IMAGE_URL: &str = "https://up.qzone.qq.com/cgi-bin/upload/cgi_upload_image";
+const CHROME_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.1.3702.40 Safari/537.36 QBWebViewUA/2 QBWebViewType/1 WKType/1";
 #[cfg(debug_assertions)]
 const EMUQZONE_PORT: u16 = 18080;
 #[cfg(debug_assertions)]
@@ -559,6 +560,7 @@ pub fn spawn_qzone_sender(
                             );
                             let retry_at = started_at_ms
                                 .saturating_add(retry_delay_ms(err.kind, 1));
+                            refresh_cookie_cache(&state, napcat).await;
                             let event = SendEvent::SendFailed {
                                 post_id,
                                 account_id,
@@ -580,6 +582,7 @@ pub fn spawn_qzone_sender(
                             );
                             let retry_at = started_at_ms
                                 .saturating_add(retry_delay_ms(err.kind, 1));
+                            refresh_cookie_cache(&state, napcat).await;
                             let event = SendEvent::SendFailed {
                                 post_id,
                                 account_id,
@@ -596,6 +599,7 @@ pub fn spawn_qzone_sender(
                         let err = QzoneError::unknown("missing draft");
                         let retry_at = started_at_ms
                             .saturating_add(retry_delay_ms(err.kind, 1));
+                        refresh_cookie_cache(&state, napcat).await;
                         let event = SendEvent::SendFailed {
                             post_id,
                             account_id,
@@ -614,6 +618,7 @@ pub fn spawn_qzone_sender(
                         let err = QzoneError::unknown("missing render preview");
                         let retry_at =
                             started_at_ms.saturating_add(retry_delay_ms(err.kind, 1));
+                        refresh_cookie_cache(&state, napcat).await;
                         let event = SendEvent::SendFailed {
                             post_id,
                             account_id,
@@ -638,6 +643,7 @@ pub fn spawn_qzone_sender(
                             );
                             let retry_at = started_at_ms
                                 .saturating_add(retry_delay_ms(err.kind, 1));
+                            refresh_cookie_cache(&state, napcat).await;
                             let event = SendEvent::SendFailed {
                                 post_id,
                                 account_id,
@@ -690,6 +696,7 @@ pub fn spawn_qzone_sender(
                             );
                             let retry_at = started_at_ms
                                 .saturating_add(retry_delay_ms(err.kind, attempt));
+                            refresh_cookie_cache(&state, napcat).await;
                             let event = SendEvent::SendFailed {
                                 post_id,
                                 account_id,
@@ -730,6 +737,7 @@ impl QzoneClient {
             .unwrap_or(0);
         debug_log!("qzone client init: uin={}", uin);
         let client = Client::builder()
+            .user_agent(CHROME_USER_AGENT)
             .timeout(Duration::from_secs(20))
             .build()
             .map_err(|err| QzoneError::network(format!("reqwest init failed: {}", err)))?;
@@ -763,7 +771,9 @@ impl QzoneClient {
         form.insert("to_sign", "0".to_string());
         form.insert("hostuin", self.uin.to_string());
         form.insert("code_version", "1".to_string());
-        form.insert("format", "json".to_string());
+        form.insert("format", "fs".to_string());
+        form.insert("pic_template", "".to_string());
+        form.insert("special_url", "".to_string());
         form.insert(
             "qzreferrer",
             format!("https://user.qzone.qq.com/{}", self.uin),
@@ -772,21 +782,42 @@ impl QzoneClient {
         if !images.is_empty() {
             let mut pic_bos = Vec::new();
             let mut richvals = Vec::new();
+            form.insert("subrichtype", "1".to_string());
             for image in images {
                 let upload = self.upload_image(image).await?;
                 let (picbo, richval) = get_picbo_and_richval(&upload)?;
                 pic_bos.push(picbo);
                 richvals.push(richval);
             }
-            form.insert("pic_bo", pic_bos.join(","));
+            form.insert("pic_bo", pic_bos.join("\t"));
             form.insert("richtype", "1".to_string());
             form.insert("richval", richvals.join("\t"));
+        }
+
+        debug_log!("qzone publish g_tk={}", self.gtk);
+        if let Some(format) = form.get("format") {
+            debug_log!("qzone publish form format={}", format);
+        }
+        if let Some(pic_bo) = form.get("pic_bo") {
+            debug_log!("qzone publish form pic_bo={}", pic_bo);
+        }
+        if let Some(richval) = form.get("richval") {
+            debug_log!(
+                "qzone publish form richval={}",
+                richval.replace('\t', "\\t")
+            );
         }
 
         let res = self
             .client
             .post(EMOTION_PUBLISH_URL)
-            .query(&[("g_tk", &self.gtk), ("uin", &self.uin.to_string())])
+            .query(&[("g_tk", &self.gtk)])
+            .header("user-agent", CHROME_USER_AGENT)
+            .header("accept", "*/*")
+            .header(
+                "content-type",
+                "application/x-www-form-urlencoded;charset=UTF-8",
+            )
             .header("referer", format!("https://user.qzone.qq.com/{}", self.uin))
             .header("origin", "https://user.qzone.qq.com")
             .header("cookie", cookie_header)
@@ -795,16 +826,51 @@ impl QzoneClient {
             .await
             .map_err(|err| classify_reqwest_error("publish request", err))?;
 
-        if !res.status().is_success() {
-            return Err(classify_http_status("publish http status", res.status().as_u16()));
+        let status = res.status();
+        let headers = res.headers().clone();
+        let body = match res.text().await {
+            Ok(text) => text,
+            Err(err) => {
+                if !status.is_success() {
+                    let fallback = format!("<read body failed: {}>", err);
+                    debug_log_http_failure("qzone publish", status, &headers, &fallback);
+                    return Err(classify_http_status_with_body(
+                        "publish http status",
+                        status.as_u16(),
+                        &fallback,
+                    ));
+                }
+                return Err(classify_reqwest_error("publish read body", err));
+            }
+        };
+        if !status.is_success() {
+            debug_log_http_failure("qzone publish", status, &headers, &body);
+            return Err(classify_http_status_with_body(
+                "publish http status",
+                status.as_u16(),
+                &body,
+            ));
         }
-
-        let body = res
-            .text()
-            .await
-            .map_err(|err| classify_reqwest_error("publish read body", err))?;
-        let json: Value = serde_json::from_str(&body)
-            .map_err(|err| QzoneError::unknown(format!("invalid response json: {}", err)))?;
+        let json = match parse_proxy_callback_json(&body) {
+            Some(json) => json,
+            None => {
+                let trimmed = body.trim();
+                if trimmed.is_empty() {
+                    debug_log!("qzone publish response empty; treating as success");
+                    return Ok("unknown".to_string());
+                }
+                let sample: String = trimmed.chars().take(200).collect();
+                debug_log!(
+                    "qzone publish response unparseable: len={} head={}",
+                    trimmed.len(),
+                    sample
+                );
+                return Err(QzoneError::unknown("invalid publish response body"));
+            }
+        };
+        if let Ok(pretty) = serde_json::to_string_pretty(&json) {
+            debug_log!("qzone publish response json:\n{}", pretty);
+        }
         if let Some(err) = classify_response_error(&json) {
             return Err(err.with_context("publish response"));
         }
@@ -842,7 +908,7 @@ impl QzoneClient {
         form.insert("p_uin", self.uin.to_string());
         form.insert("uin", self.uin.to_string());
         form.insert("p_skey", p_skey);
-        form.insert("output_type", "json".to_string());
+        form.insert("output_type", "jsonhtml".to_string());
         form.insert("qzonetoken", "".to_string());
         form.insert("refer", "shuoshuo".to_string());
         form.insert("charset", "utf-8".to_string());
@@ -865,6 +931,13 @@ impl QzoneClient {
         let res = self
             .client
             .post(UPLOAD_IMAGE_URL)
+            .query(&[("g_tk", &self.gtk)])
+            .header("user-agent", CHROME_USER_AGENT)
+            .header("accept", "*/*")
+            .header(
+                "content-type",
+                "application/x-www-form-urlencoded;charset=UTF-8",
+            )
             .header("referer", format!("https://user.qzone.qq.com/{}", self.uin))
             .header("origin", "https://user.qzone.qq.com")
             .header("cookie", cookie_header)
@@ -873,13 +946,31 @@ impl QzoneClient {
             .await
             .map_err(|err| classify_reqwest_error("upload image request", err))?;
 
-        if !res.status().is_success() {
-            return Err(classify_http_status("upload image http status", res.status().as_u16()));
+        let status = res.status();
+        let headers = res.headers().clone();
+        let body = match res.text().await {
+            Ok(text) => text,
+            Err(err) => {
+                if !status.is_success() {
+                    let fallback = format!("<read body failed: {}>", err);
+                    debug_log_http_failure("qzone upload image", status, &headers, &fallback);
+                    return Err(classify_http_status_with_body(
+                        "upload image http status",
+                        status.as_u16(),
+                        &fallback,
+                    ));
+                }
+                return Err(classify_reqwest_error("upload image read body", err));
+            }
+        };
+        if !status.is_success() {
+            debug_log_http_failure("qzone upload image", status, &headers, &body);
+            return Err(classify_http_status_with_body(
+                "upload image http status",
+                status.as_u16(),
+                &body,
+            ));
         }
-        let body = res
-            .text()
-            .await
-            .map_err(|err| classify_reqwest_error("upload image read body", err))?;
         let start =
             body.find('{')
                 .ok_or_else(|| QzoneError::unknown("invalid upload response"))?;
@@ -889,6 +980,9 @@ impl QzoneClient {
         let json_str = &body[start..=end];
         let json: Value = serde_json::from_str(json_str)
             .map_err(|err| QzoneError::unknown(format!("invalid upload json: {}", err)))?;
+        if let Ok(pretty) = serde_json::to_string_pretty(&json) {
+            debug_log!("qzone upload response json:\n{}", pretty);
+        }
         if let Some(err) = classify_response_error(&json) {
             return Err(err.with_context("upload response"));
         }
@@ -1440,9 +1534,9 @@ fn build_cookie_header(cookies: &HashMap<String, String>) -> String {
 }
 
 fn generate_gtk(skey: &str) -> String {
-    let mut hash_val: i64 = 5381;
-    for ch in skey.chars() {
-        hash_val = hash_val.saturating_add((hash_val << 5).saturating_add(ch as i64));
+    let mut hash_val: u32 = 5381;
+    for &byte in skey.as_bytes() {
+        hash_val = hash_val.wrapping_add((hash_val << 5).wrapping_add(byte as u32));
     }
     (hash_val & 0x7fffffff).to_string()
 }
@@ -1482,6 +1576,29 @@ async fn get_cookies(
         fetched_at_ms: now,
     });
     Ok(cookies)
+}
+
+async fn refresh_cookie_cache(state: &Arc<Mutex<QzoneState>>, napcat: &NapCatConfig) {
+    match fetch_cookies_ws(napcat).await {
+        Ok(cookies) => {
+            let now = now_ms();
+            let mut guard = state.lock().await;
+            guard.cookie_cache = Some(CookieCache {
+                cookies,
+                fetched_at_ms: now,
+            });
+            debug_log!("qzone cookies refreshed after send failure");
+        }
+        Err(err) => {
+            let mut guard = state.lock().await;
+            guard.cookie_cache = None;
+            debug_log!(
+                "qzone cookies refresh failed: kind={:?} message={}",
+                err.kind,
+                err.message
+            );
+        }
+    }
 }
 
 async fn fetch_cookies_ws(napcat: &NapCatConfig) -> Result<HashMap<String, String>, QzoneError> {
@@ -1589,6 +1706,133 @@ fn classify_http_status(context: &str, status: u16) -> QzoneError {
     QzoneError::new(kind, format!("{}: http {}", context, status))
 }
 
+fn classify_http_status_with_body(context: &str, status: u16, body: &str) -> QzoneError {
+    let mut err = classify_http_status(context, status);
+    let body = if body.trim().is_empty() { "<empty>" } else { body };
+    err.message = format!("{}; body={}", err.message, body);
+    err
+}
+
+fn debug_log_http_failure(
+    context: &str,
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    body: &str,
+) {
+    let mut header_lines = Vec::new();
+    for (key, value) in headers.iter() {
+        let value = value.to_str().unwrap_or("<non-utf8>");
+        header_lines.push(format!("{}: {}", key.as_str(), value));
+    }
+    let header_block = if header_lines.is_empty() {
+        "<empty>".to_string()
+    } else {
+        header_lines.join("\n")
+    };
+    debug_log!(
+        "{} non-200: status={} reason={}\nheaders:\n{}\nbody:\n{}",
+        context,
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("<none>"),
+        header_block,
+        body
+    );
+    if let Ok(json) = serde_json::from_str::<Value>(body) {
+        if let Ok(pretty) = serde_json::to_string_pretty(&json) {
+            debug_log!("{} non-200 json:\n{}", context, pretty);
+        }
+    }
+}
+
+fn parse_proxy_callback_json(body: &str) -> Option<Value> {
+    if let Ok(json) = serde_json::from_str::<Value>(body) {
+        return Some(json);
+    }
+    let trimmed = body.trim();
+    if let Some(json) = extract_json_after_marker(trimmed, "frameElement.callback") {
+        return Some(json);
+    }
+    if let Some(json) = extract_json_after_marker(trimmed, "cb(") {
+        return Some(json);
+    }
+    if let Some(json) = extract_json_by_key(trimmed, "\"ret\"") {
+        return Some(json);
+    }
+    let start = trimmed.find('{')?;
+    extract_balanced_json(trimmed, start)
+        .and_then(|slice| serde_json::from_str::<Value>(slice).ok())
+}
+
+fn extract_json_after_marker(body: &str, marker: &str) -> Option<Value> {
+    let mut offset = 0;
+    while let Some(pos) = body[offset..].find(marker) {
+        let pos = offset + pos;
+        let after = &body[pos + marker.len()..];
+        if let Some(open) = after.find('{') {
+            let start = pos + marker.len() + open;
+            if let Some(slice) = extract_balanced_json(body, start) {
+                if let Ok(json) = serde_json::from_str::<Value>(slice) {
+                    return Some(json);
+                }
+            }
+        }
+        offset = pos + marker.len();
+    }
+    None
+}
+
+fn extract_json_by_key(body: &str, key: &str) -> Option<Value> {
+    for (pos, _) in body.match_indices(key) {
+        let start = body[..pos].rfind('{')?;
+        if let Some(slice) = extract_balanced_json(body, start) {
+            if let Ok(json) = serde_json::from_str::<Value>(slice) {
+                return Some(json);
+            }
+        }
+    }
+    None
+}
+
+fn extract_balanced_json(body: &str, start: usize) -> Option<&str> {
+    if !body.is_char_boundary(start) {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escape = false;
+    for (idx, ch) in body[start..].char_indices() {
+        let abs = start + idx;
+        if in_string {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => {
+                depth += 1;
+            }
+            '}' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    let end = abs + ch.len_utf8();
+                    return Some(&body[start..end]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn classify_response_error(json: &Value) -> Option<QzoneError> {
     let ret = json.get("ret").and_then(|v| v.as_i64());
     if let Some(ret) = ret {
@@ -1670,11 +1914,17 @@ fn get_picbo_and_richval(upload: &Value) -> Result<(String, String), QzoneError>
         .get("url")
         .and_then(|v| v.as_str())
         .ok_or_else(|| QzoneError::unknown("upload response missing url"))?;
-    let picbo = url
-        .split("&bo=")
-        .nth(1)
-        .ok_or_else(|| QzoneError::unknown("upload response missing picbo"))?
-        .to_string();
+    let url_bo =
+        extract_bo(url).ok_or_else(|| QzoneError::unknown("upload response missing picbo"))?;
+    let pre_bo = data
+        .get("pre")
+        .and_then(|v| v.as_str())
+        .and_then(extract_bo);
+    let picbo = if let Some(pre_bo) = pre_bo {
+        format!("{}\t{}", pre_bo, url_bo)
+    } else {
+        format!("{}\t{}", url_bo, url_bo)
+    };
 
     let albumid = field_to_string(data, "albumid")?;
     let lloc = field_to_string(data, "lloc")?;
@@ -1688,6 +1938,17 @@ fn get_picbo_and_richval(upload: &Value) -> Result<(String, String), QzoneError>
         albumid, lloc, sloc, kind, height, width, height, width
     );
     Ok((picbo, richval))
+}
+
+fn extract_bo(value: &str) -> Option<String> {
+    let marker = "bo=";
+    let start = value.find(marker)? + marker.len();
+    let rest = &value[start..];
+    let end = rest.find('&').unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    Some(rest[..end].to_string())
 }
 
 fn field_to_string(data: &Value, key: &str) -> Result<String, QzoneError> {

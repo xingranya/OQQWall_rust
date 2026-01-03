@@ -80,7 +80,7 @@ pub fn decide_global_action(
                 }
                 events.push(Event::Review(ReviewEvent::ReviewDecisionRecorded {
                     review_id: *review_id,
-                    decision: ReviewDecision::Rejected,
+                    decision: ReviewDecision::Deleted,
                     decided_by: cmd.operator_id.clone(),
                     decided_at_ms: cmd.now_ms,
                 }));

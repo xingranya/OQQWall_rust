@@ -44,6 +44,7 @@ pub struct ReviewActionCommand {
 pub enum ReviewAction {
     Approve,
     Reject,
+    Delete,
     Defer { delay_ms: TimestampMs },
     Skip,
     Immediate,

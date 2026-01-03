@@ -252,6 +252,7 @@ pub enum ReviewDecision {
     Rejected,
     Deferred,
     Skipped,
+    Deleted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
