@@ -54,6 +54,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         prompt_optional("本组 NapCat access_token（留空则运行时用环境变量）")?;
     let process_waittime_sec = prompt_u64("聚合窗口秒数（process_waittime_sec）", 20)?;
     let tz_offset_minutes = prompt_i64("时区偏移分钟数（中国大陆=480）", 480)?;
+    let max_cache_mb = prompt_u64("内存图片缓存上限 MB（max_cache_mb）", 256)?;
 
     let max_post_stack = prompt_u64("最大暂存条数（max_post_stack）", 1)?;
     let max_image_number_one_post = prompt_u64("单条最大图片数（max_image_number_one_post）", 30)?;
@@ -68,6 +69,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
     common.insert(
         "tz_offset_minutes".to_string(),
         Value::Number(tz_offset_minutes.into()),
+    );
+    common.insert(
+        "max_cache_mb".to_string(),
+        Value::Number(max_cache_mb.into()),
     );
 
     let mut group = Map::new();

@@ -34,6 +34,7 @@ fn reducer_replay_matches_full_apply() {
             reference: MediaReference::RemoteUrl {
                 url: "http://example.com/img.png".to_string(),
             },
+            size_bytes: None,
         }],
     };
 
@@ -103,6 +104,8 @@ fn reducer_replay_matches_full_apply() {
                 session_id,
                 group_id: "group-a".to_string(),
                 ingress_ids: vec![ingress_id_a, ingress_id_b],
+                is_anonymous: false,
+                is_safe: true,
                 draft: Draft {
                     blocks: vec![DraftBlock::Paragraph {
                         text: "hello".to_string(),

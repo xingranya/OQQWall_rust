@@ -7,7 +7,7 @@ mod status;
 #[cfg(debug_assertions)]
 macro_rules! debug_log {
     ($($arg:tt)*) => {
-        eprintln!($($arg)*);
+        oqqwall_rust_infra::debug_log::log(format_args!($($arg)*));
     };
 }
 

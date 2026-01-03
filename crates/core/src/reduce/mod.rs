@@ -180,6 +180,8 @@ fn reduce_draft(state: &mut StateView, event: &DraftEvent) {
             session_id,
             group_id,
             ingress_ids,
+            is_anonymous,
+            is_safe,
             draft,
             created_at_ms,
         } => {
@@ -192,6 +194,8 @@ fn reduce_draft(state: &mut StateView, event: &DraftEvent) {
                 stage: PostStage::Drafted,
                 review_id: None,
                 created_at_ms: *created_at_ms,
+                is_anonymous: *is_anonymous,
+                is_safe: *is_safe,
                 last_error: None,
             });
             meta.session_id = *session_id;
@@ -199,6 +203,8 @@ fn reduce_draft(state: &mut StateView, event: &DraftEvent) {
             if meta.created_at_ms == 0 {
                 meta.created_at_ms = *created_at_ms;
             }
+            meta.is_anonymous = *is_anonymous;
+            meta.is_safe = *is_safe;
             state.update_post_stage(*post_id, PostStage::Drafted);
         }
     }
@@ -213,7 +219,9 @@ fn reduce_media(state: &mut StateView, event: &MediaEvent) {
         } => {
             state.register_media_reference(*ingress_id, *attachment_index, *blob_id);
         }
-        MediaEvent::MediaFetchFailed { .. } | MediaEvent::MediaFetchRequested { .. } => {}
+        MediaEvent::MediaFetchFailed { .. }
+        | MediaEvent::MediaFetchRequested { .. }
+        | MediaEvent::AvatarFetchRequested { .. } => {}
     }
 }
 
@@ -312,6 +320,17 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
                 meta.needs_republish = true;
             }
         }
+        ReviewEvent::ReviewAnonToggled { review_id } => {
+            let post_id = state.reviews.get(review_id).map(|meta| meta.post_id);
+            if let Some(meta) = state.reviews.get_mut(review_id) {
+                meta.needs_republish = true;
+            }
+            if let Some(post_id) = post_id {
+                if let Some(meta) = state.posts.get_mut(&post_id) {
+                    meta.is_anonymous = !meta.is_anonymous;
+                }
+            }
+        }
         ReviewEvent::ReviewDecisionRecorded {
             review_id,
             decision,
@@ -336,7 +355,6 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
         }
         ReviewEvent::ReviewCommentAdded { .. }
         | ReviewEvent::ReviewReplyRequested { .. }
-        | ReviewEvent::ReviewAnonToggled { .. }
         | ReviewEvent::ReviewExpandRequested { .. }
         | ReviewEvent::ReviewDisplayRequested { .. }
         | ReviewEvent::ReviewBlacklistRequested { .. }

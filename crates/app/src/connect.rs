@@ -1,3 +1,4 @@
+use oqqwall_rust_drivers::blob_cache;
 use oqqwall_rust_drivers::media_fetcher::{spawn_media_fetcher, MediaFetcherRuntimeConfig};
 use oqqwall_rust_drivers::napcat::{spawn_napcat_ws, NapCatRuntimeConfig};
 use oqqwall_rust_drivers::renderer::{spawn_renderer, RendererRuntimeConfig};
@@ -10,7 +11,7 @@ use crate::engine::EngineHandle;
 #[cfg(debug_assertions)]
 macro_rules! debug_log {
     ($($arg:tt)*) => {
-        eprintln!($($arg)*);
+        oqqwall_rust_infra::debug_log::log(format_args!($($arg)*));
     };
 }
 
@@ -20,6 +21,8 @@ macro_rules! debug_log {
 }
 
 pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) {
+    blob_cache::configure_max_cache_mb(config.max_cache_mb);
+    debug_log!("blob cache configured: max_cache_mb={}", config.max_cache_mb);
     debug_log!(
         "spawning drivers: groups={} tz_offset_minutes={}",
         config.groups.len(),

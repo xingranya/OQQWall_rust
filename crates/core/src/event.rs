@@ -125,13 +125,24 @@ pub enum DraftEvent {
         session_id: SessionId,
         group_id: GroupId,
         ingress_ids: Vec<IngressId>,
+        #[serde(default)]
+        is_anonymous: bool,
+        #[serde(default = "default_true")]
+        is_safe: bool,
         draft: Draft,
         created_at_ms: TimestampMs,
     },
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MediaEvent {
+    AvatarFetchRequested {
+        user_id: String,
+    },
     MediaFetchRequested {
         ingress_id: IngressId,
         attachment_index: usize,

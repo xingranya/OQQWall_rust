@@ -26,6 +26,8 @@ fn refresh_republishes_after_render_ready() {
             session_id: Id128(11),
             group_id: "group-a".to_string(),
             ingress_ids: Vec::new(),
+            is_anonymous: false,
+            is_safe: true,
             draft: Draft { blocks: Vec::new() },
             created_at_ms: 1_000,
         }),

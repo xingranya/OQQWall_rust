@@ -50,30 +50,23 @@ impl SnapshotStore {
         };
 
         if data.len() < 8 {
-            return Err(InfraError::InvalidData(
-                "snapshot header truncated".to_string(),
-            ));
+            return Ok(None);
         }
         let len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
         let crc = u32::from_le_bytes(data[4..8].try_into().unwrap());
         if data.len() != 8 + len {
-            return Err(InfraError::InvalidData(
-                "snapshot length mismatch".to_string(),
-            ));
+            return Ok(None);
         }
         let payload = &data[8..];
         if crc32fast::hash(payload) != crc {
-            return Err(InfraError::InvalidData(
-                "snapshot crc mismatch".to_string(),
-            ));
+            return Ok(None);
         }
-        let snapshot: Snapshot =
-            bincode::deserialize(payload).map_err(|err| InfraError::Codec(err.to_string()))?;
+        let snapshot: Snapshot = match bincode::deserialize(payload) {
+            Ok(snapshot) => snapshot,
+            Err(_) => return Ok(None),
+        };
         if snapshot.version != SNAPSHOT_VERSION {
-            return Err(InfraError::InvalidData(format!(
-                "snapshot version {} unsupported",
-                snapshot.version
-            )));
+            return Ok(None);
         }
         Ok(Some(snapshot))
     }

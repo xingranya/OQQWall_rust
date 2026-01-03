@@ -1,3 +1,5 @@
+use crate::anonymous::detect_anonymous;
+use crate::safety::detect_safe;
 use crate::command::TickCommand;
 use crate::config::CoreConfig;
 use crate::decide::builder::build_draft_from_messages;
@@ -12,6 +14,7 @@ use crate::ids::{derive_post_id, TimestampMs};
 use crate::state::{SessionMeta, StateView};
 
 const INPUT_STATUS_ACTIVE_MAX_MS: i64 = 30 * 60 * 1000;
+const SEND_TIMEOUT_RETRY_DELAY_MS: i64 = 30 * 1000;
 
 pub fn decide_tick(state: &StateView, cmd: &TickCommand, config: &CoreConfig) -> Vec<Event> {
     let mut events = Vec::new();
@@ -19,6 +22,7 @@ pub fn decide_tick(state: &StateView, cmd: &TickCommand, config: &CoreConfig) ->
     events.extend(close_due_sessions(state, cmd, config));
     events.extend(trigger_review_delays(state, cmd));
     events.extend(trigger_group_flush(state, cmd, config));
+    events.extend(recover_stuck_sends(state, cmd, config));
     events.extend(maybe_start_send(state, cmd, config));
 
     events
@@ -49,6 +53,8 @@ fn close_due_sessions(state: &StateView, cmd: &TickCommand, config: &CoreConfig)
                 messages.push(message.clone());
             }
         }
+        let is_anonymous = detect_anonymous(&messages);
+        let is_safe = detect_safe(&messages);
         let draft = build_draft_from_messages(&messages);
         let session_bytes = session_id.to_be_bytes();
         let post_id = derive_post_id(&[&session_bytes]);
@@ -62,6 +68,8 @@ fn close_due_sessions(state: &StateView, cmd: &TickCommand, config: &CoreConfig)
             session_id,
             group_id: session_meta.key.group_id.clone(),
             ingress_ids: ingress_ids.clone(),
+            is_anonymous,
+            is_safe,
             draft,
             created_at_ms: cmd.now_ms,
         }));
@@ -162,6 +170,42 @@ fn trigger_group_flush(state: &StateView, cmd: &TickCommand, config: &CoreConfig
         events.extend(build_group_flush_events(state, group_id, cmd.now_ms));
     }
 
+    events
+}
+
+fn recover_stuck_sends(state: &StateView, cmd: &TickCommand, config: &CoreConfig) -> Vec<Event> {
+    if state.sending.is_empty() {
+        return Vec::new();
+    }
+
+    let mut events = Vec::new();
+    let mut seq = state.next_send_seq;
+    for sending in state.sending.values() {
+        let timeout_ms = config.send_timeout_ms(&sending.group_id);
+        if timeout_ms <= 0 {
+            continue;
+        }
+        let elapsed = cmd.now_ms.saturating_sub(sending.started_at_ms);
+        if elapsed < timeout_ms {
+            continue;
+        }
+        let retry_at_ms = cmd.now_ms.saturating_add(SEND_TIMEOUT_RETRY_DELAY_MS);
+        events.push(Event::Send(SendEvent::SendFailed {
+            post_id: sending.post_id,
+            account_id: sending.account_id.clone(),
+            attempt: 1,
+            retry_at_ms,
+            error: format!("send timeout after {} ms", timeout_ms),
+        }));
+        events.push(Event::Schedule(ScheduleEvent::SendPlanRescheduled {
+            post_id: sending.post_id,
+            group_id: sending.group_id.clone(),
+            not_before_ms: retry_at_ms,
+            priority: SendPriority::Normal,
+            seq,
+        }));
+        seq = seq.saturating_add(1);
+    }
     events
 }
 

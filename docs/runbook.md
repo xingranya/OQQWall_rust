@@ -31,6 +31,8 @@ logs/                    # 可选：文件日志
 
 建议将 `data/` 放在稳定磁盘（不要放 tmpfs），否则重启恢复会缺失历史。
 
+调试版会把 stderr 调试日志同步写入 `data/logs/debug.log`，可用 `OQQWALL_DEBUG_LOG` 覆盖路径（基于 `OQQWALL_DATA_DIR`）。
+
 ---
 
 ## 2. 前置检查（上线前必做）

@@ -1,3 +1,5 @@
+use crate::anonymous::detect_anonymous;
+use crate::safety::detect_safe;
 use crate::command::{ReviewAction, ReviewActionCommand};
 use crate::config::CoreConfig;
 use crate::decide::builder::build_draft_from_messages;
@@ -105,9 +107,16 @@ pub fn decide_review_action(
             }));
             events
         }
-        ReviewAction::ToggleAnonymous => vec![Event::Review(ReviewEvent::ReviewAnonToggled {
-            review_id,
-        })],
+        ReviewAction::ToggleAnonymous => {
+            let mut events = build_ingress_sync_events(state, post_id);
+            events.push(Event::Review(ReviewEvent::ReviewAnonToggled { review_id }));
+            events.push(Event::Render(RenderEvent::RenderRequested {
+                post_id,
+                attempt: 1,
+                requested_at_ms: cmd.now_ms,
+            }));
+            events
+        }
         ReviewAction::ExpandAudit => vec![Event::Review(ReviewEvent::ReviewExpandRequested {
             review_id,
         })],
@@ -266,11 +275,23 @@ fn rebuild_draft_event(
         }
     }
     let draft = build_draft_from_messages(&messages);
+    let is_anonymous = state
+        .posts
+        .get(&post_id)
+        .map(|meta| meta.is_anonymous)
+        .unwrap_or_else(|| detect_anonymous(&messages));
+    let is_safe = state
+        .posts
+        .get(&post_id)
+        .map(|meta| meta.is_safe)
+        .unwrap_or_else(|| detect_safe(&messages));
     Some(DraftEvent::PostDraftCreated {
         post_id,
         session_id: post.session_id,
         group_id: post.group_id.clone(),
         ingress_ids,
+        is_anonymous,
+        is_safe,
         draft,
         created_at_ms: now_ms,
     })
@@ -353,6 +374,8 @@ fn build_merge_events(
         }
     }
     let draft = build_draft_from_messages(&messages);
+    let is_anonymous = post_is_anonymous(state, post_id) || post_is_anonymous(state, target_post_id);
+    let is_safe = post_is_safe(state, post_id) && post_is_safe(state, target_post_id);
 
     let mut events = Vec::new();
     events.extend(build_ingress_sync_events(state, post_id));
@@ -362,6 +385,8 @@ fn build_merge_events(
         session_id: post_meta.session_id,
         group_id: post_meta.group_id.clone(),
         ingress_ids,
+        is_anonymous,
+        is_safe,
         draft,
         created_at_ms: cmd.now_ms,
     }));
@@ -384,6 +409,38 @@ fn build_merge_events(
     }
 
     events
+}
+
+fn post_is_anonymous(state: &StateView, post_id: PostId) -> bool {
+    if let Some(meta) = state.posts.get(&post_id) {
+        return meta.is_anonymous;
+    }
+    let Some(ingress_ids) = state.post_ingress.get(&post_id) else {
+        return false;
+    };
+    let mut messages = Vec::new();
+    for ingress_id in ingress_ids {
+        if let Some(message) = state.ingress_messages.get(ingress_id) {
+            messages.push(message.clone());
+        }
+    }
+    detect_anonymous(&messages)
+}
+
+fn post_is_safe(state: &StateView, post_id: PostId) -> bool {
+    if let Some(meta) = state.posts.get(&post_id) {
+        return meta.is_safe;
+    }
+    let Some(ingress_ids) = state.post_ingress.get(&post_id) else {
+        return true;
+    };
+    let mut messages = Vec::new();
+    for ingress_id in ingress_ids {
+        if let Some(message) = state.ingress_messages.get(ingress_id) {
+            messages.push(message.clone());
+        }
+    }
+    detect_safe(&messages)
 }
 
 fn merge_ingress_ids(

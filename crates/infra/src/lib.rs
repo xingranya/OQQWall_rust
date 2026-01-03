@@ -1,3 +1,4 @@
+pub mod debug_log;
 pub mod journal;
 pub mod snapshot;
 

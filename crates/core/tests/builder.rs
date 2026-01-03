@@ -13,6 +13,7 @@ fn build_draft_splits_paragraphs_and_keeps_attachments() {
             reference: MediaReference::RemoteUrl {
                 url: "http://example.com/img.png".to_string(),
             },
+            size_bytes: None,
         }],
     };
 

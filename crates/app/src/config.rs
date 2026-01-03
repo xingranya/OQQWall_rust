@@ -9,7 +9,7 @@ use serde_json::Value;
 #[cfg(debug_assertions)]
 macro_rules! debug_log {
     ($($arg:tt)*) => {
-        eprintln!($($arg)*);
+        oqqwall_rust_infra::debug_log::log(format_args!($($arg)*));
     };
 }
 
@@ -30,6 +30,7 @@ pub struct AppConfig {
     pub groups: Vec<AppGroupConfig>,
     pub tz_offset_minutes: i32,
     pub fallback_napcat: Option<NapCatConfig>,
+    pub max_cache_mb: u64,
     core_config: CoreConfig,
     #[cfg(debug_assertions)]
     pub dev_config: DevConfig,
@@ -75,10 +76,16 @@ impl AppConfig {
 
         let tz_offset_minutes = parse_i64(common.get("tz_offset_minutes"))
             .unwrap_or(0) as i32;
+        let max_cache_mb = env::var("OQQWALL_MAX_CACHE_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .or_else(|| parse_u64(common.get("max_cache_mb")))
+            .unwrap_or(256);
         debug_log!(
-            "config parsed: tz_offset_minutes={} default_process_waittime_ms={}",
+            "config parsed: tz_offset_minutes={} default_process_waittime_ms={} max_cache_mb={}",
             tz_offset_minutes,
-            default_process_waittime_ms
+            default_process_waittime_ms,
+            max_cache_mb
         );
         let core_config = build_core_config(&common, &groups, default_process_waittime_ms);
         let fallback_napcat = parse_napcat_config_optional(&common);
@@ -118,6 +125,7 @@ impl AppConfig {
             groups: group_configs,
             tz_offset_minutes,
             fallback_napcat,
+            max_cache_mb,
             core_config,
             #[cfg(debug_assertions)]
             dev_config,
@@ -202,6 +210,14 @@ fn parse_usize(value: Option<&Value>) -> Option<usize> {
     parse_i64(value).and_then(|v| if v >= 0 { Some(v as usize) } else { None })
 }
 
+fn parse_u32(value: Option<&Value>) -> Option<u32> {
+    parse_i64(value).and_then(|v| if v >= 0 { u32::try_from(v).ok() } else { None })
+}
+
+fn parse_u64(value: Option<&Value>) -> Option<u64> {
+    parse_i64(value).and_then(|v| if v >= 0 { u64::try_from(v).ok() } else { None })
+}
+
 fn parse_duration_ms(value: Option<&Value>) -> Option<i64> {
     parse_i64(value)
 }
@@ -223,6 +239,14 @@ fn build_core_config(
     core.default_max_queue = parse_usize(common.get("max_queue"))
         .or_else(|| parse_usize(common.get("max_post_stack")))
         .unwrap_or(0);
+    core.default_send_timeout_ms = parse_duration_ms(common.get("send_timeout_ms"))
+        .or_else(|| parse_duration_ms(common.get("send_timeout_sec")).map(|v| v.saturating_mul(1000)))
+        .or_else(|| parse_duration_ms(common.get("send_timeout")).map(|v| v.saturating_mul(1000)))
+        .unwrap_or(300_000);
+    core.default_send_max_attempts = parse_u32(common.get("send_max_attempts"))
+        .or_else(|| parse_u32(common.get("max_send_attempts")))
+        .or_else(|| parse_u32(common.get("max_send_attempt")))
+        .unwrap_or(3);
 
     for (group_id, value) in groups {
         let process_waittime_ms = parse_duration_ms(value.get("process_waittime_ms"))
@@ -239,6 +263,12 @@ fn build_core_config(
             .or_else(|| parse_duration_ms(value.get("min_interval_sec")).map(|v| v.saturating_mul(1000)));
         let max_queue = parse_usize(value.get("max_queue"))
             .or_else(|| parse_usize(value.get("max_post_stack")));
+        let send_timeout_ms = parse_duration_ms(value.get("send_timeout_ms"))
+            .or_else(|| parse_duration_ms(value.get("send_timeout_sec")).map(|v| v.saturating_mul(1000)))
+            .or_else(|| parse_duration_ms(value.get("send_timeout")).map(|v| v.saturating_mul(1000)));
+        let send_max_attempts = parse_u32(value.get("send_max_attempts"))
+            .or_else(|| parse_u32(value.get("max_send_attempts")))
+            .or_else(|| parse_u32(value.get("max_send_attempt")));
         let send_schedule_minutes = parse_schedule_minutes(value.get("send_schedule"));
         let accounts = parse_accounts(value);
 
@@ -252,6 +282,8 @@ fn build_core_config(
                 max_queue,
                 send_schedule_minutes,
                 accounts,
+                send_timeout_ms,
+                send_max_attempts,
             },
         );
     }
@@ -263,6 +295,8 @@ fn build_core_config(
             GroupConfig {
                 group_id: default_group_id,
                 process_waittime_ms: Some(default_process_waittime_ms),
+                send_timeout_ms: None,
+                send_max_attempts: None,
                 ..Default::default()
             },
         );

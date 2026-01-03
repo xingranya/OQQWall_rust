@@ -158,6 +158,8 @@ impl App {
         self.users = result.users;
         self.corruption = result.corruption;
         self.load_error = None;
+        self.detail_wrapped.clear();
+        self.detail_wrap_key = None;
 
         if self.events.is_empty() {
             self.selected = None;
@@ -1679,6 +1681,10 @@ fn summary_parts(event: &Event) -> (&'static str, String) {
             ),
         },
         Event::Media(media) => match media {
+            MediaEvent::AvatarFetchRequested { user_id } => (
+                "Media.AvatarFetchRequested",
+                format!("user_id={}", user_id),
+            ),
             MediaEvent::MediaFetchRequested {
                 ingress_id,
                 attachment_index,

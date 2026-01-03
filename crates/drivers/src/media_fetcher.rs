@@ -16,10 +16,13 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
+use crate::avatar_cache;
+use crate::blob_cache;
+
 #[cfg(debug_assertions)]
 macro_rules! debug_log {
     ($($arg:tt)*) => {
-        eprintln!($($arg)*);
+        oqqwall_rust_infra::debug_log::log(format_args!($($arg)*));
     };
 }
 
@@ -78,13 +81,26 @@ pub fn spawn_media_fetcher(
 
             match env.event {
                 Event::Ingress(IngressEvent::MessageAccepted {
-                    ingress_id, message, ..
+                    ingress_id,
+                    user_id,
+                    message,
+                    ..
                 })
                 | Event::Ingress(IngressEvent::MessageSynced {
-                    ingress_id, message, ..
+                    ingress_id,
+                    user_id,
+                    message,
+                    ..
                 }) => {
                     let mut guard = state.lock().await;
                     guard.ingress_messages.insert(ingress_id, message);
+                    let user_id = user_id.clone();
+                    if avatar_cache::start_fetch(&user_id).is_some() {
+                        let client = client.clone();
+                        tokio::spawn(async move {
+                            prime_avatar_cache(client, user_id).await;
+                        });
+                    }
                 }
                 Event::Ingress(IngressEvent::MessageIgnored { ingress_id, .. }) => {
                     let mut guard = state.lock().await;
@@ -112,10 +128,71 @@ pub fn spawn_media_fetcher(
                         .await;
                     });
                 }
+                Event::Media(MediaEvent::AvatarFetchRequested { user_id }) => {
+                    if avatar_cache::start_fetch(&user_id).is_some() {
+                        let client = client.clone();
+                        let user_id = user_id.clone();
+                        tokio::spawn(async move {
+                            prime_avatar_cache(client, user_id).await;
+                        });
+                    }
+                }
                 _ => {}
             }
         }
     })
+}
+
+fn avatar_url_for_user(user_id: &str) -> Option<String> {
+    let trimmed = user_id.trim();
+    if trimmed.is_empty() || trimmed == "unknown" {
+        return None;
+    }
+    Some(format!(
+        "https://qlogo2.store.qq.com/qzone/{0}/{0}/640",
+        trimmed
+    ))
+}
+
+async fn prime_avatar_cache(client: Client, user_id: String) {
+    if avatar_cache::has_avatar(&user_id) {
+        avatar_cache::finish_fetch(&user_id);
+        return;
+    }
+    let Some(url) = avatar_url_for_user(&user_id) else {
+        avatar_cache::finish_fetch(&user_id);
+        return;
+    };
+    let resp = match client.get(&url).send().await {
+        Ok(resp) => resp,
+        Err(err) => {
+            debug_log!("avatar fetch failed: {}: {}", user_id, err);
+            avatar_cache::finish_fetch(&user_id);
+            return;
+        }
+    };
+    if !resp.status().is_success() {
+        debug_log!(
+            "avatar http status {}: {}",
+            resp.status().as_u16(),
+            user_id
+        );
+        avatar_cache::finish_fetch(&user_id);
+        return;
+    }
+    let bytes = match resp.bytes().await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            debug_log!("avatar read failed: {}: {}", user_id, err);
+            avatar_cache::finish_fetch(&user_id);
+            return;
+        }
+    };
+    if bytes.is_empty() {
+        avatar_cache::finish_fetch(&user_id);
+        return;
+    }
+    avatar_cache::insert_avatar_bytes(&user_id, Arc::from(bytes.to_vec()));
 }
 
 async fn handle_fetch(
@@ -159,7 +236,23 @@ async fn handle_fetch(
         match fetch_bytes(&client, &url).await {
             Ok(fetched) => {
                 let ext = choose_extension(&attachment, &url, &fetched);
-                match persist_blob(&runtime.blob_root, kind_dir(&attachment.kind), &ext, blob_id, &fetched.bytes)
+                let bytes: Arc<[u8]> = Arc::from(fetched.bytes);
+                if let Some((kind, retention)) = blob_cache::cache_policy_for_media(attachment.kind) {
+                    blob_cache::store_arc(
+                        blob_id,
+                        bytes.clone(),
+                        kind,
+                        retention,
+                        fetched.content_type.clone(),
+                    );
+                }
+                match persist_blob(
+                    &runtime.blob_root,
+                    kind_dir(&attachment.kind),
+                    &ext,
+                    blob_id,
+                    bytes.as_ref(),
+                )
                 {
                     Ok((path, size_bytes)) => {
                         let _ = send_event(
@@ -236,6 +329,13 @@ async fn fetch_bytes(client: &Client, source: &str) -> Result<FetchedBytes, Stri
             source_hint: None,
         });
     }
+    if let Some(bytes) = parse_base64_url(source)? {
+        return Ok(FetchedBytes {
+            bytes,
+            content_type: None,
+            source_hint: None,
+        });
+    }
     if source.starts_with("http://") || source.starts_with("https://") {
         let response = client
             .get(source)
@@ -302,6 +402,17 @@ fn parse_data_url(source: &str) -> Result<Option<(Option<String>, Vec<u8>)>, Str
     Ok(Some((mime, bytes)))
 }
 
+fn parse_base64_url(source: &str) -> Result<Option<Vec<u8>>, String> {
+    let payload = match source.strip_prefix("base64://") {
+        Some(payload) => payload,
+        None => return Ok(None),
+    };
+    let bytes = STANDARD
+        .decode(payload)
+        .map_err(|err| format!("invalid base64: {}", err))?;
+    Ok(Some(bytes))
+}
+
 fn choose_extension(
     attachment: &IngressAttachment,
     source: &str,
@@ -325,6 +436,7 @@ fn choose_extension(
         MediaKind::Video => "mp4".to_string(),
         MediaKind::Audio => "mp3".to_string(),
         MediaKind::File | MediaKind::Other => "bin".to_string(),
+        MediaKind::Sticker => "jpg".to_string(),
     }
 }
 
@@ -356,6 +468,9 @@ fn ext_from_source(source: &str) -> Option<String> {
         }
         return None;
     }
+    if source.starts_with("base64://") {
+        return None;
+    }
     let trimmed = source
         .split('#')
         .next()
@@ -377,6 +492,7 @@ fn kind_dir(kind: &MediaKind) -> &'static str {
         MediaKind::File => "file",
         MediaKind::Audio => "audio",
         MediaKind::Other => "other",
+        MediaKind::Sticker => "image",
     }
 }
 

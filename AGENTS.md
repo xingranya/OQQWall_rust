@@ -35,4 +35,5 @@
 ## Configuration & Runtime Notes
 - Use `OQQWALL_NAPCAT_TOKEN` to avoid committing access tokens.
 - `devconfig.json` is read only in debug builds; release ignores it.
+- Debug builds mirror stderr logs to `data/logs/debug.log` (base `OQQWALL_DATA_DIR`), override with `OQQWALL_DEBUG_LOG`.
 - Persistent data and snapshots belong under `data/`; do not commit generated files in `target/`.

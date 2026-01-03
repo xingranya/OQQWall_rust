@@ -9,6 +9,7 @@ pub fn build_draft_from_messages(messages: &[IngressMessage]) -> Draft {
             blocks.push(DraftBlock::Attachment {
                 kind: attachment.kind,
                 reference: attachment.reference.clone(),
+                size_bytes: attachment.size_bytes,
             });
         }
     }

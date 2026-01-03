@@ -5,8 +5,9 @@ use std::io::{Read, Write};
 #[cfg(debug_assertions)]
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{env};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -17,8 +18,9 @@ use oqqwall_rust_core::draft::{
 use oqqwall_rust_core::event::{
     BlobEvent, DraftEvent, Event, IngressEvent, MediaEvent, RenderEvent, ReviewEvent, SendEvent,
 };
-use oqqwall_rust_core::ids::{BlobId, IngressId, PostId, ReviewCode, TimestampMs};
-use oqqwall_rust_core::{build_draft_from_messages, derive_blob_id, Command};
+use oqqwall_rust_core::ids::{BlobId, IngressId, PostId, ReviewCode, ReviewId, TimestampMs};
+use oqqwall_rust_core::{build_draft_from_messages, derive_blob_id, Command, StateView};
+use oqqwall_rust_infra::{LocalJournal, SnapshotStore};
 use reqwest::Client;
 #[cfg(debug_assertions)]
 use serde::Serialize;
@@ -29,11 +31,12 @@ use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
 
 use crate::napcat::NapCatConfig;
+use crate::blob_cache;
 
 #[cfg(debug_assertions)]
 macro_rules! debug_log {
     ($($arg:tt)*) => {
-        eprintln!($($arg)*);
+        oqqwall_rust_infra::debug_log::log(format_args!($($arg)*));
     };
 }
 
@@ -119,6 +122,8 @@ struct QzoneState {
     ingress_messages: HashMap<IngressId, IngressMessage>,
     ingress_authors: HashMap<IngressId, IngressAuthor>,
     post_ingress: HashMap<PostId, Vec<IngressId>>,
+    post_anonymous: HashMap<PostId, bool>,
+    review_posts: HashMap<ReviewId, PostId>,
     review_codes: HashMap<PostId, ReviewCode>,
     render_blobs: HashMap<PostId, RenderBlobs>,
 }
@@ -131,6 +136,100 @@ impl QzoneState {
             }
         }
     }
+}
+
+fn load_state_view_cached() -> StateView {
+    static CACHE: OnceLock<StateView> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let data_dir = env::var("OQQWALL_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+            let journal = match LocalJournal::open(&data_dir) {
+                Ok(journal) => journal,
+                Err(err) => {
+                    debug_log!(
+                        "qzone preload skipped: journal open failed: {}",
+                        err
+                    );
+                    return StateView::default();
+                }
+            };
+            let snapshot = match SnapshotStore::open(&data_dir) {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    debug_log!(
+                        "qzone preload skipped: snapshot open failed: {}",
+                        err
+                    );
+                    return StateView::default();
+                }
+            };
+
+            let mut state = StateView::default();
+            let mut cursor = None;
+            match snapshot.load() {
+                Ok(Some(loaded)) => {
+                    state = loaded.state;
+                    cursor = loaded.journal_cursor;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    debug_log!("qzone preload: snapshot load failed: {}", err);
+                }
+            }
+
+            if let Err(err) = journal.replay(cursor, |env| {
+                state = state.reduce(env);
+            }) {
+                debug_log!("qzone preload: journal replay failed: {}", err);
+            }
+
+            state
+        })
+        .clone()
+}
+
+fn build_state_from_view(view: &StateView) -> QzoneState {
+    let mut state = QzoneState::default();
+    state.drafts = view.drafts.clone();
+    state.ingress_messages = view.ingress_messages.clone();
+    state.post_ingress = view.post_ingress.clone();
+    for (post_id, post) in &view.posts {
+        state.post_anonymous.insert(*post_id, post.is_anonymous);
+    }
+
+    for (ingress_id, meta) in &view.ingress_meta {
+        state.ingress_authors.insert(
+            *ingress_id,
+            IngressAuthor {
+                user_id: meta.user_id.clone(),
+                sender_name: meta.sender_name.clone(),
+            },
+        );
+    }
+
+    for (review_id, review) in &view.reviews {
+        state.review_codes.insert(review.post_id, review.review_code);
+        state.review_posts.insert(*review_id, review.post_id);
+    }
+
+    for (post_id, render) in &view.render {
+        if render.png_blob.is_some() {
+            state.render_blobs.insert(
+                *post_id,
+                RenderBlobs {
+                    png: render.png_blob,
+                },
+            );
+        }
+    }
+
+    for (blob_id, meta) in &view.blobs {
+        if let Some(path) = meta.persisted_path.as_ref() {
+            state.blob_paths.insert(*blob_id, path.clone());
+        }
+    }
+
+    state
 }
 
 struct CookieCache {
@@ -182,7 +281,8 @@ pub fn spawn_qzone_sender(
         } else {
             None
         };
-        let state = Arc::new(Mutex::new(QzoneState::default()));
+        let state_view = load_state_view_cached();
+        let state = Arc::new(Mutex::new(build_state_from_view(&state_view)));
         let mut bus_rx = bus_rx;
 
         loop {
@@ -234,6 +334,7 @@ pub fn spawn_qzone_sender(
                     post_id,
                     draft,
                     ingress_ids,
+                    is_anonymous,
                     ..
                 }) => {
                     debug_log!(
@@ -244,22 +345,32 @@ pub fn spawn_qzone_sender(
                     let mut guard = state.lock().await;
                     guard.drafts.insert(post_id, draft);
                     guard.post_ingress.insert(post_id, ingress_ids);
+                    guard.post_anonymous.insert(post_id, is_anonymous);
                 }
                 Event::Review(ReviewEvent::ReviewItemCreated {
+                    review_id,
                     post_id,
                     review_code,
-                    ..
                 }) => {
                     let mut guard = state.lock().await;
                     guard.review_codes.insert(post_id, review_code);
+                    guard.review_posts.insert(review_id, post_id);
                 }
                 Event::Review(ReviewEvent::ReviewInfoSynced {
+                    review_id,
                     post_id,
                     review_code,
-                    ..
                 }) => {
                     let mut guard = state.lock().await;
                     guard.review_codes.insert(post_id, review_code);
+                    guard.review_posts.insert(review_id, post_id);
+                }
+                Event::Review(ReviewEvent::ReviewAnonToggled { review_id }) => {
+                    let mut guard = state.lock().await;
+                    if let Some(post_id) = guard.review_posts.get(&review_id).copied() {
+                        let entry = guard.post_anonymous.entry(post_id).or_insert(false);
+                        *entry = !*entry;
+                    }
                 }
                 Event::Blob(BlobEvent::BlobPersisted { blob_id, path }) => {
                     let mut guard = state.lock().await;
@@ -279,6 +390,16 @@ pub fn spawn_qzone_sender(
                     let mut guard = state.lock().await;
                     let entry = guard.render_blobs.entry(post_id).or_default();
                     entry.png = None;
+                }
+                Event::Send(SendEvent::SendSucceeded { post_id, .. })
+                | Event::Send(SendEvent::SendGaveUp { post_id, .. }) => {
+                    let blob_ids = {
+                        let guard = state.lock().await;
+                        collect_post_blob_ids(&guard, post_id)
+                    };
+                    if !blob_ids.is_empty() {
+                        blob_cache::release_many(blob_ids);
+                    }
                 }
                 Event::Send(SendEvent::SendStarted {
                     post_id,
@@ -301,6 +422,7 @@ pub fn spawn_qzone_sender(
                             guard.review_codes.get(&post_id).copied(),
                             guard.post_ingress.get(&post_id),
                             &guard.ingress_authors,
+                            &guard.post_anonymous,
                         );
                         (
                             resolve_draft_for_send(&guard, post_id),
@@ -780,11 +902,16 @@ fn build_publish_text(
     review_code: Option<ReviewCode>,
     ingress_ids: Option<&Vec<IngressId>>,
     ingress_authors: &HashMap<IngressId, IngressAuthor>,
+    post_anonymous: &HashMap<PostId, bool>,
 ) -> String {
     let code = review_code
         .map(|value| value.to_string())
         .unwrap_or_else(|| post_id.0.to_string());
     let mut text = format!("#{}", code);
+
+    if post_anonymous.get(&post_id).copied().unwrap_or(false) {
+        return text;
+    }
 
     let mut mentions = Vec::new();
     let mut seen = HashSet::new();
@@ -844,6 +971,27 @@ fn render_preview_blobs(state: &QzoneState, post_id: PostId) -> Vec<BlobId> {
         return vec![png];
     }
     Vec::new()
+}
+
+fn collect_post_blob_ids(state: &QzoneState, post_id: PostId) -> Vec<BlobId> {
+    let mut blob_ids = Vec::new();
+    if let Some(render) = state.render_blobs.get(&post_id) {
+        if let Some(png) = render.png {
+            blob_ids.push(png);
+        }
+    }
+    if let Some(ingress_ids) = state.post_ingress.get(&post_id) {
+        for ingress_id in ingress_ids {
+            if let Some(message) = state.ingress_messages.get(ingress_id) {
+                for attachment in &message.attachments {
+                    if let MediaReference::Blob { blob_id } = attachment.reference {
+                        blob_ids.push(blob_id);
+                    }
+                }
+            }
+        }
+    }
+    blob_ids
 }
 
 fn resolve_blob_path(
@@ -934,6 +1082,7 @@ fn default_ext_for_kind(kind: MediaKind) -> &'static str {
         MediaKind::Video => "mp4",
         MediaKind::Audio => "mp3",
         MediaKind::File | MediaKind::Other => "bin",
+        MediaKind::Sticker => "png",
     }
 }
 
@@ -965,8 +1114,52 @@ fn read_local_image_bytes(path: &str) -> Result<Vec<u8>, QzoneError> {
     fs::read(path).map_err(|err| QzoneError::unknown(format!("read file failed: {}", err)))
 }
 
+fn resolve_blob_bytes(
+    blob_paths: &HashMap<BlobId, String>,
+    blob_id: BlobId,
+) -> Result<Vec<u8>, QzoneError> {
+    if let Some(bytes) = blob_cache::get_bytes(blob_id) {
+        return Ok(bytes.as_ref().to_vec());
+    }
+    let path = resolve_blob_path(blob_paths, blob_id)?;
+    read_local_image_bytes(&path)
+}
+
+fn resolve_reference_bytes(
+    kind: MediaKind,
+    reference: &MediaReference,
+    blob_paths: &HashMap<BlobId, String>,
+) -> Result<Vec<u8>, QzoneError> {
+    match reference {
+        MediaReference::Blob { blob_id } => resolve_blob_bytes(blob_paths, *blob_id),
+        MediaReference::RemoteUrl { url } => {
+            if let Some((_mime, bytes)) = decode_inline_source(url)? {
+                return Ok(bytes);
+            }
+            if url.starts_with("file://") || Path::new(url).exists() {
+                return read_local_image_bytes(url);
+            }
+            if url.starts_with("http://") || url.starts_with("https://") {
+                return Err(QzoneError::unknown(
+                    "remote http image url not allowed; require local file",
+                ));
+            }
+            Err(QzoneError::unknown(format!(
+                "unsupported image source: kind={:?}",
+                kind
+            )))
+        }
+    }
+}
+
 fn id128_hex(value: u128) -> String {
     format!("{:032x}", value)
+}
+
+#[cfg(debug_assertions)]
+fn data_url_from_cache(entry: &blob_cache::CacheEntry) -> String {
+    let mime = entry.mime.as_deref().unwrap_or("image/jpeg");
+    format!("data:{};base64,{}", mime, STANDARD.encode(entry.bytes.as_ref()))
 }
 
 #[cfg(debug_assertions)]
@@ -977,17 +1170,34 @@ fn collect_emuqzone_images(
 ) -> Result<Vec<String>, QzoneError> {
     let mut images = Vec::new();
     for blob_id in preview_blobs {
-        let path = resolve_blob_path(blob_paths, *blob_id)?;
-        images.push(process_emuqzone_image(&path));
+        if let Some(entry) = blob_cache::get_entry(*blob_id) {
+            images.push(data_url_from_cache(&entry));
+        } else {
+            let path = resolve_blob_path(blob_paths, *blob_id)?;
+            images.push(process_emuqzone_image(&path));
+        }
     }
     for block in &draft.blocks {
         if let DraftBlock::Attachment {
             kind: MediaKind::Image,
             reference,
+            ..
         } = block
         {
-            let path = resolve_local_image_path(MediaKind::Image, reference, blob_paths)?;
-            images.push(process_emuqzone_image(&path));
+            match reference {
+                MediaReference::Blob { blob_id } => {
+                    if let Some(entry) = blob_cache::get_entry(*blob_id) {
+                        images.push(data_url_from_cache(&entry));
+                    } else {
+                        let path = resolve_blob_path(blob_paths, *blob_id)?;
+                        images.push(process_emuqzone_image(&path));
+                    }
+                }
+                _ => {
+                    let path = resolve_local_image_path(MediaKind::Image, reference, blob_paths)?;
+                    images.push(process_emuqzone_image(&path));
+                }
+            }
         }
     }
     Ok(images)
@@ -1178,7 +1388,8 @@ function loadData() {{
         posts.innerHTML = '<p>No posts yet.</p>';
         return;
       }}
-      posts.innerHTML = data.map(post => `
+      const ordered = [...data].sort((a, b) => b.timestamp_ms - a.timestamp_ms);
+      posts.innerHTML = ordered.map(post => `
         <div class="post">
           <div class="post-header">Post #${{post.id}} - ${{post.timestamp_ms}}</div>
           <div class="post-content">${{post.text || ''}}</div>
@@ -1298,7 +1509,7 @@ async fn fetch_cookies_ws(napcat: &NapCatConfig) -> Result<HashMap<String, Strin
     let echo = format!("echo-{}", now_ms());
     let payload = serde_json::json!({
         "action": "get_cookies",
-        "params": { "domain": "qzone.qq.com" },
+        "params": { "domain": "user.qzone.qq.com" },
         "echo": echo,
     });
     debug_log!("qzone fetch cookies ws send request: echo={}", echo);
@@ -1422,28 +1633,23 @@ async fn collect_images(
     blob_paths: &HashMap<BlobId, String>,
     preview_blobs: &[BlobId],
 ) -> Result<Vec<Vec<u8>>, QzoneError> {
-    let mut sources = Vec::new();
+    let mut images = Vec::new();
     for blob_id in preview_blobs {
-        sources.push(resolve_blob_path(blob_paths, *blob_id)?);
+        images.push(resolve_blob_bytes(blob_paths, *blob_id)?);
     }
     for block in &draft.blocks {
         if let DraftBlock::Attachment {
             kind: MediaKind::Image,
             reference,
+            ..
         } = block
         {
-            sources.push(resolve_local_image_path(
+            images.push(resolve_reference_bytes(
                 MediaKind::Image,
                 reference,
                 blob_paths,
             )?);
         }
-    }
-
-    let mut images = Vec::new();
-    for source in sources {
-        debug_log!("qzone collect image: file={}", source);
-        images.push(read_local_image_bytes(&source)?);
     }
     Ok(images)
 }

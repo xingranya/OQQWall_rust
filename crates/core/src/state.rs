@@ -66,7 +66,15 @@ pub struct PostMeta {
     pub stage: PostStage,
     pub review_id: Option<ReviewId>,
     pub created_at_ms: TimestampMs,
+    #[serde(default)]
+    pub is_anonymous: bool,
+    #[serde(default = "default_true")]
+    pub is_safe: bool,
     pub last_error: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

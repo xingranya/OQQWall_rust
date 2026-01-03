@@ -211,7 +211,17 @@ impl LocalJournal {
                 }
 
                 let mut header = [0u8; 8];
-                reader.read_exact(&mut header)?;
+                if let Err(err) = reader.read_exact(&mut header) {
+                    if err.kind() == std::io::ErrorKind::UnexpectedEof {
+                        corruption = Some(JournalCorruption {
+                            segment: segment.index,
+                            offset,
+                            reason: "truncated header".to_string(),
+                        });
+                        break 'segments;
+                    }
+                    return Err(InfraError::Io(err));
+                }
                 let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
                 let crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
 
@@ -235,7 +245,17 @@ impl LocalJournal {
                 }
 
                 let mut payload = vec![0u8; len];
-                reader.read_exact(&mut payload)?;
+                if let Err(err) = reader.read_exact(&mut payload) {
+                    if err.kind() == std::io::ErrorKind::UnexpectedEof {
+                        corruption = Some(JournalCorruption {
+                            segment: segment.index,
+                            offset,
+                            reason: "truncated payload".to_string(),
+                        });
+                        break 'segments;
+                    }
+                    return Err(InfraError::Io(err));
+                }
                 if crc32fast::hash(&payload) != crc {
                     corruption = Some(JournalCorruption {
                         segment: segment.index,
@@ -245,13 +265,17 @@ impl LocalJournal {
                     break 'segments;
                 }
 
-                let env: EventEnvelope =
-                    bincode::deserialize(&payload).map_err(|err| {
-                        InfraError::InvalidData(format!(
-                            "decode failed at segment {} offset {}: {}",
-                            segment.index, offset, err
-                        ))
-                    })?;
+                let env: EventEnvelope = match bincode::deserialize(&payload) {
+                    Ok(env) => env,
+                    Err(err) => {
+                        corruption = Some(JournalCorruption {
+                            segment: segment.index,
+                            offset,
+                            reason: format!("decode failed: {}", err),
+                        });
+                        break 'segments;
+                    }
+                };
                 apply(&env);
                 events = events.saturating_add(1);
                 offset = next_offset;

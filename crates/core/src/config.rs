@@ -8,6 +8,8 @@ pub struct CoreConfig {
     pub default_send_windows: Vec<TimeWindow>,
     pub default_min_interval_ms: TimestampMs,
     pub default_max_queue: usize,
+    pub default_send_timeout_ms: TimestampMs,
+    pub default_send_max_attempts: u32,
     pub groups: HashMap<GroupId, GroupConfig>,
 }
 
@@ -20,6 +22,8 @@ pub struct GroupConfig {
     pub max_queue: Option<usize>,
     pub send_schedule_minutes: Vec<u16>,
     pub accounts: Vec<AccountId>,
+    pub send_timeout_ms: Option<TimestampMs>,
+    pub send_max_attempts: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,5 +62,17 @@ impl CoreConfig {
         self.group_config(group_id)
             .and_then(|cfg| cfg.max_queue)
             .unwrap_or(self.default_max_queue)
+    }
+
+    pub fn send_timeout_ms(&self, group_id: &GroupId) -> TimestampMs {
+        self.group_config(group_id)
+            .and_then(|cfg| cfg.send_timeout_ms)
+            .unwrap_or(self.default_send_timeout_ms)
+    }
+
+    pub fn send_max_attempts(&self, group_id: &GroupId) -> u32 {
+        self.group_config(group_id)
+            .and_then(|cfg| cfg.send_max_attempts)
+            .unwrap_or(self.default_send_max_attempts)
     }
 }

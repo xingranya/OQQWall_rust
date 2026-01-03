@@ -80,6 +80,7 @@ pub enum GlobalAction {
     PendingClear,
     SendQueueClear,
     SendQueueFlush,
+    SendInFlightClear,
     BlacklistList,
     BlacklistRemove { sender_id: String },
     SetExternalNumber { value: u64 },

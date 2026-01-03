@@ -93,10 +93,18 @@
 | friend_request_window_sec    | friend_request_window_sec    |    u32 |               300 | 未支持               | 好友请求/私聊抑制窗口（原版 TUI 提示）                                |
 | use_web_review               | use_web_review               |   bool |             false | 未支持               | 是否启用网页审核面板（原版提示）                                      |
 | web_review_port              | web_review_port              |    u16 |             10923 | 未支持               | 网页审核监听端口（原版提示）                                        |
-| process_waittime_sec         | process_waittime             |    u32 |                20 | 已支持               | 原版 `preprocess.sh` 读取 `process_waittime`（秒）           |
+| napcat_ws_url                | napcat_ws_url                | string |                "" | 已支持               | 作为默认 NapCat WS 地址（当组内未配置时兜底）                             |
+| napcat_access_token          | napcat_access_token          | string |                "" | 已支持               | 作为默认 NapCat token（可被 `OQQWALL_NAPCAT_TOKEN` 覆盖）             |
+| tz_offset_minutes            | tz_offset_minutes            |    i32 |                 0 | 已支持               | 时区偏移（分钟，用于 schedule/defer 计算）                           |
+| min_interval_ms              | min_interval_sec             |    u32 |                 0 | 已支持               | 发送最小间隔（毫秒/秒）                                            |
+| max_queue                    | max_post_stack               |    u32 |                 0 | 已支持               | 发送队列上限（=0 表示不限制，等价兼容 max_post_stack）                |
+| send_timeout_ms              | send_timeout_sec/send_timeout |    u32 |            300000 | 已支持               | 发送超时（毫秒/秒）                                               |
+| send_max_attempts            | max_send_attempts/max_send_attempt |    u32 |                 3 | 已支持               | 发送失败最大重试次数                                             |
+| max_cache_mb                 | max_cache_mb                 |    u32 |               256 | 已支持               | 内存图片缓存上限（MB），超限时优先淘汰大文件缓存                          |
+| process_waittime_sec         | process_waittime             |    u32 |                20 | 已支持（支持 ms/sec/旧字段） | 原版 `preprocess.sh` 读取 `process_waittime`（秒）           |
 
 关于 `process_waittime_sec` / `process_waittime`：
-强制只允许process_waittime_sec
+支持 `process_waittime_ms` / `process_waittime_sec` / `process_waittime`，分别按毫秒/秒/秒解析，优先级依次覆盖。
 ### 4.2 环境变量覆盖优先级（推荐）
 
 * `OQQWALL_NAPCAT_TOKEN` > `groups.<id>.napcat_access_token`（全局覆盖所有组）

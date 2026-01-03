@@ -44,6 +44,7 @@ fn tick_closes_session_and_creates_draft() {
                 reference: MediaReference::RemoteUrl {
                     url: "http://example.com/img.png".to_string(),
                 },
+                size_bytes: None,
             }],
         },
         received_at_ms: 1_000,

@@ -62,6 +62,8 @@ fn merge_reviews_from_same_sender() {
                 session_id: session_a,
                 group_id: "group".to_string(),
                 ingress_ids: vec![ingress_a],
+                is_anonymous: true,
+                is_safe: true,
                 draft: Draft {
                     blocks: vec![DraftBlock::Paragraph {
                         text: "a".to_string(),
@@ -102,6 +104,8 @@ fn merge_reviews_from_same_sender() {
                 session_id: session_b,
                 group_id: "group".to_string(),
                 ingress_ids: vec![ingress_b],
+                is_anonymous: false,
+                is_safe: false,
                 draft: Draft {
                     blocks: vec![DraftBlock::Paragraph {
                         text: "b".to_string(),
@@ -144,11 +148,13 @@ fn merge_reviews_from_same_sender() {
         Event::Draft(DraftEvent::PostDraftCreated {
             post_id,
             ingress_ids,
+            is_anonymous,
+            is_safe,
             ..
-        }) if *post_id == post_a => Some(ingress_ids.clone()),
+        }) if *post_id == post_a => Some((ingress_ids.clone(), *is_anonymous, *is_safe)),
         _ => None,
     });
-    assert_eq!(merged, Some(vec![ingress_a, ingress_b]));
+    assert_eq!(merged, Some((vec![ingress_a, ingress_b], true, false)));
 
     let skipped = out.iter().any(|event| {
         matches!(

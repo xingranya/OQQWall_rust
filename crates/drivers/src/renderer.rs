@@ -3,15 +3,21 @@ use std::future::Future;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use crate::avatar_cache;
+use crate::blob_cache::{self, CacheKind, CacheRetention};
 use crate::napcat::{extract_message_lite, NapCatConfig};
-use oqqwall_rust_core::event::{BlobEvent, Event, RenderEvent};
-use oqqwall_rust_core::{derive_blob_id, Command, Draft, DraftBlock, PostId, StateView};
-use reqwest::header::CONTENT_TYPE;
+use oqqwall_rust_core::decide::builder::build_draft_from_messages;
+use oqqwall_rust_core::event::{BlobEvent, Event, IngressEvent, MediaEvent, RenderEvent, SendEvent};
+use oqqwall_rust_core::{
+    derive_blob_id, BlobId, Command, Draft, DraftBlock, IngressId, IngressMessage, MediaKind,
+    MediaReference, PostId, StateView,
+};
+use oqqwall_rust_infra::{LocalJournal, SnapshotStore};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -36,7 +42,7 @@ mod embedded_resources {
 #[cfg(debug_assertions)]
 macro_rules! debug_log {
     ($($arg:tt)*) => {
-        eprintln!($($arg)*);
+        oqqwall_rust_infra::debug_log::log(format_args!($($arg)*));
     };
 }
 
@@ -49,6 +55,8 @@ const FORWARD_PREFIX: &str = "[合并转发:";
 const MAX_FORWARD_DEPTH: u32 = 4;
 const MEASURE_MAX_WIDTH: f32 = 10_000.0;
 const FONT_FAMILIES: [&str; 1] = ["PingFang SC"];
+const DEFAULT_AVATAR_PATH: &str = "res/Anonymous_avatar.png";
+const AVATAR_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 static FONT_BYTES_CACHE: OnceLock<Vec<FontBytes>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
@@ -81,6 +89,7 @@ struct HeaderInfo {
     user_id: String,
     post_id_hex: String,
     sender_name: Option<String>,
+    is_anonymous: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +104,7 @@ enum BlockKind {
     FileCard {
         name_lines: Vec<String>,
         meta_line: Option<String>,
+        icon_path: Option<&'static str>,
         icon_text: String,
     },
 }
@@ -130,7 +140,7 @@ struct BlockLayout {
 
 #[derive(Debug, Clone)]
 struct ResolvedImage {
-    bytes: Option<Vec<u8>>,
+    bytes: Option<Arc<[u8]>>,
     width: Option<u32>,
     height: Option<u32>,
 }
@@ -140,6 +150,18 @@ struct RenderImageSources {
     avatar: Option<ResolvedImage>,
     block_images: Vec<Option<ResolvedImage>>,
     block_labels: Vec<Option<String>>,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+enum ImageCacheKey {
+    Blob(BlobId),
+    Source(String),
+}
+
+#[derive(Default)]
+struct ImageMemoryCache {
+    entries: HashMap<ImageCacheKey, ResolvedImage>,
+    attachment_sources: HashMap<(IngressId, usize), ImageCacheKey>,
 }
 
 #[derive(Debug, Hash, PartialEq, Eq)]
@@ -157,6 +179,16 @@ struct TextMeasurer {
 
 impl ResolvedImage {
     fn from_bytes(bytes: Vec<u8>) -> Self {
+        let size = image_size_from_bytes(&bytes);
+        let (width, height) = size.map_or((None, None), |(w, h)| (Some(w), Some(h)));
+        Self {
+            bytes: Some(Arc::from(bytes)),
+            width,
+            height,
+        }
+    }
+
+    fn from_arc(bytes: Arc<[u8]>) -> Self {
         let size = image_size_from_bytes(&bytes);
         let (width, height) = size.map_or((None, None), |(w, h)| (Some(w), Some(h)));
         Self {
@@ -207,6 +239,135 @@ impl TextMeasurer {
     }
 }
 
+impl ImageMemoryCache {
+    fn on_event(&mut self, state: &StateView, event: &Event) {
+        match event {
+            Event::Ingress(IngressEvent::MessageAccepted { ingress_id, message, .. })
+            | Event::Ingress(IngressEvent::MessageSynced { ingress_id, message, .. }) => {
+                self.prime_from_message(*ingress_id, message);
+            }
+            Event::Media(MediaEvent::MediaFetchSucceeded {
+                ingress_id,
+                attachment_index,
+                blob_id,
+            }) => {
+                self.prime_from_blob(state, *ingress_id, *attachment_index, *blob_id);
+            }
+            Event::Ingress(IngressEvent::MessageIgnored { ingress_id, .. }) => {
+                self.clear_for_ingress(*ingress_id);
+            }
+            _ => {}
+        }
+    }
+
+    fn prime_from_message(&mut self, ingress_id: IngressId, message: &IngressMessage) {
+        for (idx, attachment) in message.attachments.iter().enumerate() {
+            if !is_renderable_image(attachment.kind) {
+                continue;
+            }
+            let MediaReference::RemoteUrl { url } = &attachment.reference else {
+                continue;
+            };
+            if is_remote_http(url) {
+                continue;
+            }
+            let key = ImageCacheKey::Source(url.clone());
+            if !self.entries.contains_key(&key) {
+                if let Some(image) = resolve_source_to_image(url) {
+                    self.entries.insert(key.clone(), image);
+                }
+            }
+            self.attachment_sources.insert((ingress_id, idx), key);
+        }
+    }
+
+    fn prime_from_blob(
+        &mut self,
+        state: &StateView,
+        ingress_id: IngressId,
+        attachment_index: usize,
+        blob_id: BlobId,
+    ) {
+        if !attachment_is_image(state, ingress_id, attachment_index) {
+            return;
+        }
+        if let Some(key) = self.attachment_sources.remove(&(ingress_id, attachment_index)) {
+            self.entries.remove(&key);
+        }
+        let key = ImageCacheKey::Blob(blob_id);
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        if let Some(image) = resolve_blob_image(state, blob_id) {
+            self.entries.insert(key, image);
+        }
+    }
+
+    fn clear_for_ingress(&mut self, ingress_id: IngressId) {
+        let keys = self
+            .attachment_sources
+            .iter()
+            .filter_map(|((id, _), key)| (*id == ingress_id).then(|| key.clone()))
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.entries.remove(&key);
+        }
+        self.attachment_sources
+            .retain(|(id, _), _| *id != ingress_id);
+    }
+
+    fn release_keys(&mut self, used_keys: &HashSet<ImageCacheKey>) {
+        for key in used_keys {
+            self.entries.remove(key);
+        }
+        self.attachment_sources
+            .retain(|_, key| !used_keys.contains(key));
+    }
+
+    fn get_or_load_source(&mut self, source: &str) -> Option<ResolvedImage> {
+        let key = ImageCacheKey::Source(source.to_string());
+        if let Some(image) = self.entries.get(&key) {
+            return Some(image.clone());
+        }
+        let image = resolve_source_to_image(source)?;
+        self.entries.insert(key, image.clone());
+        Some(image)
+    }
+
+    fn get_or_load_blob(&mut self, state: &StateView, blob_id: BlobId) -> Option<ResolvedImage> {
+        let key = ImageCacheKey::Blob(blob_id);
+        if let Some(image) = self.entries.get(&key) {
+            return Some(image.clone());
+        }
+        let image = resolve_blob_image(state, blob_id)?;
+        self.entries.insert(key, image.clone());
+        Some(image)
+    }
+}
+
+fn is_renderable_image(kind: MediaKind) -> bool {
+    matches!(kind, MediaKind::Image | MediaKind::Sticker)
+}
+
+fn attachment_is_image(state: &StateView, ingress_id: IngressId, attachment_index: usize) -> bool {
+    state
+        .ingress_messages
+        .get(&ingress_id)
+        .and_then(|message| message.attachments.get(attachment_index))
+        .map(|attachment| is_renderable_image(attachment.kind))
+        .unwrap_or(false)
+}
+
+fn purge_avatar_for_post(state: &StateView, post_id: PostId) {
+    let Some(ingress_ids) = state.post_ingress.get(&post_id) else {
+        return;
+    };
+    for ingress_id in ingress_ids {
+        if let Some(meta) = state.ingress_meta.get(ingress_id) {
+            avatar_cache::remove_avatar(&meta.user_id);
+        }
+    }
+}
 
 pub fn spawn_renderer(
     cmd_tx: mpsc::Sender<Command>,
@@ -223,8 +384,9 @@ pub fn spawn_renderer(
             config.canvas_width_px,
             config.max_height_px
         );
-        let mut state = StateView::default();
+        let mut state = load_state_view_cached();
         let mut bus_rx = bus_rx;
+        let mut image_cache = ImageMemoryCache::default();
 
         loop {
             let env = match bus_rx.recv().await {
@@ -234,6 +396,13 @@ pub fn spawn_renderer(
             };
 
             state = state.reduce(&env);
+            image_cache.on_event(&state, &env.event);
+
+            if let Event::Send(SendEvent::SendSucceeded { post_id, .. })
+            | Event::Send(SendEvent::SendGaveUp { post_id, .. }) = env.event
+            {
+                purge_avatar_for_post(&state, post_id);
+            }
 
             if let Event::Render(RenderEvent::RenderRequested {
                 post_id,
@@ -242,7 +411,7 @@ pub fn spawn_renderer(
             }) = env.event
             {
                 if let Err(err) =
-                    handle_render_request(&cmd_tx, &state, post_id, attempt, &config).await
+                    handle_render_request(&cmd_tx, &state, post_id, attempt, &config, &mut image_cache).await
                 {
                     debug_log!("render failed: post_id={} err={}", post_id.0, err);
                 }
@@ -253,15 +422,69 @@ pub fn spawn_renderer(
     })
 }
 
+fn load_state_view_cached() -> StateView {
+    static CACHE: OnceLock<StateView> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let data_dir =
+                std::env::var("OQQWALL_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+            let journal = match LocalJournal::open(&data_dir) {
+                Ok(journal) => journal,
+                Err(err) => {
+                    debug_log!(
+                        "renderer preload skipped: journal open failed: {}",
+                        err
+                    );
+                    return StateView::default();
+                }
+            };
+            let snapshot = match SnapshotStore::open(&data_dir) {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    debug_log!(
+                        "renderer preload skipped: snapshot open failed: {}",
+                        err
+                    );
+                    return StateView::default();
+                }
+            };
+
+            let mut state = StateView::default();
+            let mut cursor = None;
+            match snapshot.load() {
+                Ok(Some(loaded)) => {
+                    state = loaded.state;
+                    cursor = loaded.journal_cursor;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    debug_log!("renderer preload: snapshot load failed: {}", err);
+                }
+            }
+
+            if let Err(err) = journal.replay(cursor, |env| {
+                state = state.reduce(env);
+            }) {
+                debug_log!("renderer preload: journal replay failed: {}", err);
+            }
+
+            state
+        })
+        .clone()
+}
+
 async fn handle_render_request(
     cmd_tx: &mpsc::Sender<Command>,
     state: &StateView,
     post_id: PostId,
     attempt: u32,
     config: &RendererRuntimeConfig,
+    image_cache: &mut ImageMemoryCache,
 ) -> Result<(), String> {
-    let draft = match state.drafts.get(&post_id) {
-        Some(draft) => draft.clone(),
+    let draft = match rebuild_draft_from_state(state, post_id)
+        .or_else(|| state.drafts.get(&post_id).cloned())
+    {
+        Some(draft) => draft,
         None => {
             return send_render_failed(
                 cmd_tx,
@@ -275,16 +498,31 @@ async fn handle_render_request(
 
     let header = extract_header(state, post_id);
     let draft = resolve_forward_draft(&draft, &header, config).await;
-    let image_sources = resolve_image_sources(state, &draft, &header).await;
-    let bytes = match render_png_async(&draft, &header, &image_sources, config).await {
-        Ok(bytes) => bytes,
+    let (image_sources, used_keys) =
+        resolve_image_sources(state, &draft, &header, cmd_tx, image_cache).await;
+    let render_result = render_png_async(&draft, &header, &image_sources, config).await;
+    drop(image_sources);
+    image_cache.release_keys(&used_keys);
+    let bytes = match render_result {
+        Ok(bytes) => {
+            let render_only_blob_ids = collect_post_blob_ids(state, post_id);
+            blob_cache::release_render_only(render_only_blob_ids);
+            bytes
+        }
         Err(err) => {
             return send_render_failed(cmd_tx, post_id, attempt, err).await;
         }
     };
 
     let blob_id = render_blob_id(post_id);
-    let (path, size_bytes) = persist_blob(&config.blob_root, "png", "png", blob_id, &bytes)?;
+    let bytes = blob_cache::store_bytes(
+        blob_id,
+        bytes,
+        CacheKind::Image,
+        CacheRetention::UntilSend,
+        Some("image/png".to_string()),
+    );
+    let (path, size_bytes) = persist_blob(&config.blob_root, "png", "png", blob_id, bytes.as_ref())?;
 
     send_event(
         cmd_tx,
@@ -306,6 +544,37 @@ async fn handle_render_request(
     send_event(cmd_tx, Event::Render(RenderEvent::PngReady { post_id, blob_id })).await?;
 
     Ok(())
+}
+
+fn rebuild_draft_from_state(state: &StateView, post_id: PostId) -> Option<Draft> {
+    let ingress_ids = state.post_ingress.get(&post_id)?;
+    let mut messages = Vec::new();
+    for ingress_id in ingress_ids {
+        if let Some(message) = state.ingress_messages.get(ingress_id) {
+            messages.push(message.clone());
+        }
+    }
+    if messages.is_empty() {
+        return None;
+    }
+    Some(build_draft_from_messages(&messages))
+}
+
+fn collect_post_blob_ids(state: &StateView, post_id: PostId) -> Vec<BlobId> {
+    let Some(ingress_ids) = state.post_ingress.get(&post_id) else {
+        return Vec::new();
+    };
+    let mut blob_ids = Vec::new();
+    for ingress_id in ingress_ids {
+        if let Some(message) = state.ingress_messages.get(ingress_id) {
+            for attachment in &message.attachments {
+                if let MediaReference::Blob { blob_id } = attachment.reference {
+                    blob_ids.push(blob_id);
+                }
+            }
+        }
+    }
+    blob_ids
 }
 
 struct ForwardContext {
@@ -521,13 +790,14 @@ async fn forward_messages_to_blocks(
         let payload = message
             .get("message")
             .or_else(|| message.get("content"));
-        let (text, attachments) = extract_message_lite(payload);
-        let mut text_blocks = expand_forward_in_text(&text, context, depth).await;
+        let extracted = extract_message_lite(payload);
+        let mut text_blocks = expand_forward_in_text(&extracted.text, context, depth).await;
         blocks.append(&mut text_blocks);
-        for attachment in attachments {
+        for attachment in extracted.attachments {
             blocks.push(DraftBlock::Attachment {
                 kind: attachment.kind,
                 reference: attachment.reference,
+                size_bytes: attachment.size_bytes,
             });
         }
     }
@@ -538,6 +808,11 @@ fn extract_header(state: &StateView, post_id: PostId) -> HeaderInfo {
     let mut group_id = "unknown".to_string();
     let mut user_id = "unknown".to_string();
     let mut sender_name = None;
+    let is_anonymous = state
+        .posts
+        .get(&post_id)
+        .map(|meta| meta.is_anonymous)
+        .unwrap_or(false);
     if let Some(ingress_ids) = state.post_ingress.get(&post_id) {
         for ingress_id in ingress_ids {
             if let Some(meta) = state.ingress_meta.get(ingress_id) {
@@ -553,6 +828,7 @@ fn extract_header(state: &StateView, post_id: PostId) -> HeaderInfo {
         user_id,
         post_id_hex: id128_hex(post_id.0),
         sender_name,
+        is_anonymous,
     }
 }
 
@@ -608,13 +884,17 @@ fn render_png(
     let header_text_x = header_x + avatar_size + header_gap;
     let header_text_width = content_width.saturating_sub(avatar_size + header_gap);
 
-    let title_text = header.sender_name.clone().unwrap_or_else(|| {
-        if header.user_id == "unknown" {
-            "OQQWall".to_string()
-        } else {
-            format!("User {}", header.user_id)
-        }
-    });
+    let title_text = if header.is_anonymous {
+        "匿名".to_string()
+    } else {
+        header.sender_name.clone().unwrap_or_else(|| {
+            if header.user_id == "unknown" {
+                "OQQWall".to_string()
+            } else {
+                format!("User {}", header.user_id)
+            }
+        })
+    };
     let title_text = truncate_text(
         &title_text,
         header_text_width,
@@ -623,19 +903,23 @@ fn render_png(
         &mut text_measurer,
         &emoji_cache,
     );
-    let meta_source = if header.user_id == "unknown" {
-        header.post_id_hex.clone()
+    let meta_text = if header.is_anonymous {
+        String::new()
     } else {
-        header.user_id.clone()
+        let meta_source = if header.user_id == "unknown" {
+            header.post_id_hex.clone()
+        } else {
+            header.user_id.clone()
+        };
+        truncate_text(
+            &format!("QQ {}", meta_source),
+            header_text_width,
+            meta_size,
+            font_weight_body,
+            &mut text_measurer,
+            &emoji_cache,
+        )
     };
-    let meta_text = truncate_text(
-        &format!("QQ {}", meta_source),
-        header_text_width,
-        meta_size,
-        font_weight_body,
-        &mut text_measurer,
-        &emoji_cache,
-    );
     debug_log!(
         "render header: title={} meta={} header_text_width={}",
         title_text,
@@ -681,7 +965,11 @@ fn render_png(
                     kind: BlockKind::Text { lines },
                 }
             }
-            DraftBlock::Attachment { kind, reference: _ } => {
+            DraftBlock::Attachment {
+                kind,
+                reference: _,
+                size_bytes,
+            } => {
                 let image = image_sources
                     .block_images
                     .get(block_idx)
@@ -691,7 +979,8 @@ fn render_png(
                     .get(block_idx)
                     .and_then(|value| value.clone());
                 match *kind {
-                    oqqwall_rust_core::MediaKind::Image => {
+                    oqqwall_rust_core::MediaKind::Image
+                    | oqqwall_rust_core::MediaKind::Sticker => {
                         let max_width = (content_width / 2).max(1);
                         let max_height = 300u32;
                         let (width, height) = match image
@@ -750,7 +1039,9 @@ fn render_png(
                             &mut text_measurer,
                             &emoji_cache,
                         );
-                        let meta_line = Some("Size: unknown".to_string());
+                        let meta_line = size_bytes
+                            .as_ref()
+                            .and_then(|size| format_size_line(*size));
                         let name_height = name_lines.len() as u32 * file_line_height;
                         let meta_height = if meta_line.is_some() {
                             file_meta_height + file_meta_gap
@@ -768,6 +1059,7 @@ fn render_png(
                             kind: BlockKind::FileCard {
                                 name_lines,
                                 meta_line,
+                                icon_path: file_icon_path(&filename),
                                 icon_text: file_icon_text(&filename),
                             },
                         }
@@ -979,13 +1271,30 @@ fn render_png(
         }
     }
 
+    let title_baseline = if header.is_anonymous {
+        let center_y = header_y as f32 + avatar_size as f32 / 2.0;
+        if let Some((_, metrics)) = build_line_paragraph(
+            &font_collection,
+            &title_text,
+            title_size,
+            font_weight_title,
+            color_text,
+        ) {
+            center_baseline(center_y, &metrics)
+        } else {
+            title_y as f32
+        }
+    } else {
+        title_y as f32
+    };
+
     draw_text_line(
         canvas,
         &font_collection,
         &mut emoji_cache,
         &title_text,
         header_text_x as f32,
-        title_y as f32,
+        title_baseline,
         title_size,
         font_weight_title,
         color_text,
@@ -1015,6 +1324,7 @@ fn render_png(
 
     let mut face_cache: HashMap<String, ResolvedImage> = HashMap::new();
     let mut face_image_cache: HashMap<String, Option<Image>> = HashMap::new();
+    let mut file_icon_cache: HashMap<&'static str, Option<Image>> = HashMap::new();
 
     for block in blocks {
         match block.kind {
@@ -1302,6 +1612,7 @@ fn render_png(
             BlockKind::FileCard {
                 name_lines,
                 meta_line,
+                icon_path,
                 icon_text,
             } => {
                 let rect = Rect::from_xywh(
@@ -1326,37 +1637,40 @@ fn render_png(
 
                 let icon_x = block.x + block.width.saturating_sub(file_padding + file_icon_size);
                 let icon_y = block.y + (block.height - file_icon_size) / 2;
-                let icon_rect = Rect::from_xywh(
-                    icon_x as f32,
-                    icon_y as f32,
-                    file_icon_size as f32,
-                    file_icon_size as f32,
-                );
-                let icon_rr = RRect::new_rect_xy(icon_rect, 4.0, 4.0);
-                let mut icon_bg = Paint::default();
-                icon_bg.set_color4f(color_bg, None);
-                icon_bg.set_anti_alias(true);
-                canvas.draw_rrect(icon_rr, &icon_bg);
-                let mut icon_border = Paint::default();
-                icon_border.set_color4f(color_border, None);
-                icon_border.set_style(skia_safe::paint::Style::Stroke);
-                icon_border.set_stroke_width(1.0);
-                icon_border.set_anti_alias(true);
-                canvas.draw_rrect(icon_rr, &icon_border);
-
-                let icon_center_x = icon_x + file_icon_size / 2;
-                let icon_center_y = icon_y + file_icon_size / 2;
-                if let Some((paragraph, metrics)) = build_line_paragraph(
-                    &font_collection,
-                    &icon_text,
-                    11,
-                    font_weight_body,
-                    color_meta,
-                ) {
-                    let icon_baseline = center_baseline(icon_center_y as f32, &metrics);
-                    let icon_x = icon_center_x as f32 - metrics.width * 0.5;
-                    let top_y = icon_baseline - metrics.baseline;
-                    paragraph.paint(canvas, (icon_x, top_y));
+                let mut drew_icon = false;
+                if let Some(path) = icon_path {
+                    let icon_image = file_icon_cache
+                        .entry(path)
+                        .or_insert_with(|| {
+                            resolved_image_from_path(path).and_then(|img| decode_image(&img))
+                        });
+                    if let Some(image) = icon_image.as_ref() {
+                        let pad = 2.0f32;
+                        let icon_dst = Rect::from_xywh(
+                            icon_x as f32 + pad,
+                            icon_y as f32 + pad,
+                            (file_icon_size as f32 - pad * 2.0).max(1.0),
+                            (file_icon_size as f32 - pad * 2.0).max(1.0),
+                        );
+                        draw_image_stretch(canvas, image, icon_dst);
+                        drew_icon = true;
+                    }
+                }
+                if !drew_icon {
+                    let icon_center_x = icon_x + file_icon_size / 2;
+                    let icon_center_y = icon_y + file_icon_size / 2;
+                    if let Some((paragraph, metrics)) = build_line_paragraph(
+                        &font_collection,
+                        &icon_text,
+                        11,
+                        font_weight_body,
+                        color_meta,
+                    ) {
+                        let icon_baseline = center_baseline(icon_center_y as f32, &metrics);
+                        let icon_x = icon_center_x as f32 - metrics.width * 0.5;
+                        let top_y = icon_baseline - metrics.baseline;
+                        paragraph.paint(canvas, (icon_x, top_y));
+                    }
                 }
 
                 let text_x = block.x + file_padding;
@@ -1368,11 +1682,11 @@ fn render_png(
                 };
                 let text_height = name_height + meta_height;
                 let content_height = file_icon_size.max(text_height);
-                let text_y =
-                    block.y + file_padding + (content_height - text_height) / 2 + font_size;
+                let text_top = block.y + file_padding + (content_height - text_height) / 2 - 4;
+                let text_baseline = text_top + font_size;
 
                 for (idx, line) in name_lines.iter().enumerate() {
-                    let baseline = text_y + file_line_height.saturating_mul(idx as u32);
+                    let baseline = text_baseline + file_line_height.saturating_mul(idx as u32);
                     draw_text_line(
                         canvas,
                         &font_collection,
@@ -1386,7 +1700,8 @@ fn render_png(
                     );
                 }
                 if let Some(meta) = meta_line {
-                    let meta_y = text_y + name_height + file_meta_gap + file_meta_height;
+                    let meta_font_size = 11u32;
+                    let meta_y = text_top + name_height + file_meta_gap + meta_font_size + 8;
                     draw_text_line(
                         canvas,
                         &font_collection,
@@ -1394,7 +1709,7 @@ fn render_png(
                         &meta,
                         text_x as f32,
                         meta_y as f32,
-                        11,
+                        meta_font_size,
                         font_weight_body,
                         color_muted,
                     );
@@ -1874,7 +2189,7 @@ fn center_baseline(center_y: f32, metrics: &LineMetricsSnapshot) -> f32 {
 fn decode_image(image: &ResolvedImage) -> Option<Image> {
     let bytes = image.bytes.as_ref()?;
     debug_log!("image decode: bytes={}", bytes.len());
-    let data = Data::new_copy(bytes);
+    let data = Data::new_copy(bytes.as_ref());
     Image::from_encoded(data)
 }
 
@@ -1938,60 +2253,94 @@ async fn resolve_image_sources(
     state: &StateView,
     draft: &Draft,
     header: &HeaderInfo,
-) -> RenderImageSources {
-    let mut client = None;
+    cmd_tx: &mpsc::Sender<Command>,
+    image_cache: &mut ImageMemoryCache,
+) -> (RenderImageSources, HashSet<ImageCacheKey>) {
     let mut block_images = vec![None; draft.blocks.len()];
     let mut block_labels = vec![None; draft.blocks.len()];
+    let mut used_keys = HashSet::new();
     for (idx, block) in draft.blocks.iter().enumerate() {
-        if let DraftBlock::Attachment { kind, reference } = block {
-            if *kind == oqqwall_rust_core::MediaKind::Image {
-                block_images[idx] =
-                    resolve_media_reference_for_image(reference, state, &mut client).await;
+        if let DraftBlock::Attachment { kind, reference, .. } = block {
+            if is_renderable_image(*kind) {
+                block_images[idx] = resolve_media_reference_for_image(
+                    reference,
+                    state,
+                    image_cache,
+                    &mut used_keys,
+                );
             } else {
                 block_labels[idx] = resolve_media_reference_for_label(reference, state);
             }
         }
     }
-    let avatar = if header.user_id == "unknown" {
-        None
-    } else {
-        let url = format!(
-            "https://qlogo2.store.qq.com/qzone/{0}/{0}/640",
-            header.user_id
-        );
-        resolve_url_to_image(&url, &mut client).await
-    };
-    RenderImageSources {
-        avatar,
-        block_images,
-        block_labels,
-    }
+    let avatar = resolve_avatar_image(header, cmd_tx, image_cache, &mut used_keys).await;
+    (
+        RenderImageSources {
+            avatar,
+            block_images,
+            block_labels,
+        },
+        used_keys,
+    )
 }
 
-async fn resolve_media_reference_for_image(
-    reference: &oqqwall_rust_core::MediaReference,
+fn resolve_media_reference_for_image(
+    reference: &MediaReference,
     state: &StateView,
-    client: &mut Option<Client>,
+    image_cache: &mut ImageMemoryCache,
+    used_keys: &mut HashSet<ImageCacheKey>,
 ) -> Option<ResolvedImage> {
     match reference {
-        oqqwall_rust_core::MediaReference::Blob { blob_id } => {
+        MediaReference::Blob { blob_id } => {
             debug_log!("media image: blob_id={:?}", blob_id);
-            resolve_blob_image(state, *blob_id)
+            let key = ImageCacheKey::Blob(*blob_id);
+            used_keys.insert(key);
+            image_cache.get_or_load_blob(state, *blob_id)
         }
-        oqqwall_rust_core::MediaReference::RemoteUrl { url } => {
+        MediaReference::RemoteUrl { url } => {
             debug_log!("media image: remote url={}", url);
-            resolve_url_to_image(url, client).await
+            if is_remote_http(url) {
+                debug_log!("image load blocked remote url: {}", url);
+                return None;
+            }
+            let key = ImageCacheKey::Source(url.clone());
+            used_keys.insert(key);
+            image_cache.get_or_load_source(url)
         }
     }
 }
 
 fn resolve_media_reference_for_label(
-    reference: &oqqwall_rust_core::MediaReference,
+    reference: &MediaReference,
     _state: &StateView,
 ) -> Option<String> {
     match reference {
-        oqqwall_rust_core::MediaReference::Blob { .. } => None,
-        oqqwall_rust_core::MediaReference::RemoteUrl { url } => Some(url.clone()),
+        MediaReference::Blob { .. } => None,
+        MediaReference::RemoteUrl { url } => Some(url.clone()),
+    }
+}
+
+fn format_size_line(size_bytes: u64) -> Option<String> {
+    if size_bytes == 0 {
+        return None;
+    }
+    Some(format!("Size: {}", format_bytes(size_bytes)))
+}
+
+fn format_bytes(size_bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut size = size_bytes as f64;
+    let mut unit_idx = 0usize;
+    while size >= 1024.0 && unit_idx + 1 < UNITS.len() {
+        size /= 1024.0;
+        unit_idx += 1;
+    }
+    if unit_idx == 0 {
+        format!("{} {}", size_bytes, UNITS[unit_idx])
+    } else if size >= 10.0 {
+        format!("{:.0} {}", size.round(), UNITS[unit_idx])
+    } else {
+        format!("{:.1} {}", size, UNITS[unit_idx])
     }
 }
 
@@ -2008,41 +2357,91 @@ fn resolve_face_image(id: &str, cache: &mut HashMap<String, ResolvedImage>) -> O
     Some(resolved)
 }
 
-fn resolve_blob_image(state: &StateView, blob_id: oqqwall_rust_core::BlobId) -> Option<ResolvedImage> {
+fn resolve_blob_image(state: &StateView, blob_id: BlobId) -> Option<ResolvedImage> {
+    if let Some(entry) = blob_cache::get_entry(blob_id) {
+        return Some(ResolvedImage::from_arc(entry.bytes));
+    }
     let path = state
         .blobs
         .get(&blob_id)
         .and_then(|meta| meta.persisted_path.clone())?;
     debug_log!("blob image path: blob_id={:?} path={}", blob_id, path);
-    resolved_image_from_path(&path)
+    let bytes = fs::read(path).ok()?;
+    let bytes: Arc<[u8]> = Arc::from(bytes);
+    blob_cache::store_arc(
+        blob_id,
+        bytes.clone(),
+        CacheKind::Image,
+        CacheRetention::UntilSend,
+        None,
+    );
+    Some(ResolvedImage::from_arc(bytes))
 }
 
-async fn resolve_url_to_image(url: &str, client: &mut Option<Client>) -> Option<ResolvedImage> {
-    if url.starts_with("data:") {
-        debug_log!("image load data url");
-        return resolved_image_from_data_url(url);
+async fn resolve_avatar_image(
+    header: &HeaderInfo,
+    cmd_tx: &mpsc::Sender<Command>,
+    image_cache: &mut ImageMemoryCache,
+    used_keys: &mut HashSet<ImageCacheKey>,
+) -> Option<ResolvedImage> {
+    if header.is_anonymous {
+        return resolve_default_avatar(image_cache, used_keys);
     }
-    if let Some(path) = url.strip_prefix("file://") {
+    if let Some(bytes) = avatar_cache::get_avatar_bytes(&header.user_id) {
+        return Some(ResolvedImage::from_arc(bytes));
+    }
+    if let Some((notify, created)) = avatar_cache::ensure_in_flight(&header.user_id) {
+        if created {
+            let _ = send_event(
+                cmd_tx,
+                Event::Media(MediaEvent::AvatarFetchRequested {
+                    user_id: header.user_id.clone(),
+                }),
+            )
+            .await;
+        }
+        if let Some(bytes) =
+            avatar_cache::wait_for_avatar(&header.user_id, notify, AVATAR_FETCH_TIMEOUT).await
+        {
+            return Some(ResolvedImage::from_arc(bytes));
+        }
+    }
+    resolve_default_avatar(image_cache, used_keys)
+}
+
+fn resolve_default_avatar(
+    image_cache: &mut ImageMemoryCache,
+    used_keys: &mut HashSet<ImageCacheKey>,
+) -> Option<ResolvedImage> {
+    let key = ImageCacheKey::Source(DEFAULT_AVATAR_PATH.to_string());
+    used_keys.insert(key);
+    image_cache.get_or_load_source(DEFAULT_AVATAR_PATH)
+}
+
+fn resolve_source_to_image(source: &str) -> Option<ResolvedImage> {
+    if is_remote_http(source) {
+        debug_log!("image load blocked remote url: {}", source);
+        return None;
+    }
+    if source.starts_with("data:") {
+        debug_log!("image load data url");
+        return resolved_image_from_data_url(source);
+    }
+    if source.starts_with("base64://") {
+        debug_log!("image load base64 url");
+        return resolved_image_from_base64_url(source);
+    }
+    if let Some(path) = source.strip_prefix("file://") {
         debug_log!("image load file url: {}", path);
         return resolved_image_from_path(path);
     }
-    if Path::new(url).exists() {
-        debug_log!("image load local path: {}", url);
-        return resolved_image_from_path(url);
+    if source.starts_with("res/") {
+        debug_log!("image load embedded path: {}", source);
+        return resolved_image_from_path(source);
     }
-    if url.starts_with("http://") || url.starts_with("https://") {
-        debug_log!("image load remote: {}", url);
-        if client.is_none() {
-            let built = Client::builder()
-                .timeout(Duration::from_secs(6))
-                .build()
-                .ok()?;
-            *client = Some(built);
-        }
-        let client = client.as_ref()?;
-        if let Some((bytes, _content_type)) = fetch_remote_bytes(client, url).await {
-            return Some(ResolvedImage::from_bytes(bytes));
-        }
+    if Path::new(source).exists() {
+        debug_log!("image load local path: {}", source);
+        return resolved_image_from_path(source);
     }
     None
 }
@@ -2060,6 +2459,11 @@ fn resolved_image_from_path(path: &str) -> Option<ResolvedImage> {
 
 fn resolved_image_from_data_url(url: &str) -> Option<ResolvedImage> {
     let (_mime, bytes) = parse_data_url(url)?;
+    Some(ResolvedImage::from_bytes(bytes))
+}
+
+fn resolved_image_from_base64_url(url: &str) -> Option<ResolvedImage> {
+    let bytes = parse_base64_url(url)?;
     Some(ResolvedImage::from_bytes(bytes))
 }
 
@@ -2082,20 +2486,13 @@ fn parse_data_url(source: &str) -> Option<(Option<String>, Vec<u8>)> {
     Some((mime, bytes))
 }
 
-async fn fetch_remote_bytes(client: &Client, url: &str) -> Option<(Vec<u8>, Option<String>)> {
-    debug_log!("http fetch: {}", url);
-    let response = client.get(url).send().await.ok()?;
-    if !response.status().is_success() {
-        debug_log!("http fetch failed: {}", url);
-        return None;
-    }
-    let content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.to_string());
-    let bytes = response.bytes().await.ok()?.to_vec();
-    Some((bytes, content_type))
+fn parse_base64_url(source: &str) -> Option<Vec<u8>> {
+    let payload = source.strip_prefix("base64://")?;
+    STANDARD.decode(payload).ok()
+}
+
+fn is_remote_http(source: &str) -> bool {
+    source.starts_with("http://") || source.starts_with("https://")
 }
 
 fn extract_filename(url: &str) -> Option<String> {
@@ -2124,6 +2521,48 @@ fn file_icon_text(name: &str) -> String {
     out
 }
 
+fn file_icon_path(name: &str) -> Option<&'static str> {
+    let ext = name
+        .rsplit('.')
+        .next()
+        .filter(|part| *part != name)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let path = match ext.as_str() {
+        "doc" | "docx" => "res/doc.png",
+        "pdf" => "res/pdf.png",
+        "xls" | "xlsx" | "csv" => "res/xls.png",
+        "ppt" | "pptx" => "res/ppt.png",
+        "zip" | "7z" => "res/zip.png",
+        "rar" => "res/rar.png",
+        "txt" | "md" | "log" | "rtf" => "res/txt.png",
+        "mp3" | "wav" | "flac" | "m4a" | "ogg" | "aac" => "res/audio.png",
+        "mp4" | "mov" | "mkv" | "avi" | "flv" | "wmv" => "res/video.png",
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "heic" => {
+            "res/image.png"
+        }
+        "apk" => "res/apk.png",
+        "ipa" => "res/ipa.png",
+        "dmg" => "res/dmg.png",
+        "pkg" => "res/pkg.png",
+        "exe" | "msi" => "res/exe.png",
+        "psd" | "psb" => "res/ps.png",
+        "ai" => "res/ai.png",
+        "sketch" => "res/sketch.png",
+        "xmind" | "mindmap" => "res/mindmap.png",
+        "note" => "res/note.png",
+        "pages" => "res/pages.png",
+        "key" | "keynote" => "res/keynote.png",
+        "numbers" => "res/numbers.png",
+        "rs" | "js" | "ts" | "json" | "yaml" | "yml" | "toml" | "go" | "py" | "java"
+        | "c" | "cc" | "cpp" | "h" | "hpp" | "cs" | "php" | "rb" | "swift" | "kt"
+        | "kts" | "html" | "css" | "scss" | "sh" | "bat" | "ps1" | "sql" => "res/code.png",
+        "" => "res/unknown.png",
+        _ => "res/unknown.png",
+    };
+    Some(path)
+}
+
 fn media_label(kind: oqqwall_rust_core::MediaKind) -> &'static str {
     match kind {
         oqqwall_rust_core::MediaKind::Image => "Image",
@@ -2131,6 +2570,7 @@ fn media_label(kind: oqqwall_rust_core::MediaKind) -> &'static str {
         oqqwall_rust_core::MediaKind::File => "File",
         oqqwall_rust_core::MediaKind::Audio => "Audio",
         oqqwall_rust_core::MediaKind::Other => "Attachment",
+        oqqwall_rust_core::MediaKind::Sticker => "Image",
     }
 }
 
@@ -2139,6 +2579,7 @@ fn media_icon_text(kind: oqqwall_rust_core::MediaKind) -> String {
         oqqwall_rust_core::MediaKind::Video => "VID".to_string(),
         oqqwall_rust_core::MediaKind::Audio => "AUD".to_string(),
         oqqwall_rust_core::MediaKind::Other => "ATT".to_string(),
+        oqqwall_rust_core::MediaKind::Sticker => "IMG".to_string(),
         _ => "FILE".to_string(),
     }
 }

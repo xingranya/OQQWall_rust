@@ -9,7 +9,12 @@ pub struct Draft {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DraftBlock {
     Paragraph { text: String },
-    Attachment { kind: MediaKind, reference: MediaReference },
+    Attachment {
+        kind: MediaKind,
+        reference: MediaReference,
+        #[serde(default)]
+        size_bytes: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +28,8 @@ pub struct IngressAttachment {
     pub kind: MediaKind,
     pub name: Option<String>,
     pub reference: MediaReference,
+    #[serde(default)]
+    pub size_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,4 +45,5 @@ pub enum MediaKind {
     File,
     Audio,
     Other,
+    Sticker,
 }

@@ -1,9 +1,12 @@
 use crate::config::CoreConfig;
-use crate::event::{Event, RenderEvent, ReviewEvent, ScheduleEvent, SendEvent, SendPriority};
-use crate::ids::derive_review_id;
+use crate::event::{
+    Event, ManualEvent, RenderEvent, ReviewDecision, ReviewEvent, ScheduleEvent, SendEvent,
+    SendPriority,
+};
+use crate::ids::{derive_review_id, PostId, ReviewCode, ReviewId};
 use crate::state::StateView;
 
-pub fn decide_driver_event(state: &StateView, event: &Event, _config: &CoreConfig) -> Vec<Event> {
+pub fn decide_driver_event(state: &StateView, event: &Event, config: &CoreConfig) -> Vec<Event> {
     // Driver events come from IO drivers. They must flow into the event stream
     // (reduce/broadcast), otherwise other drivers cannot observe key events like
     // BlobPersisted / RenderReady / MediaFetchSucceeded / SendSucceeded.
@@ -47,6 +50,8 @@ pub fn decide_driver_event(state: &StateView, event: &Event, _config: &CoreConfi
         Event::Send(SendEvent::SendFailed {
             post_id,
             retry_at_ms,
+            attempt,
+            error,
             ..
         }) => {
             let group_id = state
@@ -55,17 +60,80 @@ pub fn decide_driver_event(state: &StateView, event: &Event, _config: &CoreConfi
                 .map(|sending| sending.group_id.clone())
                 .or_else(|| state.posts.get(post_id).map(|meta| meta.group_id.clone()))
                 .unwrap_or_default();
-            vec![Event::Schedule(ScheduleEvent::SendPlanRescheduled {
-                post_id: *post_id,
-                group_id,
-                not_before_ms: *retry_at_ms,
-                priority: SendPriority::Normal,
-                seq: state.next_send_seq,
-            })]
+            let decided_at_ms = state.last_ts_ms.unwrap_or(0);
+            if is_send_timeout_error(error) {
+                return_to_pending(state, *post_id, decided_at_ms)
+            } else {
+                let max_attempts = config.send_max_attempts(&group_id);
+                if max_attempts > 0 && *attempt >= max_attempts {
+                    let reason = format!("send failed after {} attempts: {}", attempt, error);
+                    let mut events = vec![
+                        Event::Send(SendEvent::SendGaveUp {
+                            post_id: *post_id,
+                            reason: reason.clone(),
+                        }),
+                        Event::Manual(ManualEvent::ManualInterventionRequired {
+                            post_id: *post_id,
+                            reason,
+                        }),
+                    ];
+                    events.extend(return_to_pending(state, *post_id, decided_at_ms));
+                    events
+                } else {
+                    vec![Event::Schedule(ScheduleEvent::SendPlanRescheduled {
+                        post_id: *post_id,
+                        group_id,
+                        not_before_ms: *retry_at_ms,
+                        priority: SendPriority::Normal,
+                        seq: state.next_send_seq,
+                    })]
+                }
+            }
+        }
+        Event::Send(SendEvent::SendGaveUp { post_id, .. }) => {
+            let decided_at_ms = state.last_ts_ms.unwrap_or(0);
+            return_to_pending(state, *post_id, decided_at_ms)
         }
         _ => Vec::new(),
     };
 
     out.extend(derived);
     out
+}
+
+fn is_send_timeout_error(error: &str) -> bool {
+    error.starts_with("send timeout")
+}
+
+fn return_to_pending(state: &StateView, post_id: PostId, decided_at_ms: i64) -> Vec<Event> {
+    let Some((review_id, review_code)) = resolve_review_meta(state, post_id) else {
+        return Vec::new();
+    };
+    vec![
+        Event::Review(ReviewEvent::ReviewDecisionRecorded {
+            review_id,
+            decision: ReviewDecision::Deferred,
+            decided_by: "system".to_string(),
+            decided_at_ms,
+        }),
+        Event::Review(ReviewEvent::ReviewInfoSynced {
+            review_id,
+            post_id,
+            review_code,
+        }),
+        Event::Review(ReviewEvent::ReviewPublishRequested { review_id }),
+    ]
+}
+
+fn resolve_review_meta(state: &StateView, post_id: PostId) -> Option<(ReviewId, ReviewCode)> {
+    let review_id = state
+        .posts
+        .get(&post_id)
+        .and_then(|meta| meta.review_id)
+        .or_else(|| {
+            let derived = derive_review_id(&[&post_id.to_be_bytes()]);
+            state.reviews.contains_key(&derived).then_some(derived)
+        })?;
+    let review = state.reviews.get(&review_id)?;
+    Some((review_id, review.review_code))
 }
