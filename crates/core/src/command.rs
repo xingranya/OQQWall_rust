@@ -1,6 +1,6 @@
 use crate::draft::IngressMessage;
 use crate::event::Event;
-use crate::ids::{AuditMsgId, GroupId, ReviewCode, ReviewId, TimestampMs};
+use crate::ids::{AuditMsgId, ExternalCode, GroupId, ReviewCode, ReviewId, TimestampMs};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -84,7 +84,7 @@ pub enum GlobalAction {
     SendInFlightClear,
     BlacklistList,
     BlacklistRemove { sender_id: String },
-    SetExternalNumber { value: u64 },
+    SetExternalNumber { value: ExternalCode },
     QuickReplyList,
     QuickReplyAdd { key: String, text: String },
     QuickReplyDelete { key: String },

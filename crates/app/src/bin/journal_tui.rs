@@ -1855,6 +1855,26 @@ fn summary_parts(event: &Event) -> (&'static str, String) {
                 "Review.QuickReplyRequested",
                 format!("review={} key={}", short_id(*review_id), key),
             ),
+            ReviewEvent::ReviewExternalNumberSet {
+                group_id,
+                next_number,
+            } => (
+                "Review.ExternalNumberSet",
+                format!("group={} next={}", group_id, next_number),
+            ),
+            ReviewEvent::ReviewExternalCodeAssigned {
+                post_id,
+                group_id,
+                external_code,
+            } => (
+                "Review.ExternalCodeAssigned",
+                format!(
+                    "post={} group={} code={}",
+                    short_id(*post_id),
+                    group_id,
+                    external_code
+                ),
+            ),
             ReviewEvent::ReviewInfoSynced {
                 review_id,
                 post_id,

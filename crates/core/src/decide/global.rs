@@ -6,6 +6,7 @@ use crate::event::{
     Event, GroupFlushReason, RenderEvent, ReviewDecision, ReviewEvent, ScheduleEvent, SendEvent,
     SendPriority,
 };
+use crate::ids::ExternalCode;
 use crate::state::StateView;
 
 pub fn decide_global_action(
@@ -63,31 +64,47 @@ pub fn decide_global_action(
             events
         }
         GlobalAction::PendingClear => {
+            let mut pending = state
+                .reviews
+                .iter()
+                .filter_map(|(review_id, review)| {
+                    let is_pending = matches!(
+                        review.decision,
+                        None | Some(ReviewDecision::Deferred)
+                    );
+                    if !is_pending {
+                        return None;
+                    }
+                    let post_meta = state.posts.get(&review.post_id)?;
+                    if post_meta.group_id != cmd.group_id {
+                        return None;
+                    }
+                    Some((
+                        review.review_code,
+                        *review_id,
+                        review.post_id,
+                        post_meta.group_id.clone(),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            pending.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+
+            let mut next_by_group = state.next_external_code_by_group.clone();
             let mut events = Vec::new();
-            for (review_id, review) in &state.reviews {
-                let pending = matches!(
-                    review.decision,
-                    None | Some(ReviewDecision::Deferred)
-                );
-                if !pending {
-                    continue;
-                }
-                let Some(post_meta) = state.posts.get(&review.post_id) else {
-                    continue;
-                };
-                if post_meta.group_id != cmd.group_id {
-                    continue;
-                }
+            for (_, review_id, post_id, group_id) in pending {
                 events.push(Event::Review(ReviewEvent::ReviewDecisionRecorded {
-                    review_id: *review_id,
+                    review_id,
                     decision: ReviewDecision::Deleted,
                     decided_by: cmd.operator_id.clone(),
                     decided_at_ms: cmd.now_ms,
                 }));
-                if state.send_plans.contains_key(&review.post_id) {
-                    events.push(Event::Schedule(ScheduleEvent::SendPlanCanceled {
-                        post_id: review.post_id,
-                    }));
+                if let Some(event) =
+                    maybe_assign_external_code(state, &mut next_by_group, &group_id, post_id)
+                {
+                    events.push(event);
+                }
+                if state.send_plans.contains_key(&post_id) {
+                    events.push(Event::Schedule(ScheduleEvent::SendPlanCanceled { post_id }));
                 }
             }
             events
@@ -108,6 +125,30 @@ pub fn decide_global_action(
                 }),
             ]
         }
+        GlobalAction::SetExternalNumber { value } => vec![Event::Review(
+            ReviewEvent::ReviewExternalNumberSet {
+                group_id: cmd.group_id.clone(),
+                next_number: *value,
+            },
+        )],
         _ => Vec::new(),
     }
+}
+
+fn maybe_assign_external_code(
+    state: &StateView,
+    next_by_group: &mut std::collections::HashMap<String, ExternalCode>,
+    group_id: &str,
+    post_id: crate::ids::PostId,
+) -> Option<Event> {
+    if state.external_code_by_post.contains_key(&post_id) {
+        return None;
+    }
+    let next_code = next_by_group.get(group_id).copied().unwrap_or(1);
+    next_by_group.insert(group_id.to_string(), next_code.saturating_add(1));
+    Some(Event::Review(ReviewEvent::ReviewExternalCodeAssigned {
+        post_id,
+        group_id: group_id.to_string(),
+        external_code: next_code,
+    }))
 }

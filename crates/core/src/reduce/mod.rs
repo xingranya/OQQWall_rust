@@ -354,6 +354,29 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
                 state.update_post_stage(post_id, stage);
             }
         }
+        ReviewEvent::ReviewExternalNumberSet {
+            group_id,
+            next_number,
+        } => {
+            state
+                .next_external_code_by_group
+                .insert(group_id.clone(), *next_number);
+        }
+        ReviewEvent::ReviewExternalCodeAssigned {
+            post_id,
+            group_id,
+            external_code,
+        } => {
+            state.external_code_by_post.insert(*post_id, *external_code);
+            let next_value = external_code.saturating_add(1);
+            let entry = state
+                .next_external_code_by_group
+                .entry(group_id.clone())
+                .or_insert(next_value);
+            if *entry < next_value {
+                *entry = next_value;
+            }
+        }
         ReviewEvent::ReviewCommentAdded { .. }
         | ReviewEvent::ReviewReplyRequested { .. }
         | ReviewEvent::ReviewExpandRequested { .. }

@@ -1,7 +1,7 @@
 use crate::draft::{Draft, IngressMessage};
 use crate::ids::{
-    AccountId, ActorId, AuditMsgId, BlobId, CorrelationId, EventId, GroupId, IngressId, PostId,
-    RemotePostId, ReviewCode, ReviewId, SessionId, TimestampMs,
+    AccountId, ActorId, AuditMsgId, BlobId, CorrelationId, EventId, ExternalCode, GroupId,
+    IngressId, PostId, RemotePostId, ReviewCode, ReviewId, SessionId, TimestampMs,
 };
 use serde::{Deserialize, Serialize};
 
@@ -238,6 +238,15 @@ pub enum ReviewEvent {
     ReviewQuickReplyRequested {
         review_id: ReviewId,
         key: String,
+    },
+    ReviewExternalNumberSet {
+        group_id: GroupId,
+        next_number: ExternalCode,
+    },
+    ReviewExternalCodeAssigned {
+        post_id: PostId,
+        group_id: GroupId,
+        external_code: ExternalCode,
     },
     ReviewInfoSynced {
         review_id: ReviewId,

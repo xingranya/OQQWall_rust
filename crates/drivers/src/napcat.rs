@@ -15,7 +15,7 @@ use oqqwall_rust_core::event::{
     BlobEvent, DraftEvent, Event, IngressEvent, InputStatusKind, MediaEvent, ReviewDecision,
     ReviewEvent, ScheduleEvent, SendEvent, SendPriority,
 };
-use oqqwall_rust_core::ids::{BlobId, IngressId, PostId, ReviewCode, ReviewId};
+use oqqwall_rust_core::ids::{BlobId, ExternalCode, IngressId, PostId, ReviewCode, ReviewId};
 use oqqwall_rust_core::{derive_blob_id, derive_ingress_id, Command, IngressCommand, StateView};
 use oqqwall_rust_infra::{LocalJournal, SnapshotStore};
 use std::path::{Path, PathBuf};
@@ -143,6 +143,7 @@ struct NapCatState {
     post_group: HashMap<PostId, String>,
     post_safe: HashMap<PostId, bool>,
     post_review_code: HashMap<PostId, ReviewCode>,
+    post_external_code: HashMap<PostId, ExternalCode>,
     review_submitter: HashMap<ReviewId, String>,
     send_plans: HashMap<PostId, SendPlanInfo>,
     sending: HashMap<PostId, SendingInfo>,
@@ -264,6 +265,9 @@ fn build_state_from_view(view: &StateView) -> NapCatState {
         if let Some(user_id) = resolve_post_submitter(&state, review.post_id) {
             state.review_submitter.insert(*review_id, user_id);
         }
+    }
+    for (post_id, external_code) in &view.external_code_by_post {
+        state.post_external_code.insert(*post_id, *external_code);
     }
     for (post_id, plan) in &view.send_plans {
         state.send_plans.insert(
@@ -414,6 +418,7 @@ pub fn spawn_napcat_ws(
             let mut bus_task_rx = bus_rx.resubscribe();
             let state_bus = Arc::clone(&state_ref);
             let runtime_bus = runtime.clone();
+            let out_tx_bus = out_tx.clone();
             let bus_task = tokio::spawn(async move {
                 loop {
                     let env = match bus_task_rx.recv().await {
@@ -422,14 +427,20 @@ pub fn spawn_napcat_ws(
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     };
 
-                    let action = build_action_from_event(&runtime_bus, &state_bus, env.event).await;
+                    let action = build_action_from_event(
+                        &runtime_bus,
+                        &state_bus,
+                        &out_tx_bus,
+                        env.event,
+                    )
+                    .await;
                     if let Some(action) = action {
                         debug_log!(
                             "napcat ws outbound action: group_id={} bytes={}",
                             runtime_bus.group_id,
                             action.len()
                         );
-                        let _ = out_tx.send(action).await;
+                        let _ = out_tx_bus.send(action).await;
                     }
                 }
             });
@@ -541,6 +552,7 @@ fn log_ws_connect_error(
 async fn build_action_from_event(
     runtime: &NapCatRuntimeConfig,
     state: &Arc<Mutex<NapCatState>>,
+    out_tx: &mpsc::Sender<String>,
     event: Event,
 ) -> Option<String> {
     match event {
@@ -676,6 +688,15 @@ async fn build_action_from_event(
             }
             None
         }
+        Event::Review(ReviewEvent::ReviewExternalCodeAssigned {
+            post_id,
+            external_code,
+            ..
+        }) => {
+            let mut guard = state.lock().await;
+            guard.post_external_code.insert(post_id, external_code);
+            None
+        }
         Event::Review(ReviewEvent::ReviewPublished {
             review_id,
             audit_msg_id,
@@ -764,7 +785,7 @@ async fn build_action_from_event(
             let Some(audit_group_id) = audit_group_id else {
                 return None;
             };
-            let text = format!("{} 正在发送...", label);
+            let text = format!("{}正在发送...", label);
             let payload = serde_json::json!({
                 "action": "send_group_msg",
                 "params": {
@@ -820,7 +841,7 @@ async fn build_action_from_event(
             account_id,
             ..
         }) => {
-            let (group_id, label, audit_group_id) = {
+            let (group_id, audit_group_id, send_code, submitter_id) = {
                 let mut guard = state.lock().await;
                 let group_id = guard
                     .sending
@@ -828,11 +849,32 @@ async fn build_action_from_event(
                     .map(|info| info.group_id)
                     .or_else(|| guard.post_group.get(&post_id).cloned())
                     .unwrap_or_else(|| runtime.group_id.clone());
-                let label = post_label(&guard, post_id);
-                (group_id, label, runtime.audit_group_id.clone())
+                let send_code = guard
+                    .post_external_code
+                    .get(&post_id)
+                    .map(|code| code.to_string())
+                    .or_else(|| guard.post_review_code.get(&post_id).map(|code| code.to_string()));
+                let submitter_id = resolve_post_submitter(&guard, post_id);
+                (
+                    group_id,
+                    runtime.audit_group_id.clone(),
+                    send_code,
+                    submitter_id,
+                )
             };
             if group_id.is_empty() || group_id != runtime.group_id {
                 return None;
+            }
+            if let (Some(code), Some(user_id)) = (send_code, submitter_id) {
+                let text = format!("#{}已发送", code);
+                let payload = serde_json::json!({
+                    "action": "send_private_msg",
+                    "params": {
+                        "user_id": json_id(&user_id),
+                        "message": message_segments_from_text(&text)
+                    }
+                });
+                let _ = out_tx.send(payload.to_string()).await;
             }
             let Some(audit_group_id) = audit_group_id else {
                 return None;
@@ -2131,10 +2173,13 @@ fn build_pending_list_text(state: &NapCatState, group_id: &str) -> String {
 }
 
 fn post_label(state: &NapCatState, post_id: PostId) -> String {
-    if let Some(code) = state.post_review_code.get(&post_id) {
-        format!("#{}", code)
-    } else {
-        format!("post:{}", id128_hex(post_id.0))
+    let review_code = state.post_review_code.get(&post_id).copied();
+    let external_code = state.post_external_code.get(&post_id).copied();
+    match (external_code, review_code) {
+        (Some(external), Some(review)) => format!("#{}/{}", external, review),
+        (Some(external), None) => format!("#{}", external),
+        (None, Some(review)) => format!("#{}", review),
+        (None, None) => format!("post:{}", id128_hex(post_id.0)),
     }
 }
 

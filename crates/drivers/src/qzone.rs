@@ -18,7 +18,9 @@ use oqqwall_rust_core::draft::{
 use oqqwall_rust_core::event::{
     BlobEvent, DraftEvent, Event, IngressEvent, MediaEvent, RenderEvent, ReviewEvent, SendEvent,
 };
-use oqqwall_rust_core::ids::{BlobId, IngressId, PostId, ReviewCode, ReviewId, TimestampMs};
+use oqqwall_rust_core::ids::{
+    BlobId, ExternalCode, IngressId, PostId, ReviewCode, ReviewId, TimestampMs,
+};
 use oqqwall_rust_core::{build_draft_from_messages, derive_blob_id, Command, StateView};
 use oqqwall_rust_infra::{LocalJournal, SnapshotStore};
 use reqwest::Client;
@@ -126,6 +128,7 @@ struct QzoneState {
     post_anonymous: HashMap<PostId, bool>,
     review_posts: HashMap<ReviewId, PostId>,
     review_codes: HashMap<PostId, ReviewCode>,
+    external_codes: HashMap<PostId, ExternalCode>,
     render_blobs: HashMap<PostId, RenderBlobs>,
 }
 
@@ -212,6 +215,7 @@ fn build_state_from_view(view: &StateView) -> QzoneState {
         state.review_codes.insert(review.post_id, review.review_code);
         state.review_posts.insert(*review_id, review.post_id);
     }
+    state.external_codes = view.external_code_by_post.clone();
 
     for (post_id, render) in &view.render {
         if render.png_blob.is_some() {
@@ -373,6 +377,14 @@ pub fn spawn_qzone_sender(
                         *entry = !*entry;
                     }
                 }
+                Event::Review(ReviewEvent::ReviewExternalCodeAssigned {
+                    post_id,
+                    external_code,
+                    ..
+                }) => {
+                    let mut guard = state.lock().await;
+                    guard.external_codes.insert(post_id, external_code);
+                }
                 Event::Blob(BlobEvent::BlobPersisted { blob_id, path }) => {
                     let mut guard = state.lock().await;
                     guard.blob_paths.insert(blob_id, path);
@@ -420,6 +432,7 @@ pub fn spawn_qzone_sender(
                         let guard = state.lock().await;
                         let publish_text = build_publish_text(
                             post_id,
+                            guard.external_codes.get(&post_id).copied(),
                             guard.review_codes.get(&post_id).copied(),
                             guard.post_ingress.get(&post_id),
                             &guard.ingress_authors,
@@ -993,13 +1006,15 @@ impl QzoneClient {
 
 fn build_publish_text(
     post_id: PostId,
+    external_code: Option<ExternalCode>,
     review_code: Option<ReviewCode>,
     ingress_ids: Option<&Vec<IngressId>>,
     ingress_authors: &HashMap<IngressId, IngressAuthor>,
     post_anonymous: &HashMap<PostId, bool>,
 ) -> String {
-    let code = review_code
+    let code = external_code
         .map(|value| value.to_string())
+        .or_else(|| review_code.map(|value| value.to_string()))
         .unwrap_or_else(|| post_id.0.to_string());
     let mut text = format!("#{}", code);
 

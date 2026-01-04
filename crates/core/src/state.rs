@@ -3,8 +3,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use crate::draft::{Draft, IngressMessage, MediaReference};
 use crate::event::{InputStatusKind, ReviewDecision, SendPriority};
 use crate::ids::{
-    AccountId, AuditMsgId, BlobId, EventId, GroupId, IngressId, PostId, ReviewCode, ReviewId,
-    SessionId, TimestampMs,
+    AccountId, AuditMsgId, BlobId, EventId, ExternalCode, GroupId, IngressId, PostId, ReviewCode,
+    ReviewId, SessionId, TimestampMs,
 };
 use serde::{Deserialize, Serialize};
 
@@ -180,6 +180,10 @@ pub struct StateView {
     pub review_by_code: HashMap<ReviewCode, ReviewId>,
     pub review_by_audit_msg: HashMap<AuditMsgId, ReviewId>,
     pub next_review_code: ReviewCode,
+    #[serde(default)]
+    pub external_code_by_post: HashMap<PostId, ExternalCode>,
+    #[serde(default)]
+    pub next_external_code_by_group: HashMap<GroupId, ExternalCode>,
 
     pub send_plans: HashMap<PostId, SendPlan>,
     pub send_due: BTreeSet<SendDueKey>,
@@ -215,6 +219,8 @@ impl Default for StateView {
             review_by_code: HashMap::new(),
             review_by_audit_msg: HashMap::new(),
             next_review_code: 1,
+            external_code_by_post: HashMap::new(),
+            next_external_code_by_group: HashMap::new(),
             send_plans: HashMap::new(),
             send_due: BTreeSet::new(),
             sending: HashMap::new(),

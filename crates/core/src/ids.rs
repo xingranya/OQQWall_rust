@@ -4,6 +4,7 @@ pub type TimestampMs = i64;
 pub type GroupId = String;
 pub type AccountId = String;
 pub type ReviewCode = u32;
+pub type ExternalCode = u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Id128(pub u128);

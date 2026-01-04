@@ -9,7 +9,7 @@ use crate::event::{
     DraftEvent, Event, IngressEvent, RenderEvent, ReviewDecision, ReviewEvent, ScheduleEvent,
     SendPriority,
 };
-use crate::ids::{IngressId, PostId, ReviewCode, ReviewId};
+use crate::ids::{ExternalCode, IngressId, PostId, ReviewCode, ReviewId};
 use crate::state::StateView;
 
 pub fn decide_review_action(
@@ -51,6 +51,9 @@ pub fn decide_review_action(
                 decided_by: cmd.operator_id.clone(),
                 decided_at_ms: cmd.now_ms,
             })];
+            if let Some(event) = maybe_assign_external_code(state, &group_id, post_id) {
+                events.push(event);
+            }
             if state.send_plans.contains_key(&post_id) {
                 events.push(Event::Schedule(ScheduleEvent::SendPlanCanceled { post_id }));
             }
@@ -75,6 +78,9 @@ pub fn decide_review_action(
                 decided_by: cmd.operator_id.clone(),
                 decided_at_ms: cmd.now_ms,
             })];
+            if let Some(event) = maybe_assign_external_code(state, &group_id, post_id) {
+                events.push(event);
+            }
             if state.send_plans.contains_key(&post_id) {
                 events.push(Event::Schedule(ScheduleEvent::SendPlanCanceled { post_id }));
             }
@@ -174,6 +180,9 @@ fn build_approve_events(
         decided_by: cmd.operator_id.clone(),
         decided_at_ms: cmd.now_ms,
     }));
+    if let Some(event) = maybe_assign_external_code(state, &group_id, post_id) {
+        events.push(event);
+    }
 
     let plan = build_send_plan(state, cmd, config, post_id, group_id, SendPriority::Normal);
     if let Some(event) = plan {
@@ -198,6 +207,9 @@ fn build_immediate_events(
         decided_by: cmd.operator_id.clone(),
         decided_at_ms: cmd.now_ms,
     }));
+    if let Some(event) = maybe_assign_external_code(state, &group_id, post_id) {
+        events.push(event);
+    }
 
     if config.group_config(&group_id).is_some() {
         events.push(Event::Schedule(ScheduleEvent::SendPlanCreated {
@@ -257,6 +269,26 @@ fn build_send_plan(
         not_before_ms,
         priority,
         seq: state.next_send_seq,
+    }))
+}
+
+fn maybe_assign_external_code(
+    state: &StateView,
+    group_id: &str,
+    post_id: PostId,
+) -> Option<Event> {
+    if state.external_code_by_post.contains_key(&post_id) {
+        return None;
+    }
+    let next_code: ExternalCode = state
+        .next_external_code_by_group
+        .get(group_id)
+        .copied()
+        .unwrap_or(1);
+    Some(Event::Review(ReviewEvent::ReviewExternalCodeAssigned {
+        post_id,
+        group_id: group_id.to_string(),
+        external_code: next_code,
     }))
 }
 
