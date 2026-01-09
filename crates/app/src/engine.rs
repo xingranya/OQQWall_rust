@@ -90,16 +90,16 @@ impl Engine {
             let events = decide(&self.state, &cmd, &self.config);
             if !events.is_empty() {
                 debug_log!("engine produced {} event(s)", events.len());
-                for event in &events {
-                    debug_log!("engine event: {:?}", event);
+                for _event in &events {
+                    debug_log!("engine event: {:?}", _event);
                 }
             }
             for event in events {
                 let env = self.envelope(event);
                 let cursor = match self.journal.append(&env) {
                     Ok(cursor) => cursor,
-                    Err(err) => {
-                        debug_log!("journal append failed: {}", err);
+                    Err(_err) => {
+                        debug_log!("journal append failed: {}", _err);
                         return;
                     }
                 };
@@ -137,8 +137,8 @@ impl Engine {
             Ok(None) => {
                 debug_log!("snapshot missing");
             }
-            Err(err) => {
-                debug_log!("snapshot load failed: {}", err);
+            Err(_err) => {
+                debug_log!("snapshot load failed: {}", _err);
             }
         }
 
@@ -147,8 +147,8 @@ impl Engine {
         });
         let outcome = match replay {
             Ok(outcome) => outcome,
-            Err(err) if cursor.is_some() => {
-                debug_log!("journal replay from snapshot cursor failed: {}", err);
+            Err(_err) if cursor.is_some() => {
+                debug_log!("journal replay from snapshot cursor failed: {}", _err);
                 state = StateView::default();
                 last_snapshot_ms = 0;
                 journal
@@ -157,15 +157,15 @@ impl Engine {
                     })
                     .map_err(|err| format!("journal replay failed: {}", err))?
             }
-            Err(err) => return Err(format!("journal replay failed: {}", err)),
+            Err(_err) => return Err(format!("journal replay failed: {}", _err)),
         };
 
-        if let Some(corruption) = &outcome.corruption {
+        if let Some(_corruption) = &outcome.corruption {
             debug_log!(
                 "journal corruption at segment {} offset {}: {}",
-                corruption.segment,
-                corruption.offset,
-                corruption.reason
+                _corruption.segment,
+                _corruption.offset,
+                _corruption.reason
             );
             journal
                 .truncate_tail(outcome.last_cursor)
@@ -208,8 +208,8 @@ impl Engine {
                 self.events_since_snapshot = 0;
                 debug_log!("snapshot saved: ts_ms={}", now);
             }
-            Err(err) => {
-                debug_log!("snapshot write failed: {}", err);
+            Err(_err) => {
+                debug_log!("snapshot write failed: {}", _err);
             }
         }
     }

@@ -19,6 +19,12 @@ pub fn decide_ingress(state: &StateView, cmd: &IngressCommand, config: &CoreConf
             reason: IngressIgnoreReason::Duplicate,
         })];
     }
+    if is_blacklisted(state, &cmd.group_id, &cmd.user_id) {
+        return vec![Event::Ingress(IngressEvent::MessageIgnored {
+            ingress_id,
+            reason: IngressIgnoreReason::Blacklisted,
+        })];
+    }
 
     let close_at_ms = initial_close_at(state, cmd, config);
     let key = SessionKey {
@@ -94,4 +100,12 @@ fn initial_close_at(state: &StateView, cmd: &IngressCommand, config: &CoreConfig
         .map(|status_ms| status_ms.max(cmd.received_at_ms))
         .unwrap_or(cmd.received_at_ms);
     last_activity_ms.saturating_add(wait_ms.saturating_mul(multiplier))
+}
+
+fn is_blacklisted(state: &StateView, group_id: &str, user_id: &str) -> bool {
+    state
+        .blacklist
+        .get(group_id)
+        .map(|entries| entries.contains_key(user_id))
+        .unwrap_or(false)
 }

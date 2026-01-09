@@ -410,10 +410,10 @@ pub fn spawn_renderer(
                 ..
             }) = env.event
             {
-                if let Err(err) =
+                if let Err(_err) =
                     handle_render_request(&cmd_tx, &state, post_id, attempt, &config, &mut image_cache).await
                 {
-                    debug_log!("render failed: post_id={} err={}", post_id.0, err);
+                    debug_log!("render failed: post_id={} err={}", post_id.0, _err);
                 }
             }
         }
@@ -430,20 +430,20 @@ fn load_state_view_cached() -> StateView {
                 std::env::var("OQQWALL_DATA_DIR").unwrap_or_else(|_| "data".to_string());
             let journal = match LocalJournal::open(&data_dir) {
                 Ok(journal) => journal,
-                Err(err) => {
+                Err(_err) => {
                     debug_log!(
                         "renderer preload skipped: journal open failed: {}",
-                        err
+                        _err
                     );
                     return StateView::default();
                 }
             };
             let snapshot = match SnapshotStore::open(&data_dir) {
                 Ok(snapshot) => snapshot,
-                Err(err) => {
+                Err(_err) => {
                     debug_log!(
                         "renderer preload skipped: snapshot open failed: {}",
-                        err
+                        _err
                     );
                     return StateView::default();
                 }
@@ -457,15 +457,15 @@ fn load_state_view_cached() -> StateView {
                     cursor = loaded.journal_cursor;
                 }
                 Ok(None) => {}
-                Err(err) => {
-                    debug_log!("renderer preload: snapshot load failed: {}", err);
+                Err(_err) => {
+                    debug_log!("renderer preload: snapshot load failed: {}", _err);
                 }
             }
 
-            if let Err(err) = journal.replay(cursor, |env| {
+            if let Err(_err) = journal.replay(cursor, |env| {
                 state = state.reduce(env);
             }) {
-                debug_log!("renderer preload: journal replay failed: {}", err);
+                debug_log!("renderer preload: journal replay failed: {}", _err);
             }
 
             state
@@ -743,8 +743,8 @@ async fn forward_blocks_for_id(
 
     let resolved = match fetch_forward_messages(context, forward_id).await {
         Ok(messages) => forward_messages_to_blocks(&messages, context, depth + 1).await,
-        Err(err) => {
-            debug_log!("forward resolve failed: id={} err={}", forward_id, err);
+        Err(_err) => {
+            debug_log!("forward resolve failed: id={} err={}", forward_id, _err);
             vec![DraftBlock::Paragraph {
                 text: forward_placeholder(forward_id),
             }]
@@ -1101,17 +1101,17 @@ fn render_png(
             }
         };
         match &layout.kind {
-            BlockKind::Text { lines } => {
+            BlockKind::Text { lines: _lines } => {
                 debug_log!(
                     "layout block: idx={} kind=text width={} height={} lines={}",
                     block_idx,
                     layout.width,
                     layout.height,
-                    lines.len()
+                    _lines.len()
                 );
             }
             BlockKind::Image { image } => {
-                let size = image
+                let _size = image
                     .as_ref()
                     .and_then(|img| img.width.zip(img.height));
                 debug_log!(
@@ -1119,26 +1119,33 @@ fn render_png(
                     block_idx,
                     layout.width,
                     layout.height,
-                    size
+                    _size
                 );
             }
-            BlockKind::MediaCard { lines, media_kind, .. } => {
+            BlockKind::MediaCard {
+                lines: _lines,
+                media_kind: _media_kind,
+                ..
+            } => {
                 debug_log!(
                     "layout block: idx={} kind=media width={} height={} lines={} media_kind={:?}",
                     block_idx,
                     layout.width,
                     layout.height,
-                    lines.len(),
-                    media_kind
+                    _lines.len(),
+                    _media_kind
                 );
             }
-            BlockKind::FileCard { name_lines, .. } => {
+            BlockKind::FileCard {
+                name_lines: _name_lines,
+                ..
+            } => {
                 debug_log!(
                     "layout block: idx={} kind=file width={} height={} name_lines={}",
                     block_idx,
                     layout.width,
                     layout.height,
-                    name_lines.len()
+                    _name_lines.len()
                 );
             }
         }
@@ -3131,7 +3138,7 @@ async fn send_render_failed(
     attempt: u32,
     error: String,
 ) -> Result<(), String> {
-    let retry_at_ms = now_ms().saturating_add(10_000);
+    let retry_at_ms = now_ms().saturating_add(render_retry_delay_ms(attempt));
     let event = RenderEvent::RenderFailed {
         post_id,
         attempt,
@@ -3139,6 +3146,14 @@ async fn send_render_failed(
         error,
     };
     send_event(cmd_tx, Event::Render(event)).await
+}
+
+fn render_retry_delay_ms(attempt: u32) -> i64 {
+    let base = 10_000i64;
+    let max = 300_000i64;
+    let shift = attempt.saturating_sub(1).min(10);
+    let delay = base.saturating_mul(1_i64 << shift);
+    delay.min(max)
 }
 
 fn now_ms() -> i64 {
@@ -3169,8 +3184,8 @@ fn init_font_bytes_cache(font_dir: &Path) {
                 }
                 match fs::read(&path) {
                     Ok(bytes) => fonts.push(FontBytes { path, bytes }),
-                    Err(err) => {
-                        debug_log!("font cache read failed: {} err={}", path.display(), err);
+                    Err(_err) => {
+                        debug_log!("font cache read failed: {} err={}", path.display(), _err);
                     }
                 }
             }
@@ -3188,10 +3203,10 @@ fn build_font_collection(font_dir: &Path) -> FontCollection {
     let mut asset_mgr = TypefaceFontProvider::new();
     let sys_mgr = skia_safe::FontMgr::new();
     debug_log!("font init: font_dir={}", font_dir.display());
-    let embedded_count = register_embedded_fonts(&mut asset_mgr, &sys_mgr);
-    debug_log!("font init: embedded_fonts={}", embedded_count);
+    let _embedded_count = register_embedded_fonts(&mut asset_mgr, &sys_mgr);
+    debug_log!("font init: embedded_fonts={}", _embedded_count);
     if let Some(fonts) = font_bytes_cache() {
-        let mut disk_count = 0usize;
+        let mut _disk_count = 0usize;
         for font in fonts {
             let ext = font
                 .path
@@ -3204,23 +3219,23 @@ fn build_font_collection(font_dir: &Path) -> FontCollection {
             }
             if let Some(tf) = sys_mgr.new_from_data(&font.bytes, 0) {
                 let alias = font_alias_for_path(&font.path);
-                let family = tf.family_name();
+                let _family = tf.family_name();
                 debug_log!(
                     "font disk load: path={} family={} alias={:?}",
                     font.path.display(),
-                    family,
+                    _family,
                     alias
                 );
                 register_typeface_with_alias(&mut asset_mgr, tf, alias);
-                disk_count += 1;
+                _disk_count += 1;
             } else {
                 debug_log!("font disk load failed: {}", font.path.display());
             }
         }
-        debug_log!("font init: disk_fonts={}", disk_count);
+        debug_log!("font init: disk_fonts={}", _disk_count);
     } else if font_dir.exists() {
         if let Ok(entries) = fs::read_dir(font_dir) {
-            let mut disk_count = 0usize;
+            let mut _disk_count = 0usize;
             for entry in entries.flatten() {
                 let path = entry.path();
                 let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("");
@@ -3231,15 +3246,15 @@ fn build_font_collection(font_dir: &Path) -> FontCollection {
                 if let Ok(bytes) = fs::read(&path) {
                     if let Some(tf) = sys_mgr.new_from_data(&bytes, 0) {
                         let alias = font_alias_for_path(&path);
-                        let family = tf.family_name();
+                        let _family = tf.family_name();
                         debug_log!(
                             "font disk load: path={} family={} alias={:?}",
                             path.display(),
-                            family,
+                            _family,
                             alias
                         );
                         register_typeface_with_alias(&mut asset_mgr, tf, alias);
-                        disk_count += 1;
+                        _disk_count += 1;
                     } else {
                         debug_log!("font disk load failed: {}", path.display());
                     }
@@ -3247,7 +3262,7 @@ fn build_font_collection(font_dir: &Path) -> FontCollection {
                     debug_log!("font disk read failed: {}", path.display());
                 }
             }
-            debug_log!("font init: disk_fonts={}", disk_count);
+            debug_log!("font init: disk_fonts={}", _disk_count);
         }
     } else {
         debug_log!("font dir not found: {}", font_dir.display());
@@ -3283,11 +3298,11 @@ fn register_embedded_fonts(
         }
         if let Some(tf) = sys_mgr.new_from_data(entry.bytes, 0usize) {
             let alias = font_alias_for_path(path);
-            let family = tf.family_name();
+            let _family = tf.family_name();
             debug_log!(
                 "embedded font load: path={} family={} alias={:?} bytes={}",
                 entry.path,
-                family,
+                _family,
                 alias,
                 entry.bytes.len()
             );
@@ -3324,8 +3339,8 @@ fn embedded_bytes_for_path(path: &Path) -> Option<&'static [u8]> {
         }
     };
     let found = embedded_resource_bytes(&rel);
-    if let Some(bytes) = found {
-        debug_log!("embedded lookup hit: {} bytes={}", rel, bytes.len());
+    if let Some(_bytes) = found {
+        debug_log!("embedded lookup hit: {} bytes={}", rel, _bytes.len());
     } else {
         debug_log!("embedded lookup miss: {}", rel);
     }

@@ -64,8 +64,8 @@ pub fn spawn_media_fetcher(
     tokio::spawn(async move {
         let client = match Client::builder().timeout(runtime.timeout).build() {
             Ok(client) => client,
-            Err(err) => {
-                debug_log!("media fetcher init failed: {}", err);
+            Err(_err) => {
+                debug_log!("media fetcher init failed: {}", _err);
                 return;
             }
         };
@@ -165,8 +165,8 @@ async fn prime_avatar_cache(client: Client, user_id: String) {
     };
     let resp = match client.get(&url).send().await {
         Ok(resp) => resp,
-        Err(err) => {
-            debug_log!("avatar fetch failed: {}: {}", user_id, err);
+        Err(_err) => {
+            debug_log!("avatar fetch failed: {}: {}", user_id, _err);
             avatar_cache::finish_fetch(&user_id);
             return;
         }
@@ -182,8 +182,8 @@ async fn prime_avatar_cache(client: Client, user_id: String) {
     }
     let bytes = match resp.bytes().await {
         Ok(bytes) => bytes,
-        Err(err) => {
-            debug_log!("avatar read failed: {}: {}", user_id, err);
+        Err(_err) => {
+            debug_log!("avatar read failed: {}: {}", user_id, _err);
             avatar_cache::finish_fetch(&user_id);
             return;
         }
@@ -232,6 +232,8 @@ async fn handle_fetch(
 
     let blob_id = derive_attachment_blob_id(ingress_id, attachment_index);
     let mut attempt = initial_attempt.max(1);
+    let mut local_attempt = 1u32;
+    let max_attempts = runtime.max_attempts.max(1);
     loop {
         match fetch_bytes(&client, &url).await {
             Ok(fetched) => {
@@ -289,7 +291,7 @@ async fn handle_fetch(
                 break;
             }
             Err(err) => {
-                if attempt >= runtime.max_attempts {
+                if local_attempt >= max_attempts {
                     let _ = send_media_failed(
                         &cmd_tx,
                         ingress_id,
@@ -310,6 +312,7 @@ async fn handle_fetch(
                 );
                 sleep(Duration::from_millis(delay_ms as u64)).await;
                 attempt = attempt.saturating_add(1);
+                local_attempt = local_attempt.saturating_add(1);
             }
         }
     }

@@ -9,7 +9,7 @@ mkdir -p "${target_dir}"
 lock_dir="${target_dir}/.zip_texts.${PPID}.lock"
 
 if mkdir "${lock_dir}" 2>/dev/null; then
-  python3 "${script_dir}/zip_texts.py" "${repo_root}" "${target_dir}/text-files.zip"
+    python3 "${script_dir}/zip_texts.py" "${repo_root}" "${target_dir}/text-files.zip"
 fi
 
 rustc="$1"

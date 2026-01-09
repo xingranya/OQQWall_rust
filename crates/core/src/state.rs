@@ -81,6 +81,10 @@ fn default_true() -> bool {
 pub struct RenderMeta {
     pub png_blob: Option<BlobId>,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub last_attempt: u32,
+    #[serde(default)]
+    pub retry_at_ms: Option<TimestampMs>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +98,25 @@ pub struct ReviewMeta {
     pub needs_republish: bool,
     pub decided_by: Option<String>,
     pub decided_at_ms: Option<TimestampMs>,
+    #[serde(default)]
+    pub publish_retry_at_ms: Option<TimestampMs>,
+    #[serde(default)]
+    pub publish_last_error: Option<String>,
+    #[serde(default)]
+    pub publish_attempt: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MediaFetchKey {
+    pub ingress_id: IngressId,
+    pub attachment_index: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaFetchMeta {
+    pub attempt: u32,
+    pub retry_at_ms: Option<TimestampMs>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +187,8 @@ pub struct StateView {
     pub ingress_seen: HashSet<IngressId>,
     pub ingress_meta: HashMap<IngressId, IngressMeta>,
     pub ingress_messages: HashMap<IngressId, IngressMessage>,
+    #[serde(default)]
+    pub media_fetch: HashMap<MediaFetchKey, MediaFetchMeta>,
     pub input_status: HashMap<SessionKey, InputStatusMeta>,
 
     pub sessions: HashMap<SessionId, SessionMeta>,
@@ -184,6 +209,8 @@ pub struct StateView {
     pub external_code_by_post: HashMap<PostId, ExternalCode>,
     #[serde(default)]
     pub next_external_code_by_group: HashMap<GroupId, ExternalCode>,
+    #[serde(default)]
+    pub blacklist: HashMap<GroupId, HashMap<String, Option<String>>>,
 
     pub send_plans: HashMap<PostId, SendPlan>,
     pub send_due: BTreeSet<SendDueKey>,
@@ -206,6 +233,7 @@ impl Default for StateView {
             ingress_seen: HashSet::new(),
             ingress_meta: HashMap::new(),
             ingress_messages: HashMap::new(),
+            media_fetch: HashMap::new(),
             input_status: HashMap::new(),
             sessions: HashMap::new(),
             session_by_key: HashMap::new(),
@@ -221,6 +249,7 @@ impl Default for StateView {
             next_review_code: 1,
             external_code_by_post: HashMap::new(),
             next_external_code_by_group: HashMap::new(),
+            blacklist: HashMap::new(),
             send_plans: HashMap::new(),
             send_due: BTreeSet::new(),
             sending: HashMap::new(),
@@ -260,5 +289,9 @@ impl StateView {
                 attachment.reference = MediaReference::Blob { blob_id };
             }
         }
+        self.media_fetch.remove(&MediaFetchKey {
+            ingress_id,
+            attachment_index: idx,
+        });
     }
 }

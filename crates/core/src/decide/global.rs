@@ -131,6 +131,12 @@ pub fn decide_global_action(
                 next_number: *value,
             },
         )],
+        GlobalAction::BlacklistRemove { sender_id } => vec![Event::Review(
+            ReviewEvent::ReviewBlacklistRemoved {
+                group_id: cmd.group_id.clone(),
+                sender_id: sender_id.clone(),
+            },
+        )],
         _ => Vec::new(),
     }
 }

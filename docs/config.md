@@ -61,62 +61,44 @@
 
 ---
 
-## 3. 字段命名规范与“别名”兼容策略（非常重要）
-
-原版很多 key 用 `-`（例如 `force_chromium_no-sandbox`），你当前 JSON 样例用 snake_case（例如 `force_chromium_no_sandbox`）。
-
-**Rust 版规范：配置 JSON 内推荐统一 snake_case**，并通过 `alias` 兼容旧 key：
-
-* `force_chromium_no_sandbox` 兼容 `force_chromium_no-sandbox`（原版 `preprocess.sh` 读取的是带 `-` 的 key）
-* `process_waittime_sec` 兼容 `process_waittime`（原版键名；冲突处理见下）
-
-实现建议（Rust / serde）：
-
-* 使用 `#[serde(alias="force_chromium_no-sandbox")]`、`#[serde(alias="process_waittime")]`
-* 对布尔/数字做“宽松解析”：允许 `"false"`/`false`、`"3"`/`3`（你的样例里大量数值与 bool 是字符串）
-
----
-
-## 4. common（全局配置）字段说明
+## 3. common（全局配置）字段说明
 
 > 原版 TUI 给出全局配置键的提示集合（TOOLTIPS）以及固定顺序（ORDER）
 > Rust 版可以“按这个集合为主”，并允许未来扩展字段（未知字段保留在 `extra`）。
 
-### 4.1 字段表
+### 3.1 字段表
 
-| JSON Key (snake_case)        | 兼容别名                         |     类型 |                默认 | 当前支持状态             | 原版语义/参考                                               |
-| ---------------------------- | ---------------------------- | -----: | ----------------: | ------------------ | ----------------------------------------------------- |
-| manage_napcat_internal       | manage_napcat_internal       |   bool |             false | 不再支持               | 是否由系统内部管理 NapCat/QQ（原版有同名配置提示）                        |
-| renewcookies_use_napcat      | renewcookies_use_napcat      |   bool |              true | 未支持               | 续 cookies 逻辑使用 NapCat 版本/非 NapCat 版本（原版提示）            |
-| max_attempts_qzone_autologin | max_attempts_qzone_autologin |    u32 |                 3 | 未支持               | sendcontrol 默认 3 次并校验数字                               |
-| at_unprived_sender           | at_unprived_sender           |   bool |             false | 未支持               | 发件时是否 @ 非匿名的投稿人（sendcontrol 读取此 key）                |
-| friend_request_window_sec    | friend_request_window_sec    |    u32 |               300 | 未支持               | 好友请求/私聊抑制窗口（原版 TUI 提示）                                |
-| use_web_review               | use_web_review               |   bool |             false | 未支持               | 是否启用网页审核面板（原版提示）                                      |
-| web_review_port              | web_review_port              |    u16 |             10923 | 未支持               | 网页审核监听端口（原版提示）                                        |
-| napcat_ws_url                | napcat_ws_url                | string |                "" | 已支持               | 作为默认 NapCat WS 地址（当组内未配置时兜底）                             |
-| napcat_access_token          | napcat_access_token          | string |                "" | 已支持               | 作为默认 NapCat token（可被 `OQQWALL_NAPCAT_TOKEN` 覆盖）             |
-| tz_offset_minutes            | tz_offset_minutes            |    i32 |                 0 | 已支持               | 时区偏移（分钟，用于 schedule/defer 计算）                           |
-| min_interval_ms              | min_interval_sec             |    u32 |                 0 | 已支持               | 发送最小间隔（毫秒/秒）                                            |
-| max_queue                    | max_post_stack               |    u32 |                 0 | 已支持               | 发送队列上限（=0 表示不限制，等价兼容 max_post_stack）                |
-| send_timeout_ms              | send_timeout_sec/send_timeout |    u32 |            300000 | 已支持               | 发送超时（毫秒/秒）                                               |
-| send_max_attempts            | max_send_attempts/max_send_attempt |    u32 |                 3 | 已支持               | 发送失败最大重试次数                                             |
-| max_cache_mb                 | max_cache_mb                 |    u32 |               256 | 已支持               | 内存图片缓存上限（MB），超限时优先淘汰大文件缓存                          |
-| process_waittime_sec         | process_waittime             |    u32 |                20 | 已支持（支持 ms/sec/旧字段） | 原版 `preprocess.sh` 读取 `process_waittime`（秒）           |
+| JSON Key (snake_case)        |     类型 |                默认 | 当前支持状态             | 原版语义/参考                                               |
+| ---------------------------- | -----: | ----------------: | ------------------ | ----------------------------------------------------- |
+| manage_napcat_internal       |   bool |             false | 不再支持               | 是否由系统内部管理 NapCat/QQ（原版有同名配置提示）                        |
+| renewcookies_use_napcat      |   bool |              true | 未支持               | 续 cookies 逻辑使用 NapCat 版本/非 NapCat 版本（原版提示）            |
+| max_attempts_qzone_autologin |    u32 |                 3 | 未支持               | sendcontrol 默认 3 次并校验数字                               |
+| friend_request_window_sec    |    u32 |               300 | 已支持               | 好友请求/私聊抑制窗口（原版 TUI 提示）                                |
+| use_web_review               |   bool |             false | 未支持               | 是否启用网页审核面板（原版提示）                                      |
+| web_review_port              |    u16 |             10923 | 未支持               | 网页审核监听端口（原版提示）                                        |
+| napcat_ws_url                | string |                "" | 已支持               | 作为默认 NapCat WS 地址（当组内未配置时兜底）                             |
+| napcat_access_token          | string |                "" | 已支持               | 作为默认 NapCat token（可被 `OQQWALL_NAPCAT_TOKEN` 覆盖）             |
+| tz_offset_minutes            |    i32 |                 0 | 已支持               | 时区偏移（分钟，用于 schedule/defer 计算）                           |
+| min_interval_ms              |    u32 |                 0 | 已支持               | 发送最小间隔（毫秒）                                             |
+| max_queue                    |    u32 |                 0 | 已支持               | 发送队列上限（=0 表示不限制）                                     |
+| max_image_number_one_post    |    u32 |                30 | 已支持               | 单条最大图片数；超限会拆分发送，并触发暂存区 flush                       |
+| send_timeout_ms              |    u32 |            300000 | 已支持               | 发送超时（毫秒）                                               |
+| send_max_attempts            |    u32 |                 3 | 已支持               | 发送失败最大重试次数                                             |
+| max_cache_mb                 |    u32 |               256 | 已支持               | 内存图片缓存上限（MB），超限时优先淘汰大文件缓存                          |
+| process_waittime_sec         |    u32 |                20 | 已支持               | 原版 `preprocess.sh` 读取该值（秒）                           |
 
-关于 `process_waittime_sec` / `process_waittime`：
-支持 `process_waittime_ms` / `process_waittime_sec` / `process_waittime`，分别按毫秒/秒/秒解析，优先级依次覆盖。
-### 4.2 环境变量覆盖优先级（推荐）
+### 3.2 环境变量覆盖优先级（推荐）
 
 * `OQQWALL_NAPCAT_TOKEN` > `groups.<id>.napcat_access_token`（全局覆盖所有组）
 * `OQQWALL_NAPCAT_WS_URL` > `groups.<id>.napcat_ws_url`（全局覆盖所有组）
 
 ---
 
-## 5. groups（账号组配置）字段说明
+## 4. groups（账号组配置）字段说明
 
 > 原版 TUI 列出了组配置键顺序（GROUP_CONFIG_ORDER），覆盖了主要字段：mangroupid/mainqqid/阈值/send_schedule/quick_replies/admins 。
 
-### 5.1 字段表（每个 group 对象）
+### 4.1 字段表（每个 group 对象）
 
 | JSON Key                  |                         类型 | 默认/规则            | 当前支持状态                 | 原版行为/参考                                                         |
 | ------------------------- | -------------------------: | ---------------- | ---------------------- | --------------------------------------------------------------- |
@@ -125,16 +107,17 @@
 | napcat_access_token       |                     string | 必填（可 env 覆盖）   | 已支持                   | 本组 NapCat token；可用 `OQQWALL_NAPCAT_TOKEN` 覆盖                 |
 | mainqqid                  |                     string | 必填               | 已支持                   | 主账号 QQ 号，用于组归属等                                                 |
 | minorqqid                 |              array[string] | 可空               | 已支持                   | 副账号 QQ 列表                                                       |
-| max_post_stack            |                        int | 默认 1；只允许正整数（1 表示单条直接发送，>1 启用暂存堆栈） | 已支持（映射 max_queue） | sendcontrol 对此字段做默认值与数字校验                                       |
-| max_image_number_one_post |                        int | 默认 30；只允许正整数     | 未支持                   | sendcontrol 同样校验并默认                                             |
+| max_post_stack            |                        int | 默认 1；只允许正整数（1 表示单条直接发送，>1 启用暂存堆栈） | 已支持                   | sendcontrol 对此字段做默认值与数字校验                                       |
+| max_image_number_one_post |                        int | 默认 30；只允许正整数     | 已支持                   | 单条最大图片数；超限会拆分发送，并触发暂存区 flush                       |
 | individual_image_in_posts |                       bool | 默认 true          | 未支持                   | preprocess 缺省为 true，决定是否把用户原图也发送到空间（否则只发送概览图）                  |
+| at_unprived_sender           | at_unprived_sender           |   bool |             false | 已支持               | 发件时是否 @ 非匿名的投稿人（sendcontrol 读取此 key）                |
 | send_schedule             |             array["HH:MM"] | 默认空（不启用定时 flush） | 已支持                   | sendcontrol scheduler 从该字段读出 HH:MM 列表并按分钟触发 flush；同一时间点当日只触发一次  |
 | watermark_text            |                     string | 默认 ""            | 未支持                   | 用于渲染/展示（Rust 可保留用于渲染主题）                                    |
-| friend_add_message        |                     string | 默认 ""            | 未支持                   | 用于自动通过好友申请后发送文本（你样例包含）                                        |
+| friend_add_message        |                     string | 默认 ""            | 已支持                   | 用于自动通过好友申请后发送文本（你样例包含）                                        |
 | quick_replies             |     object{string->string} | 默认 {}            | 未支持                   | 用于快捷回复              |
 | admins                    | array[{username,password}] | 默认 []            | 未支持                   | 用于 web_review 管理员）                                      |
 
-### 5.2 send_schedule 的语义（必须写清楚）
+### 4.2 send_schedule 的语义（必须写清楚）
 
 * `send_schedule` 是一组 **每日 HH:MM** 时间点（例如 `"15:05"`、`"23:55"`）
 * sendcontrol 的 scheduler 每分钟 tick，一旦当前 `nowHM == HH:MM` 则触发 `flush_staged_posts`，并创建当日 markfile，保证**同日同时间只触发一次**。
@@ -146,9 +129,9 @@ Rust 版落地建议：
 
 ---
 
-## 6. 配置读取、校验、归一化（Rust 实现建议）
+## 5. 配置读取、校验、归一化（Rust 实现建议）
 
-### 6.1 两阶段配置模型
+### 5.1 两阶段配置模型
 
 1. `ConfigRaw`：serde 直接反序列化 JSON（宽松类型：string/bool/number 都能收）
 2. `EffectiveConfig`：归一化后的强类型配置（bool/u32/u16、时间解析、端口解析、派生结构）
@@ -160,16 +143,16 @@ Rust 版落地建议：
 * 解析 `send_schedule`：`HH:MM` 校验并转换为 `minutes_of_day`（0..1439）
 * 应用默认值（参考原版 defaults：sendcontrol 的默认 max_attempts/max_post_stack/max_image_number 等）
 
-### 6.2 校验失败策略（建议）
+### 5.2 校验失败策略（建议）
 
 * **启动时**：关键字段缺失（如 napcat_ws_url、napcat_access_token、mangroupid、mainqqid）→ 直接报错退出
 * **热更新时**：新配置解析失败 → 保留旧 `EffectiveConfig`，并发出告警/日志
 
 ---
 
-## 7. 配置“读取与传递”设计（不硬编码、可热更新）
+## 6. 配置“读取与传递”设计（不硬编码、可热更新）
 
-### 7.1 组件：ConfigManager（shell 层）
+### 6.1 组件：ConfigManager（shell 层）
 
 职责：
 
@@ -178,7 +161,7 @@ Rust 版落地建议：
 * 提供 `ConfigHandle`：`ArcSwap<EffectiveConfig>`（或 `Arc<RwLock<..>>`，但 ArcSwap 更偏函数式快照）
 * 可选：监控文件变更（notify crate）或支持 `SIGHUP` 触发 reload
 
-### 7.2 与事件系统的集成（推荐）
+### 6.2 与事件系统的集成（推荐）
 
 * 引擎启动时：把 `EffectiveConfig` 注入到 Engine（不进 reducer）
 * 每次 reload 成功后：append 一个 `ConfigApplied { config_version, config_blob }` 事件
@@ -191,14 +174,14 @@ Rust 版落地建议：
 
 > 这样：配置既“不硬编码”，又不会把大 JSON 混进 StateView（避免回放膨胀），同时仍能用事件记录“某时刻应用了什么配置版本”。
 
-### 7.3 drivers 如何拿到配置
+### 6.3 drivers 如何拿到配置
 
 * drivers 通过 `ConfigHandle.load()` 获取最新 `Arc<EffectiveConfig>` 快照
 * 对“必须一致的请求”：driver 在处理 `XxxRequested` 事件时，应使用事件内的参数为准（例如 retry_at / not_before），而不是用当前配置重新算——保持可重放一致性。
 
 ---
 
-## 8. JSON 示例（推荐模板）
+## 7. JSON 示例（推荐模板）
 
 你上传的样例 `config.json` 已经符合“common + group”的思路，建议稍微增强为：
 
@@ -242,7 +225,7 @@ Rust 版落地建议：
 
 ---
 
-## 9. 兼容/迁移（可选，但强烈建议）
+## 8. 兼容/迁移（可选，但强烈建议）
 
 为了平滑迁移原版部署，建议提供命令：
 
@@ -252,12 +235,11 @@ Rust 版落地建议：
 
 * 读取 KV（原版 `read_config` 语义：去掉 `#` 注释，按 `=` 分割）
 * 读取 `AcountGroupcfg.json` 作为 groups
-* 处理 key alias（`force_chromium_no-sandbox`→`force_chromium_no_sandbox`）
 * 输出统一 JSON
 
 ---
 
-## 10. 开发落地 Checklist（让实现不走样）
+## 9. 开发落地 Checklist（让实现不走样）
 
 * [ ] serde 结构：Raw + Effective 两层
 * [ ] 宽松解析：bool/int/string 兼容（样例里大量是 string）
@@ -268,6 +250,6 @@ Rust 版落地建议：
 
 ---
 
-## 11. 附：原版字段集合（便于对照）
+## 10. 附：原版字段集合（便于对照）
 
 原版 TUI 明确列出了一批全局 key 的说明（tooltip），并列出组 key 的顺序（包含 send_schedule、quick_replies、admins 等）。Rust 版可以把这些作为“兼容字段白名单”的基础。

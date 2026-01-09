@@ -55,6 +55,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let process_waittime_sec = prompt_u64("聚合窗口秒数（process_waittime_sec）", 20)?;
     let tz_offset_minutes = prompt_i64("时区偏移分钟数（中国大陆=480）", 480)?;
     let max_cache_mb = prompt_u64("内存图片缓存上限 MB（max_cache_mb）", 256)?;
+    let at_unprived_sender =
+        prompt_bool("发件时是否 @ 非匿名投稿人（at_unprived_sender）", false)?;
 
     let max_post_stack = prompt_u64("最大暂存条数（max_post_stack）", 1)?;
     let max_image_number_one_post = prompt_u64("单条最大图片数（max_image_number_one_post）", 30)?;
@@ -73,6 +75,18 @@ pub fn run(args: &[String]) -> Result<(), String> {
     common.insert(
         "max_cache_mb".to_string(),
         Value::Number(max_cache_mb.into()),
+    );
+    common.insert(
+        "at_unprived_sender".to_string(),
+        Value::Bool(at_unprived_sender),
+    );
+    common.insert(
+        "max_post_stack".to_string(),
+        Value::Number(max_post_stack.into()),
+    );
+    common.insert(
+        "max_image_number_one_post".to_string(),
+        Value::Number(max_image_number_one_post.into()),
     );
 
     let mut group = Map::new();

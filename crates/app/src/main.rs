@@ -20,6 +20,7 @@ use engine::Engine;
 use connect::spawn_napcat_drivers;
 use config::AppConfig;
 use oqqwall_rust_core::Command;
+use oqqwall_rust::tui::oqqwall_tui;
 use tokio::time::{sleep, Duration};
 use std::env;
 
@@ -30,6 +31,13 @@ async fn main() {
     if args.len() > 1 && (args[1] == "oobe" || args[1] == "--oobe") {
         if let Err(err) = oobe::run(&args[1..]) {
             eprintln!("{}", err);
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args.iter().any(|arg| arg == "--tui") {
+        if let Err(err) = oqqwall_tui::run_cli(&args) {
+            eprintln!("tui: {err}");
             std::process::exit(1);
         }
         return;

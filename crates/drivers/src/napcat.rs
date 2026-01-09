@@ -57,9 +57,17 @@ pub struct NapCatRuntimeConfig {
     pub audit_group_id: Option<String>,
     pub group_id: String,
     pub tz_offset_minutes: i32,
+    pub friend_request_window_sec: u32,
+    pub friend_add_message: Option<String>,
+    pub max_queue: usize,
 }
 
 const MAX_FORWARD_DEPTH: u32 = 4;
+const FRIEND_APPROVE_DELAY_MAX_SEC: u64 = 240;
+const FRIEND_NOTIFY_DELAY_SEC: u64 = 30;
+const FRIEND_REQUEST_ID_MAX_LEN: usize = 20;
+const FRIEND_SUPPRESS_REMOVE_CHARS: &str = r#"　“”‘’《》〈〉【】。，：；？！（）、「」『』—［］＂＇"'`~!@#$%^&*()_+-={}[]|:;<>?,./"#;
+static STARTUP_NOTICE_SENT: OnceLock<std::sync::Mutex<HashSet<String>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 struct ReviewInfo {
@@ -121,7 +129,7 @@ struct AuditMessage {
 
 #[derive(Debug, Clone)]
 enum PendingAction {
-    SendAuditMessage { review_id: ReviewId },
+    SendAuditMessage { review_id: ReviewId, attempt: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,10 +141,17 @@ enum AuditCommand {
     Global(GlobalAction),
 }
 
+#[derive(Debug, Clone)]
+struct SuppressionEntry {
+    comment_norm: String,
+    expire_at_ms: i64,
+}
+
 #[derive(Default)]
 struct NapCatState {
     review_info: HashMap<ReviewId, ReviewInfo>,
     review_by_code: HashMap<ReviewCode, ReviewId>,
+    review_publish_attempts: HashMap<ReviewId, u32>,
     ingress_summary: HashMap<IngressId, IngressSummary>,
     pending_summary: HashMap<IngressId, String>,
     post_ingress: HashMap<PostId, Vec<IngressId>>,
@@ -145,11 +160,14 @@ struct NapCatState {
     post_review_code: HashMap<PostId, ReviewCode>,
     post_external_code: HashMap<PostId, ExternalCode>,
     review_submitter: HashMap<ReviewId, String>,
+    blacklist: HashMap<String, HashMap<String, Option<String>>>,
     send_plans: HashMap<PostId, SendPlanInfo>,
     sending: HashMap<PostId, SendingInfo>,
     audit_msg_to_review: HashMap<String, ReviewId>,
     processed_reviews: HashSet<ReviewId>,
     pending: HashMap<String, PendingAction>,
+    friend_req_cache: HashMap<String, i64>,
+    friend_suppression: HashMap<String, Vec<SuppressionEntry>>,
     blob_paths: HashMap<BlobId, String>,
     next_echo: u64,
 }
@@ -161,20 +179,20 @@ fn load_state_view_cached() -> StateView {
             let data_dir = env::var("OQQWALL_DATA_DIR").unwrap_or_else(|_| "data".to_string());
             let journal = match LocalJournal::open(&data_dir) {
                 Ok(journal) => journal,
-                Err(err) => {
+                Err(_err) => {
                     debug_log!(
                         "napcat preload skipped: journal open failed: {}",
-                        err
+                        _err
                     );
                     return StateView::default();
                 }
             };
             let snapshot = match SnapshotStore::open(&data_dir) {
                 Ok(snapshot) => snapshot,
-                Err(err) => {
+                Err(_err) => {
                     debug_log!(
                         "napcat preload skipped: snapshot open failed: {}",
-                        err
+                        _err
                     );
                     return StateView::default();
                 }
@@ -188,15 +206,15 @@ fn load_state_view_cached() -> StateView {
                     cursor = loaded.journal_cursor;
                 }
                 Ok(None) => {}
-                Err(err) => {
-                    debug_log!("napcat preload: snapshot load failed: {}", err);
+                Err(_err) => {
+                    debug_log!("napcat preload: snapshot load failed: {}", _err);
                 }
             }
 
-            if let Err(err) = journal.replay(cursor, |env| {
+            if let Err(_err) = journal.replay(cursor, |env| {
                 state = state.reduce(env);
             }) {
-                debug_log!("napcat preload: journal replay failed: {}", err);
+                debug_log!("napcat preload: journal replay failed: {}", _err);
             }
 
             state
@@ -262,12 +280,20 @@ fn build_state_from_view(view: &StateView) -> NapCatState {
         ) {
             state.processed_reviews.insert(*review_id);
         }
+        if review.publish_attempt > 0 {
+            state
+                .review_publish_attempts
+                .insert(*review_id, review.publish_attempt);
+        }
         if let Some(user_id) = resolve_post_submitter(&state, review.post_id) {
             state.review_submitter.insert(*review_id, user_id);
         }
     }
     for (post_id, external_code) in &view.external_code_by_post {
         state.post_external_code.insert(*post_id, *external_code);
+    }
+    for (group_id, entries) in &view.blacklist {
+        state.blacklist.insert(group_id.clone(), entries.clone());
     }
     for (post_id, plan) in &view.send_plans {
         state.send_plans.insert(
@@ -346,6 +372,13 @@ pub fn spawn_napcat_ws(
             debug_log!("napcat ws connected: group_id={}", runtime.group_id);
             let (out_tx, mut out_rx) = mpsc::channel::<String>(256);
             let state_ref = Arc::clone(&state);
+            let startup_group_id = runtime
+                .audit_group_id
+                .as_deref()
+                .unwrap_or(&runtime.group_id);
+            if should_send_startup_notice(startup_group_id) {
+                send_group_text(&out_tx, startup_group_id, "系统已启动").await;
+            }
 
             let writer = tokio::spawn(async move {
                 while let Some(msg) = out_rx.recv().await {
@@ -368,8 +401,8 @@ pub fn spawn_napcat_ws(
                 while let Some(msg) = ws_read.next().await {
                     let msg = match msg {
                         Ok(msg) => msg,
-                        Err(err) => {
-                            debug_log!("napcat ws read error: {}", err);
+                        Err(_err) => {
+                            debug_log!("napcat ws read error: {}", _err);
                             break;
                         }
                     };
@@ -379,8 +412,8 @@ pub fn spawn_napcat_ws(
                     }
                     let text = match msg.to_text() {
                         Ok(text) => text,
-                        Err(err) => {
-                            debug_log!("napcat ws text decode error: {}", err);
+                        Err(_err) => {
+                            debug_log!("napcat ws text decode error: {}", _err);
                             continue;
                         }
                     };
@@ -452,6 +485,15 @@ pub fn spawn_napcat_ws(
     })
 }
 
+fn should_send_startup_notice(group_id: &str) -> bool {
+    let lock = STARTUP_NOTICE_SENT.get_or_init(|| std::sync::Mutex::new(HashSet::new()));
+    let mut guard = match lock.lock() {
+        Ok(guard) => guard,
+        Err(err) => err.into_inner(),
+    };
+    guard.insert(group_id.to_string())
+}
+
 fn build_ws_url(base: &str, token: Option<&str>) -> String {
     if let Some(token) = token {
         if base.contains("?") {
@@ -496,17 +538,17 @@ fn ws_url_for_log(url: &str) -> &str {
 }
 
 fn log_ws_connect_error(
-    group_id: &str,
-    ws_url: &str,
-    err: &tokio_tungstenite::tungstenite::Error,
+    _group_id: &str,
+    _ws_url: &str,
+    _err: &tokio_tungstenite::tungstenite::Error,
 ) {
-    match err {
+    match _err {
         tokio_tungstenite::tungstenite::Error::Http(response) => {
-            let status = response.status();
-            let headers = response.headers();
+            let _status = response.status();
+            let _headers = response.headers();
             let body = response.body().as_ref();
-            let body_len = body.map(|bytes| bytes.len()).unwrap_or(0);
-            let preview = body
+            let _body_len = body.map(|bytes| bytes.len()).unwrap_or(0);
+            let _preview = body
                 .and_then(|bytes| std::str::from_utf8(bytes).ok())
                 .map(|text| text.trim())
                 .filter(|text| !text.is_empty())
@@ -517,33 +559,33 @@ fn log_ws_connect_error(
                     }
                     out
                 });
-            if let Some(preview) = preview {
+            if let Some(_preview) = _preview {
                 debug_log!(
                     "napcat ws connect failed: group_id={} ws_url={} status={} headers={:?} body_len={} body_preview=\"{}\"",
-                    group_id,
-                    ws_url_for_log(ws_url),
-                    status,
-                    headers,
-                    body_len,
-                    preview
+                    _group_id,
+                    ws_url_for_log(_ws_url),
+                    _status,
+                    _headers,
+                    _body_len,
+                    _preview
                 );
             } else {
                 debug_log!(
                     "napcat ws connect failed: group_id={} ws_url={} status={} headers={:?} body_len={}",
-                    group_id,
-                    ws_url_for_log(ws_url),
-                    status,
-                    headers,
-                    body_len
+                    _group_id,
+                    ws_url_for_log(_ws_url),
+                    _status,
+                    _headers,
+                    _body_len
                 );
             }
         }
         _ => {
             debug_log!(
                 "napcat ws connect failed: group_id={} ws_url={} err={:?}",
-                group_id,
-                ws_url_for_log(ws_url),
-                err
+                _group_id,
+                ws_url_for_log(_ws_url),
+                _err
             );
         }
     }
@@ -708,6 +750,23 @@ async fn build_action_from_event(
             );
             let mut guard = state.lock().await;
             guard.audit_msg_to_review.insert(audit_msg_id, review_id);
+            guard.review_publish_attempts.remove(&review_id);
+            None
+        }
+        Event::Review(ReviewEvent::ReviewPublishFailed {
+            review_id,
+            attempt,
+            error: _error,
+            ..
+        }) => {
+            debug_log!(
+                "napcat review publish failed: review_id={} attempt={} err={}",
+                review_id.0,
+                attempt,
+                _error
+            );
+            let mut guard = state.lock().await;
+            guard.review_publish_attempts.insert(review_id, attempt);
             None
         }
         Event::Review(ReviewEvent::ReviewDecisionRecorded {
@@ -750,10 +809,65 @@ async fn build_action_from_event(
                 "action": "send_private_msg",
                 "params": {
                     "user_id": json_id(&user_id),
-                    "message": message_segments_from_text(text)
+                    "message": message_segments_from_text(&text)
                 }
             });
             Some(payload.to_string())
+        }
+        Event::Review(ReviewEvent::ReviewReplyRequested { review_id, text }) => {
+            if text.trim().is_empty() {
+                debug_log!("napcat reply skipped: empty text");
+                return None;
+            }
+            let submitter = {
+                let guard = state.lock().await;
+                resolve_review_submitter(&guard, review_id)
+            };
+            let Some((group_id, user_id)) = submitter else {
+                debug_log!("napcat reply skipped: missing submitter info");
+                return None;
+            };
+            if !group_id.is_empty() && group_id != runtime.group_id {
+                return None;
+            }
+            let payload = serde_json::json!({
+                "action": "send_private_msg",
+                "params": {
+                    "user_id": json_id(&user_id),
+                    "message": message_segments_from_text(&text)
+                }
+            });
+            Some(payload.to_string())
+        }
+        Event::Review(ReviewEvent::ReviewBlacklistRequested { review_id, reason }) => {
+            let mut guard = state.lock().await;
+            let Some((group_id, sender_id)) = resolve_review_submitter(&guard, review_id) else {
+                debug_log!("napcat blacklist skipped: missing review submitter");
+                return None;
+            };
+            let entry = guard
+                .blacklist
+                .entry(group_id)
+                .or_default()
+                .entry(sender_id)
+                .or_insert(None);
+            if reason.is_some() {
+                *entry = reason.clone();
+            }
+            None
+        }
+        Event::Review(ReviewEvent::ReviewBlacklistRemoved {
+            group_id,
+            sender_id,
+        }) => {
+            let mut guard = state.lock().await;
+            if let Some(group) = guard.blacklist.get_mut(&group_id) {
+                group.remove(&sender_id);
+                if group.is_empty() {
+                    guard.blacklist.remove(&group_id);
+                }
+            }
+            None
         }
         Event::Schedule(ScheduleEvent::SendPlanCreated {
             post_id,
@@ -762,7 +876,8 @@ async fn build_action_from_event(
             priority,
             seq,
         }) => {
-            let (label, should_notify, audit_group_id) = {
+            let stacking_enabled = runtime.max_queue > 1;
+            let (label, label_plain, code_text, submitter_id, should_notify, audit_group_id) = {
                 let mut guard = state.lock().await;
                 guard.send_plans.insert(
                     post_id,
@@ -775,6 +890,9 @@ async fn build_action_from_event(
                 );
                 (
                     post_label(&guard, post_id),
+                    post_label_plain(&guard, post_id),
+                    post_code_text(&guard, post_id),
+                    resolve_post_submitter(&guard, post_id),
                     group_id == runtime.group_id,
                     runtime.audit_group_id.clone(),
                 )
@@ -785,6 +903,28 @@ async fn build_action_from_event(
             let Some(audit_group_id) = audit_group_id else {
                 return None;
             };
+            if stacking_enabled {
+                if let (Some(code), Some(user_id)) = (code_text, submitter_id) {
+                    let text = format!("#{}已通过审核,待发送", code);
+                    let payload = serde_json::json!({
+                        "action": "send_private_msg",
+                        "params": {
+                            "user_id": json_id(&user_id),
+                            "message": message_segments_from_text(&text)
+                        }
+                    });
+                    let _ = out_tx.send(payload.to_string()).await;
+                }
+                let text = format!("{}已存入暂存区", label_plain);
+                let payload = serde_json::json!({
+                    "action": "send_group_msg",
+                    "params": {
+                        "group_id": json_id(&audit_group_id),
+                        "message": message_segments_from_text(&text)
+                    }
+                });
+                return Some(payload.to_string());
+            }
             let text = format!("{}正在发送...", label);
             let payload = serde_json::json!({
                 "action": "send_group_msg",
@@ -825,16 +965,38 @@ async fn build_action_from_event(
             started_at_ms,
             ..
         }) => {
-            let mut guard = state.lock().await;
-            guard.send_plans.remove(&post_id);
-            guard.sending.insert(
-                post_id,
-                SendingInfo {
-                    group_id,
-                    started_at_ms,
-                },
-            );
-            None
+            let stacking_enabled = runtime.max_queue > 1;
+            let (label_plain, should_notify, audit_group_id) = {
+                let mut guard = state.lock().await;
+                guard.send_plans.remove(&post_id);
+                guard.sending.insert(
+                    post_id,
+                    SendingInfo {
+                        group_id: group_id.clone(),
+                        started_at_ms,
+                    },
+                );
+                (
+                    post_label_plain(&guard, post_id),
+                    group_id == runtime.group_id,
+                    runtime.audit_group_id.clone(),
+                )
+            };
+            if !stacking_enabled || !should_notify {
+                return None;
+            }
+            let Some(audit_group_id) = audit_group_id else {
+                return None;
+            };
+            let text = format!("{}正在发送中", label_plain);
+            let payload = serde_json::json!({
+                "action": "send_group_msg",
+                "params": {
+                    "group_id": json_id(&audit_group_id),
+                    "message": message_segments_from_text(&text)
+                }
+            });
+            Some(payload.to_string())
         }
         Event::Send(SendEvent::SendSucceeded {
             post_id,
@@ -849,11 +1011,7 @@ async fn build_action_from_event(
                     .map(|info| info.group_id)
                     .or_else(|| guard.post_group.get(&post_id).cloned())
                     .unwrap_or_else(|| runtime.group_id.clone());
-                let send_code = guard
-                    .post_external_code
-                    .get(&post_id)
-                    .map(|code| code.to_string())
-                    .or_else(|| guard.post_review_code.get(&post_id).map(|code| code.to_string()));
+                let send_code = post_code_text(&guard, post_id);
                 let submitter_id = resolve_post_submitter(&guard, post_id);
                 (
                     group_id,
@@ -966,6 +1124,14 @@ async fn build_action_from_event(
                 debug_log!("napcat review publish requested but missing review info");
                 return None;
             };
+            let attempt = {
+                let entry = guard
+                    .review_publish_attempts
+                    .entry(review_id)
+                    .and_modify(|value| *value = value.saturating_add(1))
+                    .or_insert(1);
+                *entry
+            };
             let ingress_ids = guard
                 .post_ingress
                 .get(&info.post_id)
@@ -992,7 +1158,10 @@ async fn build_action_from_event(
             let echo = next_echo(&mut guard);
             guard.pending.insert(
                 echo.clone(),
-                PendingAction::SendAuditMessage { review_id },
+                PendingAction::SendAuditMessage {
+                    review_id,
+                    attempt,
+                },
             );
 
             let mut message = message_segments_from_text(&summary.text);
@@ -1031,22 +1200,48 @@ async fn handle_action_response(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
     let retcode = value.get("retcode").and_then(|v| v.as_i64()).unwrap_or(-1);
-    if status != "ok" || retcode != 0 {
-        debug_log!(
-            "napcat action failed: echo={} status={} retcode={} raw={}",
-            echo,
-            status,
-            retcode,
-            value
-        );
-        return None;
-    }
     match pending {
-        PendingAction::SendAuditMessage { review_id } => {
+        PendingAction::SendAuditMessage { review_id, attempt } => {
+            if status != "ok" || retcode != 0 {
+                debug_log!(
+                    "napcat action failed: echo={} status={} retcode={} raw={}",
+                    echo,
+                    status,
+                    retcode,
+                    value
+                );
+                let msg = value
+                    .get("msg")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let mut error = format!("action failed status={} retcode={}", status, retcode);
+                if !msg.is_empty() {
+                    error.push_str(&format!(" msg={}", msg));
+                }
+                let retry_at_ms =
+                    now_ms().saturating_add(review_retry_delay_ms(attempt));
+                return Some(Event::Review(ReviewEvent::ReviewPublishFailed {
+                    review_id,
+                    attempt,
+                    retry_at_ms,
+                    error,
+                }));
+            }
+
             let message_id = value
                 .get("data")
                 .and_then(|data| data.get("message_id"))
-                .and_then(value_to_string)?;
+                .and_then(value_to_string);
+            let Some(message_id) = message_id else {
+                let retry_at_ms =
+                    now_ms().saturating_add(review_retry_delay_ms(attempt));
+                return Some(Event::Review(ReviewEvent::ReviewPublishFailed {
+                    review_id,
+                    attempt,
+                    retry_at_ms,
+                    error: "missing message_id in action response".to_string(),
+                }));
+            };
             debug_log!(
                 "napcat audit message sent: review_id={} message_id={}",
                 review_id.0,
@@ -1076,6 +1271,14 @@ fn is_send_timeout_error(error: &str) -> bool {
     error.starts_with("send timeout")
 }
 
+fn review_retry_delay_ms(attempt: u32) -> i64 {
+    let base = 5_000i64;
+    let max = 60_000i64;
+    let shift = attempt.saturating_sub(1).min(10);
+    let delay = base.saturating_mul(1_i64 << shift);
+    delay.min(max)
+}
+
 async fn parse_inbound_event(
     runtime: &NapCatRuntimeConfig,
     state: &Arc<Mutex<NapCatState>>,
@@ -1085,6 +1288,10 @@ async fn parse_inbound_event(
     let post_type = value.get("post_type").and_then(|v| v.as_str())?;
     if post_type == "notice" {
         return parse_notice_event(runtime, value);
+    }
+    if post_type == "request" {
+        handle_friend_request(runtime, state, out_tx, value).await;
+        return None;
     }
     if post_type != "message" && post_type != "message_sent" {
         return None;
@@ -1137,12 +1344,12 @@ async fn parse_inbound_event(
         let ExtractedMessage {
             text,
             summary_text: _,
-            attachments,
+            attachments: _attachments,
         } = extracted;
         debug_log!(
             "napcat inbound content: text_len={} attachments={} reply_id_present={}",
             text.len(),
-            attachments.len(),
+            _attachments.len(),
             reply_id.is_some()
         );
         let chat_group_id = value_opt_to_string(value.get("group_id"))?;
@@ -1170,6 +1377,43 @@ async fn parse_inbound_event(
                     send_group_text(out_tx, &chat_group_id, "已收到指令").await;
                     send_group_text(out_tx, &chat_group_id, &pending_text).await;
                     return None;
+                }
+                AuditCommand::Global(GlobalAction::BlacklistList) => {
+                    let blacklist_text = {
+                        let guard = state.lock().await;
+                        build_blacklist_list_text(&guard, &runtime.group_id)
+                    };
+                    send_group_text(out_tx, &chat_group_id, "已收到指令").await;
+                    send_group_text(out_tx, &chat_group_id, &blacklist_text).await;
+                    return None;
+                }
+                AuditCommand::Global(GlobalAction::BlacklistRemove { sender_id }) => {
+                    let removed = {
+                        let mut guard = state.lock().await;
+                        if let Some(group) = guard.blacklist.get_mut(&runtime.group_id) {
+                            let removed = group.remove(&sender_id).is_some();
+                            if group.is_empty() {
+                                guard.blacklist.remove(&runtime.group_id);
+                            }
+                            removed
+                        } else {
+                            false
+                        }
+                    };
+                    send_group_text(out_tx, &chat_group_id, "已收到指令").await;
+                    let text = if removed {
+                        format!("已取消拉黑 {}", sender_id)
+                    } else {
+                        format!("黑名单中不存在 {}", sender_id)
+                    };
+                    send_group_text(out_tx, &chat_group_id, &text).await;
+                    return Some(Command::GlobalAction(GlobalActionCommand {
+                        group_id: runtime.group_id.clone(),
+                        action: GlobalAction::BlacklistRemove { sender_id },
+                        operator_id: user_id.to_string(),
+                        now_ms: timestamp_ms,
+                        tz_offset_minutes: runtime.tz_offset_minutes,
+                    }));
                 }
                 AuditCommand::Global(action) => {
                     if let GlobalAction::Recall { review_code } = &action {
@@ -1214,11 +1458,26 @@ async fn parse_inbound_event(
     }
 
     if message_type == "private" {
+        let raw_message = value.get("raw_message").and_then(|v| v.as_str());
+        if let Some(raw_message) = raw_message {
+            if is_auto_reply_message(raw_message) {
+                debug_log!("napcat inbound ignored private system message");
+                return None;
+            }
+        }
         let ExtractedMessage {
             text,
             summary_text,
             attachments,
         } = extract_message_lite(value.get("message"));
+        if raw_message
+            .map(|raw| raw.is_empty())
+            .unwrap_or(true)
+            && is_auto_reply_message(&summary_text)
+        {
+            debug_log!("napcat inbound ignored private system message");
+            return None;
+        }
         debug_log!(
             "napcat inbound private lite: text_len={} attachments={}",
             text.len(),
@@ -1230,8 +1489,21 @@ async fn parse_inbound_event(
             user_id.as_bytes(),
             message_id.as_bytes(),
         ]);
+        let suppress_text = match raw_message {
+            Some(raw) if !raw.is_empty() => raw,
+            _ => summary_text.as_str(),
+        };
         {
             let mut guard = state.lock().await;
+            if should_suppress_private_message(
+                &mut guard.friend_suppression,
+                &user_id,
+                suppress_text,
+                now_ms(),
+            ) {
+                debug_log!("napcat inbound private suppressed after friend request");
+                return None;
+            }
             guard.pending_summary.insert(ingress_id, summary_text);
         }
         return Some(Command::Ingress(IngressCommand {
@@ -1247,6 +1519,204 @@ async fn parse_inbound_event(
     }
 
     None
+}
+
+async fn handle_friend_request(
+    runtime: &NapCatRuntimeConfig,
+    state: &Arc<Mutex<NapCatState>>,
+    out_tx: &mpsc::Sender<String>,
+    value: &Value,
+) {
+    let request_type = value.get("request_type").and_then(|v| v.as_str());
+    if request_type != Some("friend") {
+        return;
+    }
+
+    let user_id = value_opt_to_string(value.get("user_id")).unwrap_or_default();
+    let flag = value_opt_to_string(value.get("flag")).unwrap_or_default();
+    let self_id = value_opt_to_string(value.get("self_id")).unwrap_or_default();
+    let comment = value
+        .get("comment")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if !is_digits(&user_id, FRIEND_REQUEST_ID_MAX_LEN)
+        || !is_digits(&flag, FRIEND_REQUEST_ID_MAX_LEN)
+        || !is_digits(&self_id, FRIEND_REQUEST_ID_MAX_LEN)
+    {
+        debug_log!(
+            "napcat friend request ignored: invalid identifiers user_id={} flag={} self_id={}",
+            user_id,
+            flag,
+            self_id
+        );
+        return;
+    }
+
+    let window_ms = runtime
+        .friend_request_window_sec
+        .saturating_mul(1000) as i64;
+    if window_ms > 0 {
+        let now_ms = now_ms();
+        let mut guard = state.lock().await;
+        if !should_process_friend_request(
+            &mut guard.friend_req_cache,
+            &user_id,
+            now_ms,
+            window_ms,
+        ) {
+            debug_log!(
+                "napcat friend request ignored: duplicate user_id={} window_sec={}",
+                user_id,
+                runtime.friend_request_window_sec
+            );
+            return;
+        }
+        if !comment.is_empty() {
+            add_friend_request_suppression(
+                &mut guard.friend_suppression,
+                &user_id,
+                &comment,
+                now_ms,
+                window_ms,
+            );
+        }
+    }
+
+    let approve_delay_sec = friend_request_delay_sec();
+    let friend_add_message = runtime
+        .friend_add_message
+        .clone()
+        .and_then(|msg| if msg.trim().is_empty() { None } else { Some(msg) });
+    let out_tx = out_tx.clone();
+    tokio::spawn(async move {
+        if approve_delay_sec > 0 {
+            sleep(Duration::from_secs(approve_delay_sec)).await;
+        }
+        let approve_payload = serde_json::json!({
+            "action": "set_friend_add_request",
+            "params": {
+                "flag": flag,
+                "approve": true
+            }
+        });
+        let _ = out_tx.send(approve_payload.to_string()).await;
+        if let Some(text) = friend_add_message {
+            sleep(Duration::from_secs(FRIEND_NOTIFY_DELAY_SEC)).await;
+            let message_payload = serde_json::json!({
+                "action": "send_private_msg",
+                "params": {
+                    "user_id": json_id(&user_id),
+                    "message": message_segments_from_text(&text)
+                }
+            });
+            let _ = out_tx.send(message_payload.to_string()).await;
+        }
+    });
+}
+
+fn is_auto_reply_message(text: &str) -> bool {
+    text.contains("自动回复")
+        || text.contains("请求添加你为好友")
+        || text.contains("我们已成功添加为好友")
+}
+
+fn is_digits(value: &str, max_len: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_len
+        && value.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn is_digits_unbounded(value: &str) -> bool {
+    is_digits(value, usize::MAX)
+}
+
+fn normalize_text(text: &str) -> String {
+    let mut out = String::new();
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        if FRIEND_SUPPRESS_REMOVE_CHARS.contains(ch) {
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn should_process_friend_request(
+    cache: &mut HashMap<String, i64>,
+    user_id: &str,
+    now_ms: i64,
+    window_ms: i64,
+) -> bool {
+    if user_id.is_empty() || window_ms <= 0 {
+        return true;
+    }
+    cache.retain(|_, exp| *exp > now_ms);
+    if let Some(expire_at) = cache.get(user_id) {
+        if *expire_at > now_ms {
+            return false;
+        }
+    }
+    cache.insert(user_id.to_string(), now_ms.saturating_add(window_ms));
+    true
+}
+
+fn add_friend_request_suppression(
+    cache: &mut HashMap<String, Vec<SuppressionEntry>>,
+    user_id: &str,
+    comment: &str,
+    now_ms: i64,
+    window_ms: i64,
+) {
+    if user_id.is_empty() || comment.is_empty() || window_ms <= 0 {
+        return;
+    }
+    let normalized = normalize_text(comment);
+    if normalized.is_empty() {
+        return;
+    }
+    let entry = SuppressionEntry {
+        comment_norm: normalized,
+        expire_at_ms: now_ms.saturating_add(window_ms),
+    };
+    let list = cache.entry(user_id.to_string()).or_default();
+    list.push(entry);
+    list.retain(|item| item.expire_at_ms > now_ms);
+}
+
+fn should_suppress_private_message(
+    cache: &mut HashMap<String, Vec<SuppressionEntry>>,
+    user_id: &str,
+    text: &str,
+    now_ms: i64,
+) -> bool {
+    if user_id.is_empty() || text.is_empty() {
+        return false;
+    }
+    let normalized = normalize_text(text);
+    if normalized.is_empty() {
+        return false;
+    }
+    let Some(list) = cache.get_mut(user_id) else {
+        return false;
+    };
+    list.retain(|item| item.expire_at_ms > now_ms);
+    list.iter().any(|item| item.comment_norm == normalized)
+}
+
+fn friend_request_delay_sec() -> u64 {
+    if FRIEND_APPROVE_DELAY_MAX_SEC == 0 {
+        return 0;
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    (nanos % (FRIEND_APPROVE_DELAY_MAX_SEC as u128 + 1)) as u64
 }
 
 fn parse_notice_event(runtime: &NapCatRuntimeConfig, value: &Value) -> Option<Command> {
@@ -1473,8 +1943,8 @@ async fn resolve_forward_chunks(
 
     let resolved = match fetch_forward_messages(resolver, forward_id).await {
         Ok(messages) => forward_messages_to_chunks(&messages, resolver, depth + 1).await,
-        Err(err) => {
-            debug_log!("forward resolve failed: id={} err={}", forward_id, err);
+        Err(_err) => {
+            debug_log!("forward resolve failed: id={} err={}", forward_id, _err);
             let placeholder = forward_placeholder(forward_id);
             vec![MessageChunk {
                 text: placeholder.clone(),
@@ -1935,16 +2405,13 @@ fn parse_audit_command(text: &str, has_reply: bool) -> Option<AuditCommand> {
         return Some(AuditCommand::Global(GlobalAction::Help));
     }
 
-    let mut tokens = trimmed.split_whitespace();
-    let first = tokens.next()?;
-    let rest = tokens.collect::<Vec<_>>().join(" ");
+    let (first, rest) = split_first_token_with_rest(trimmed)?;
 
-    if is_digits(first) {
+    if is_digits_unbounded(first) {
         let review_code = first.parse::<ReviewCode>().ok()?;
-        let mut rest_tokens = rest.split_whitespace();
-        let command = rest_tokens.next()?;
-        let args_text = rest_tokens.collect::<Vec<_>>().join(" ");
-        let action = parse_review_action(command, &args_text, true)?;
+        let (command, args_text) = split_first_token_with_rest(rest)?;
+        let args_text = args_text.trim_start();
+        let action = parse_review_action(command, args_text, true)?;
         return Some(AuditCommand::Review {
             review_code: Some(review_code),
             action,
@@ -1972,6 +2439,21 @@ fn parse_audit_command(text: &str, has_reply: bool) -> Option<AuditCommand> {
     }
 
     None
+}
+
+fn split_first_token_with_rest(input: &str) -> Option<(&str, &str)> {
+    let input = input.trim_start();
+    if input.is_empty() {
+        return None;
+    }
+    let mut iter = input.splitn(2, char::is_whitespace);
+    let first = iter.next().unwrap_or("");
+    let rest = iter.next().unwrap_or("");
+    if first.is_empty() {
+        None
+    } else {
+        Some((first, rest))
+    }
 }
 
 fn parse_review_action(command: &str, rest: &str, allow_quick_reply: bool) -> Option<ReviewAction> {
@@ -2172,6 +2654,26 @@ fn build_pending_list_text(state: &NapCatState, group_id: &str) -> String {
     lines.join("\n")
 }
 
+fn build_blacklist_list_text(state: &NapCatState, group_id: &str) -> String {
+    let Some(entries) = state.blacklist.get(group_id) else {
+        return "黑名单为空".to_string();
+    };
+    if entries.is_empty() {
+        return "黑名单为空".to_string();
+    }
+    let mut lines = entries
+        .iter()
+        .map(|(sender_id, reason)| {
+            let reason = reason.as_deref().unwrap_or("无");
+            format!("{} -> {}", sender_id, reason)
+        })
+        .collect::<Vec<_>>();
+    lines.sort();
+    let count = lines.len();
+    lines.insert(0, format!("黑名单({}):", count));
+    lines.join("\n")
+}
+
 fn post_label(state: &NapCatState, post_id: PostId) -> String {
     let review_code = state.post_review_code.get(&post_id).copied();
     let external_code = state.post_external_code.get(&post_id).copied();
@@ -2181,6 +2683,20 @@ fn post_label(state: &NapCatState, post_id: PostId) -> String {
         (None, Some(review)) => format!("#{}", review),
         (None, None) => format!("post:{}", id128_hex(post_id.0)),
     }
+}
+
+fn post_label_plain(state: &NapCatState, post_id: PostId) -> String {
+    post_label(state, post_id)
+        .trim_start_matches('#')
+        .to_string()
+}
+
+fn post_code_text(state: &NapCatState, post_id: PostId) -> Option<String> {
+    state
+        .post_external_code
+        .get(&post_id)
+        .map(|code| code.to_string())
+        .or_else(|| state.post_review_code.get(&post_id).map(|code| code.to_string()))
 }
 
 fn resolve_post_submitter(state: &NapCatState, post_id: PostId) -> Option<String> {
@@ -2520,10 +3036,6 @@ fn id128_hex(value: u128) -> String {
     format!("{:032x}", value)
 }
 
-fn is_digits(value: &str) -> bool {
-    !value.is_empty() && value.chars().all(|c| c.is_ascii_digit())
-}
-
 const HELP_TEXT: &str = r#"全局指令:
 这些是可以在任何时刻@本账号调用的指令
 语法: @本账号/次要账号 指令
@@ -2795,6 +3307,37 @@ mod tests {
                 review_code: None,
                 action: ReviewAction::QuickReply {
                     key: "谢谢".to_string(),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn parse_reply_text_preserves_spaces() {
+        assert_eq!(
+            parse_audit_command("123 回复 hello world", false),
+            Some(AuditCommand::Review {
+                review_code: Some(123),
+                action: ReviewAction::Reply {
+                    text: "hello world".to_string(),
+                },
+            })
+        );
+        assert_eq!(
+            parse_audit_command("123 回复  hello   world", false),
+            Some(AuditCommand::Review {
+                review_code: Some(123),
+                action: ReviewAction::Reply {
+                    text: "hello   world".to_string(),
+                },
+            })
+        );
+        assert_eq!(
+            parse_audit_command("回复  你好  世界", true),
+            Some(AuditCommand::Review {
+                review_code: None,
+                action: ReviewAction::Reply {
+                    text: "你好  世界".to_string(),
                 },
             })
         );

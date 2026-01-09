@@ -95,6 +95,7 @@ pub enum IngressEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IngressIgnoreReason {
     Duplicate,
+    Blacklisted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,6 +196,12 @@ pub enum ReviewEvent {
         review_id: ReviewId,
         audit_msg_id: AuditMsgId,
     },
+    ReviewPublishFailed {
+        review_id: ReviewId,
+        attempt: u32,
+        retry_at_ms: TimestampMs,
+        error: String,
+    },
     ReviewDelayed {
         review_id: ReviewId,
         not_before_ms: TimestampMs,
@@ -234,6 +241,10 @@ pub enum ReviewEvent {
     ReviewBlacklistRequested {
         review_id: ReviewId,
         reason: Option<String>,
+    },
+    ReviewBlacklistRemoved {
+        group_id: GroupId,
+        sender_id: String,
     },
     ReviewQuickReplyRequested {
         review_id: ReviewId,

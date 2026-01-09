@@ -1,11 +1,14 @@
 use oqqwall_rust_core::decide::decide;
 use oqqwall_rust_core::event::{
-    DraftEvent, GroupFlushReason, RenderEvent, ScheduleEvent, SendPriority, SessionEvent,
+    DraftEvent, GroupFlushReason, MediaEvent, RenderEvent, ReviewEvent, ScheduleEvent,
+    SendPriority, SessionEvent,
 };
 use oqqwall_rust_core::{
     Command, CoreConfig, Event, EventEnvelope, GroupConfig, Id128, IngressAttachment,
-    IngressCommand, IngressMessage, MediaKind, MediaReference, StateView, TickCommand,
+    IngressCommand, IngressMessage, MediaFetchKey, MediaFetchMeta, MediaKind, MediaReference,
+    StateView, TickCommand,
 };
+use oqqwall_rust_core::state::{PostMeta, PostStage, RenderMeta, ReviewMeta};
 
 fn wrap(event: Event, id: u128) -> EventEnvelope {
     EventEnvelope {
@@ -189,4 +192,131 @@ fn tick_group_flush_reschedules_send_plans() {
 
     assert!(saw_flush);
     assert!(saw_reschedule);
+}
+
+#[test]
+fn tick_retries_review_publish_after_failure() {
+    let review_id = Id128(200);
+    let post_id = Id128(201);
+    let mut state = StateView::default();
+    state.reviews.insert(
+        review_id,
+        ReviewMeta {
+            review_id,
+            post_id,
+            review_code: 42,
+            decision: None,
+            audit_msg_id: None,
+            delayed_until_ms: None,
+            needs_republish: false,
+            decided_by: None,
+            decided_at_ms: None,
+            publish_retry_at_ms: Some(900),
+            publish_last_error: Some("send failed".to_string()),
+            publish_attempt: 2,
+        },
+    );
+
+    let tick = TickCommand {
+        now_ms: 1_000,
+        tz_offset_minutes: 0,
+    };
+    let events = decide(&state, &Command::Tick(tick), &CoreConfig::default());
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::Review(ReviewEvent::ReviewPublishRequested { review_id: rid })
+            if *rid == review_id
+    )));
+}
+
+#[test]
+fn tick_retries_render_after_failure() {
+    let post_id = Id128(300);
+    let mut state = StateView::default();
+    state.posts.insert(
+        post_id,
+        PostMeta {
+            post_id,
+            session_id: Id128(1),
+            group_id: "group-a".to_string(),
+            stage: PostStage::Drafted,
+            review_id: None,
+            created_at_ms: 0,
+            is_anonymous: false,
+            is_safe: true,
+            last_error: None,
+        },
+    );
+    state.update_post_stage(post_id, PostStage::Failed);
+    state.render.insert(
+        post_id,
+        RenderMeta {
+            png_blob: None,
+            last_error: Some("render failed".to_string()),
+            last_attempt: 1,
+            retry_at_ms: Some(900),
+        },
+    );
+
+    let tick = TickCommand {
+        now_ms: 1_000,
+        tz_offset_minutes: 0,
+    };
+    let events = decide(&state, &Command::Tick(tick), &CoreConfig::default());
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::Render(RenderEvent::RenderRequested {
+            post_id: pid,
+            attempt,
+            requested_at_ms,
+        }) if *pid == post_id && *attempt == 2 && *requested_at_ms == 1_000
+    )));
+}
+
+#[test]
+fn tick_retries_media_fetch_after_failure() {
+    let ingress_id = Id128(400);
+    let mut state = StateView::default();
+    state.ingress_messages.insert(
+        ingress_id,
+        IngressMessage {
+            text: "hi".to_string(),
+            attachments: vec![IngressAttachment {
+                kind: MediaKind::Image,
+                name: None,
+                reference: MediaReference::RemoteUrl {
+                    url: "http://example.com/img.png".to_string(),
+                },
+                size_bytes: None,
+            }],
+        },
+    );
+    state.media_fetch.insert(
+        MediaFetchKey {
+            ingress_id,
+            attachment_index: 0,
+        },
+        MediaFetchMeta {
+            attempt: 2,
+            retry_at_ms: Some(900),
+            last_error: Some("download failed".to_string()),
+        },
+    );
+
+    let tick = TickCommand {
+        now_ms: 1_000,
+        tz_offset_minutes: 0,
+    };
+    let events = decide(&state, &Command::Tick(tick), &CoreConfig::default());
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::Media(MediaEvent::MediaFetchRequested {
+            ingress_id: id,
+            attachment_index,
+            attempt,
+        }) if *id == ingress_id && *attachment_index == 0 && *attempt == 3
+    )));
 }

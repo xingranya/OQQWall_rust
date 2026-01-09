@@ -23,6 +23,8 @@ pub struct AppGroupConfig {
     pub group_id: String,
     pub audit_group_id: Option<String>,
     pub napcat: NapCatConfig,
+    pub friend_request_window_sec: u32,
+    pub friend_add_message: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +33,7 @@ pub struct AppConfig {
     pub tz_offset_minutes: i32,
     pub fallback_napcat: Option<NapCatConfig>,
     pub max_cache_mb: u64,
+    pub at_unprived_sender: bool,
     core_config: CoreConfig,
     #[cfg(debug_assertions)]
     pub dev_config: DevConfig,
@@ -63,13 +66,8 @@ impl AppConfig {
         let default_process_waittime_ms = env::var("OQQWALL_PROCESS_WAITTIME_MS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .or_else(|| parse_duration_ms(common.get("process_waittime_ms")))
             .or_else(|| {
                 parse_duration_ms(common.get("process_waittime_sec"))
-                    .map(|v| v.saturating_mul(1000))
-            })
-            .or_else(|| {
-                parse_duration_ms(common.get("process_waittime"))
                     .map(|v| v.saturating_mul(1000))
             })
             .unwrap_or(20_000);
@@ -81,11 +79,16 @@ impl AppConfig {
             .and_then(|v| v.parse::<u64>().ok())
             .or_else(|| parse_u64(common.get("max_cache_mb")))
             .unwrap_or(256);
+        let at_unprived_sender = parse_bool(common.get("at_unprived_sender")).unwrap_or(false);
+        let default_friend_request_window_sec =
+            parse_u32(common.get("friend_request_window_sec")).unwrap_or(300);
+        let default_friend_add_message = parse_string(common.get("friend_add_message"));
         debug_log!(
-            "config parsed: tz_offset_minutes={} default_process_waittime_ms={} max_cache_mb={}",
+            "config parsed: tz_offset_minutes={} default_process_waittime_ms={} max_cache_mb={} at_unprived_sender={}",
             tz_offset_minutes,
             default_process_waittime_ms,
-            max_cache_mb
+            max_cache_mb,
+            at_unprived_sender
         );
         let core_config = build_core_config(&common, &groups, default_process_waittime_ms);
         let fallback_napcat = parse_napcat_config_optional(&common);
@@ -95,18 +98,25 @@ impl AppConfig {
             let audit_group_id = parse_string(group_value.get("mangroupid"));
             let napcat = parse_napcat_config(&common, Some(group_value))
                 .map_err(|err| format!("group {}: {}", group_id, err))?;
-            let napcat_ws_log = ws_url_for_log(&napcat.ws_url);
+            let friend_request_window_sec =
+                parse_u32(group_value.get("friend_request_window_sec"))
+                    .unwrap_or(default_friend_request_window_sec);
+            let friend_add_message = parse_string(group_value.get("friend_add_message"))
+                .or_else(|| default_friend_add_message.clone());
+            let _napcat_ws_log = ws_url_for_log(&napcat.ws_url);
             debug_log!(
                 "config group: group_id={} audit_group_id={:?} napcat_ws_url={} napcat_token_present={}",
                 group_id,
                 audit_group_id,
-                napcat_ws_log,
+                _napcat_ws_log,
                 napcat.access_token.is_some()
             );
             group_configs.push(AppGroupConfig {
                 group_id: group_id.clone(),
                 audit_group_id,
                 napcat,
+                friend_request_window_sec,
+                friend_add_message,
             });
         }
         if group_configs.is_empty() {
@@ -117,6 +127,8 @@ impl AppConfig {
                 group_id: "default".to_string(),
                 audit_group_id: None,
                 napcat,
+                friend_request_window_sec: default_friend_request_window_sec,
+                friend_add_message: default_friend_add_message,
             });
         }
         #[cfg(debug_assertions)]
@@ -126,6 +138,7 @@ impl AppConfig {
             tz_offset_minutes,
             fallback_napcat,
             max_cache_mb,
+            at_unprived_sender,
             core_config,
             #[cfg(debug_assertions)]
             dev_config,
@@ -149,8 +162,7 @@ fn load_dev_config() -> Result<DevConfig, String> {
     let obj = root
         .as_object()
         .ok_or_else(|| "dev config must be a json object".to_string())?;
-    let use_virt_qzone = parse_bool(obj.get("use-virt-qzone").or_else(|| obj.get("use_virt_qzone")))
-        .unwrap_or(false);
+    let use_virt_qzone = parse_bool(obj.get("use-virt-qzone")).unwrap_or(false);
     debug_log!("dev config parsed: use_virt_qzone={}", use_virt_qzone);
     Ok(DevConfig { use_virt_qzone })
 }
@@ -233,42 +245,24 @@ fn build_core_config(
 ) -> CoreConfig {
     let mut core = CoreConfig::default();
     core.default_process_waittime_ms = default_process_waittime_ms;
-    core.default_min_interval_ms = parse_duration_ms(common.get("min_interval_ms"))
-        .or_else(|| parse_duration_ms(common.get("min_interval_sec")).map(|v| v.saturating_mul(1000)))
-        .unwrap_or(0);
-    core.default_max_queue = parse_usize(common.get("max_queue"))
-        .or_else(|| parse_usize(common.get("max_post_stack")))
-        .unwrap_or(0);
-    core.default_send_timeout_ms = parse_duration_ms(common.get("send_timeout_ms"))
-        .or_else(|| parse_duration_ms(common.get("send_timeout_sec")).map(|v| v.saturating_mul(1000)))
-        .or_else(|| parse_duration_ms(common.get("send_timeout")).map(|v| v.saturating_mul(1000)))
-        .unwrap_or(300_000);
-    core.default_send_max_attempts = parse_u32(common.get("send_max_attempts"))
-        .or_else(|| parse_u32(common.get("max_send_attempts")))
-        .or_else(|| parse_u32(common.get("max_send_attempt")))
-        .unwrap_or(3);
+    core.default_min_interval_ms =
+        parse_duration_ms(common.get("min_interval_ms")).unwrap_or(0);
+    core.default_max_queue = parse_usize(common.get("max_queue")).unwrap_or(0);
+    core.default_max_images_per_post =
+        parse_usize(common.get("max_image_number_one_post")).unwrap_or(30);
+    core.default_send_timeout_ms =
+        parse_duration_ms(common.get("send_timeout_ms")).unwrap_or(300_000);
+    core.default_send_max_attempts = parse_u32(common.get("send_max_attempts")).unwrap_or(3);
 
     for (group_id, value) in groups {
-        let process_waittime_ms = parse_duration_ms(value.get("process_waittime_ms"))
-            .or_else(|| {
-                parse_duration_ms(value.get("process_waittime_sec"))
-                    .map(|v| v.saturating_mul(1000))
-            })
-            .or_else(|| {
-                parse_duration_ms(value.get("process_waittime"))
-                    .map(|v| v.saturating_mul(1000))
-            });
+        let process_waittime_ms = parse_duration_ms(value.get("process_waittime_sec"))
+            .map(|v| v.saturating_mul(1000));
 
-        let min_interval_ms = parse_duration_ms(value.get("min_interval_ms"))
-            .or_else(|| parse_duration_ms(value.get("min_interval_sec")).map(|v| v.saturating_mul(1000)));
-        let max_queue = parse_usize(value.get("max_queue"))
-            .or_else(|| parse_usize(value.get("max_post_stack")));
-        let send_timeout_ms = parse_duration_ms(value.get("send_timeout_ms"))
-            .or_else(|| parse_duration_ms(value.get("send_timeout_sec")).map(|v| v.saturating_mul(1000)))
-            .or_else(|| parse_duration_ms(value.get("send_timeout")).map(|v| v.saturating_mul(1000)));
-        let send_max_attempts = parse_u32(value.get("send_max_attempts"))
-            .or_else(|| parse_u32(value.get("max_send_attempts")))
-            .or_else(|| parse_u32(value.get("max_send_attempt")));
+        let min_interval_ms = parse_duration_ms(value.get("min_interval_ms"));
+        let max_queue = parse_usize(value.get("max_post_stack"));
+        let max_images_per_post = parse_usize(value.get("max_image_number_one_post"));
+        let send_timeout_ms = parse_duration_ms(value.get("send_timeout_ms"));
+        let send_max_attempts = parse_u32(value.get("send_max_attempts"));
         let send_schedule_minutes = parse_schedule_minutes(value.get("send_schedule"));
         let accounts = parse_accounts(value);
 
@@ -280,6 +274,7 @@ fn build_core_config(
                 send_windows: Vec::new(),
                 min_interval_ms,
                 max_queue,
+                max_images_per_post,
                 send_schedule_minutes,
                 accounts,
                 send_timeout_ms,
@@ -381,10 +376,10 @@ fn parse_napcat_config(common: &Value, group: Option<&Value>) -> Result<NapCatCo
         .ok_or_else(|| "missing napcat_ws_url".to_string())?;
     let access_token = resolve_napcat_token(common, group);
 
-    let ws_log = ws_url_for_log(&ws_url);
+    let _ws_log = ws_url_for_log(&ws_url);
     debug_log!(
         "napcat config resolved: ws_url={} token_present={}",
-        ws_log,
+        _ws_log,
         access_token.is_some()
     );
     Ok(NapCatConfig {
@@ -396,10 +391,10 @@ fn parse_napcat_config(common: &Value, group: Option<&Value>) -> Result<NapCatCo
 fn parse_napcat_config_optional(common: &Value) -> Option<NapCatConfig> {
     let ws_url = resolve_napcat_ws_url(common, None)?;
     let access_token = resolve_napcat_token(common, None);
-    let ws_log = ws_url_for_log(&ws_url);
+    let _ws_log = ws_url_for_log(&ws_url);
     debug_log!(
         "napcat config resolved: ws_url={} token_present={}",
-        ws_log,
+        _ws_log,
         access_token.is_some()
     );
     Some(NapCatConfig {
@@ -423,4 +418,9 @@ fn resolve_napcat_token(common: &Value, group: Option<&Value>) -> Option<String>
 #[cfg(debug_assertions)]
 fn ws_url_for_log(url: &str) -> &str {
     url.split('?').next().unwrap_or(url)
+}
+
+#[cfg(not(debug_assertions))]
+fn ws_url_for_log(_url: &str) -> &str {
+    "<redacted>"
 }

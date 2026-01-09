@@ -5,12 +5,15 @@ use crate::config::CoreConfig;
 use crate::decide::builder::build_draft_from_messages;
 use crate::decide::flush::build_group_flush_events;
 use crate::decide::scheduler::{compute_not_before, day_index, minute_of_day};
+use crate::draft::MediaKind;
 use crate::event::{
     DraftEvent, Event, IngressEvent, RenderEvent, ReviewDecision, ReviewEvent, ScheduleEvent,
     SendPriority,
 };
 use crate::ids::{ExternalCode, IngressId, PostId, ReviewCode, ReviewId};
 use crate::state::StateView;
+
+const STACKING_HOLD_MS: i64 = 365 * 24 * 60 * 60 * 1000;
 
 pub fn decide_review_action(
     state: &StateView,
@@ -184,10 +187,14 @@ fn build_approve_events(
         events.push(event);
     }
 
-    let plan = build_send_plan(state, cmd, config, post_id, group_id, SendPriority::Normal);
-    if let Some(event) = plan {
-        events.push(event);
-    }
+    events.extend(build_send_plan_events(
+        state,
+        cmd,
+        config,
+        post_id,
+        group_id,
+        SendPriority::Normal,
+    ));
 
     events
 }
@@ -212,10 +219,16 @@ fn build_immediate_events(
     }
 
     if config.group_config(&group_id).is_some() {
+        let stacking_enabled = config.max_queue(&group_id) > 1;
+        let not_before_ms = if stacking_enabled {
+            cmd.now_ms.saturating_add(1)
+        } else {
+            cmd.now_ms
+        };
         events.push(Event::Schedule(ScheduleEvent::SendPlanCreated {
             post_id,
             group_id: group_id.clone(),
-            not_before_ms: cmd.now_ms,
+            not_before_ms,
             priority: SendPriority::High,
             seq: state.next_send_seq,
         }));
@@ -233,43 +246,61 @@ fn build_immediate_events(
     events
 }
 
-fn build_send_plan(
+fn build_send_plan_events(
     state: &StateView,
     cmd: &ReviewActionCommand,
     config: &CoreConfig,
     post_id: crate::ids::PostId,
     group_id: String,
     priority: SendPriority,
-) -> Option<Event> {
+) -> Vec<Event> {
     if config.group_config(&group_id).is_none() {
-        return None;
+        return Vec::new();
     }
+    let max_queue = config.max_queue(&group_id);
+    let max_images = config.max_images_per_post(&group_id);
     let queue_depth = state
         .send_plans
         .values()
         .filter(|plan| plan.group_id == group_id)
         .count();
-    let last_send_ms = state
-        .group_runtime
-        .get(&group_id)
-        .and_then(|runtime| runtime.last_send_ms);
-    let not_before_ms = compute_not_before(
-        cmd.now_ms,
-        None,
-        config.send_windows(&group_id),
-        config.min_interval_ms(&group_id),
-        last_send_ms,
-        queue_depth,
-        config.max_queue(&group_id),
-        cmd.tz_offset_minutes,
-    );
-    Some(Event::Schedule(ScheduleEvent::SendPlanCreated {
+    let queue_depth_after = queue_depth.saturating_add(1);
+    let image_count_after = count_group_queue_images(state, &group_id, Some(post_id));
+    let stacking_enabled = max_queue > 1;
+    let should_flush = stacking_enabled
+        && ((max_queue > 0 && queue_depth_after >= max_queue)
+            || (max_images > 0 && image_count_after > max_images));
+    let not_before_ms = if stacking_enabled && !should_flush {
+        cmd.now_ms.saturating_add(STACKING_HOLD_MS)
+    } else if should_flush {
+        cmd.now_ms
+    } else {
+        let last_send_ms = state
+            .group_runtime
+            .get(&group_id)
+            .and_then(|runtime| runtime.last_send_ms);
+        compute_not_before(
+            cmd.now_ms,
+            None,
+            config.send_windows(&group_id),
+            config.min_interval_ms(&group_id),
+            last_send_ms,
+            queue_depth,
+            max_queue,
+            cmd.tz_offset_minutes,
+        )
+    };
+    let mut events = vec![Event::Schedule(ScheduleEvent::SendPlanCreated {
         post_id,
-        group_id,
+        group_id: group_id.clone(),
         not_before_ms,
         priority,
         seq: state.next_send_seq,
-    }))
+    })];
+    if should_flush {
+        events.extend(build_group_flush_events(state, &group_id, cmd.now_ms));
+    }
+    events
 }
 
 fn maybe_assign_external_code(
@@ -520,4 +551,44 @@ fn post_sender_key(state: &StateView, post_id: PostId) -> Option<(String, String
         meta.user_id.clone(),
         meta.group_id.clone(),
     ))
+}
+
+fn count_group_queue_images(
+    state: &StateView,
+    group_id: &str,
+    extra_post_id: Option<PostId>,
+) -> usize {
+    let mut total: usize = 0;
+    for plan in state.send_plans.values().filter(|plan| plan.group_id == group_id) {
+        total = total.saturating_add(count_post_images(state, plan.post_id));
+    }
+    if let Some(post_id) = extra_post_id {
+        if !state.send_plans.contains_key(&post_id) {
+            total = total.saturating_add(count_post_images(state, post_id));
+        }
+    }
+    total
+}
+
+fn count_post_images(state: &StateView, post_id: PostId) -> usize {
+    let mut total: usize = 0;
+    if let Some(render) = state.render.get(&post_id) {
+        if render.png_blob.is_some() {
+            total = total.saturating_add(1);
+        }
+    }
+    if let Some(ingress_ids) = state.post_ingress.get(&post_id) {
+        for ingress_id in ingress_ids {
+            let Some(message) = state.ingress_messages.get(ingress_id) else {
+                continue;
+            };
+            let images = message
+                .attachments
+                .iter()
+                .filter(|attachment| attachment.kind == MediaKind::Image)
+                .count();
+            total = total.saturating_add(images);
+        }
+    }
+    total
 }

@@ -1,3 +1,4 @@
+from typing import List, Dict, Tuple
 #!/usr/bin/env python3
 import argparse
 import os
@@ -26,8 +27,8 @@ def is_text_file(path: Path) -> bool:
         return False
 
 
-def collect_files(repo_root: Path) -> list[Path]:
-    files: list[Path] = []
+def collect_files(repo_root: Path) -> List[Path]:
+    files: List[Path] = []
     for root, dirs, filenames in os.walk(repo_root):
         dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
         for name in filenames:

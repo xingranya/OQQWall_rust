@@ -7,11 +7,12 @@ use crate::decide::flush::build_group_flush_events;
 use crate::decide::scheduler::{day_index, minute_of_day};
 use crate::decide::sender::{choose_account, AccountChoice};
 use crate::event::{
-    DraftEvent, Event, GroupFlushReason, InputStatusKind, RenderEvent, ScheduleEvent, SendEvent,
-    SendPriority, SessionEvent,
+    DraftEvent, Event, GroupFlushReason, InputStatusKind, MediaEvent, RenderEvent, ReviewEvent,
+    ScheduleEvent, SendEvent, SendPriority, SessionEvent,
 };
 use crate::ids::{derive_post_id, TimestampMs};
-use crate::state::{SessionMeta, StateView};
+use crate::state::{PostStage, SessionMeta, StateView};
+use crate::draft::MediaReference;
 
 const INPUT_STATUS_ACTIVE_MAX_MS: i64 = 30 * 60 * 1000;
 const SEND_TIMEOUT_RETRY_DELAY_MS: i64 = 30 * 1000;
@@ -21,6 +22,9 @@ pub fn decide_tick(state: &StateView, cmd: &TickCommand, config: &CoreConfig) ->
 
     events.extend(close_due_sessions(state, cmd, config));
     events.extend(trigger_review_delays(state, cmd));
+    events.extend(retry_review_publish_failures(state, cmd));
+    events.extend(retry_failed_renders(state, cmd));
+    events.extend(retry_failed_media_fetches(state, cmd));
     events.extend(trigger_group_flush(state, cmd, config));
     events.extend(recover_stuck_sends(state, cmd, config));
     events.extend(maybe_start_send(state, cmd, config));
@@ -140,6 +144,78 @@ fn trigger_review_delays(state: &StateView, cmd: &TickCommand) -> Vec<Event> {
                 }));
             }
         }
+    }
+    events
+}
+
+fn retry_review_publish_failures(state: &StateView, cmd: &TickCommand) -> Vec<Event> {
+    let mut events = Vec::new();
+    for review in state.reviews.values() {
+        let Some(retry_at_ms) = review.publish_retry_at_ms else {
+            continue;
+        };
+        if cmd.now_ms < retry_at_ms {
+            continue;
+        }
+        if review.audit_msg_id.is_some() {
+            continue;
+        }
+        events.push(Event::Review(ReviewEvent::ReviewPublishRequested {
+            review_id: review.review_id,
+        }));
+    }
+    events
+}
+
+fn retry_failed_renders(state: &StateView, cmd: &TickCommand) -> Vec<Event> {
+    let mut events = Vec::new();
+    for (post_id, meta) in &state.render {
+        let Some(retry_at_ms) = meta.retry_at_ms else {
+            continue;
+        };
+        if cmd.now_ms < retry_at_ms {
+            continue;
+        }
+        let Some(post) = state.posts.get(post_id) else {
+            continue;
+        };
+        if post.stage != PostStage::Failed {
+            continue;
+        }
+        let attempt = meta.last_attempt.saturating_add(1).max(1);
+        events.push(Event::Render(RenderEvent::RenderRequested {
+            post_id: *post_id,
+            attempt,
+            requested_at_ms: cmd.now_ms,
+        }));
+    }
+    events
+}
+
+fn retry_failed_media_fetches(state: &StateView, cmd: &TickCommand) -> Vec<Event> {
+    let mut events = Vec::new();
+    for (key, meta) in &state.media_fetch {
+        let Some(retry_at_ms) = meta.retry_at_ms else {
+            continue;
+        };
+        if cmd.now_ms < retry_at_ms {
+            continue;
+        }
+        let Some(message) = state.ingress_messages.get(&key.ingress_id) else {
+            continue;
+        };
+        let Some(attachment) = message.attachments.get(key.attachment_index) else {
+            continue;
+        };
+        if !matches!(attachment.reference, MediaReference::RemoteUrl { .. }) {
+            continue;
+        }
+        let attempt = meta.attempt.saturating_add(1).max(1);
+        events.push(Event::Media(MediaEvent::MediaFetchRequested {
+            ingress_id: key.ingress_id,
+            attachment_index: key.attachment_index,
+            attempt,
+        }));
     }
     events
 }

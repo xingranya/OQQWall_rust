@@ -6,8 +6,9 @@ use crate::event::{
     ScheduleEvent, SendEvent, SessionEvent,
 };
 use crate::state::{
-    AccountRuntime, BlobMeta, GroupRuntime, InputStatusMeta, PostMeta, PostStage, RenderMeta,
-    ReviewMeta, SendDueKey, SendPlan, SendingMeta, SessionKey, SessionMeta, StateView,
+    AccountRuntime, BlobMeta, GroupRuntime, InputStatusMeta, MediaFetchKey, MediaFetchMeta,
+    PostMeta, PostStage, RenderMeta, ReviewMeta, SendDueKey, SendPlan, SendingMeta, SessionKey,
+    SessionMeta, StateView,
 };
 
 pub fn reduce(state: &StateView, env: &EventEnvelope) -> StateView {
@@ -219,36 +220,93 @@ fn reduce_media(state: &mut StateView, event: &MediaEvent) {
         } => {
             state.register_media_reference(*ingress_id, *attachment_index, *blob_id);
         }
-        MediaEvent::MediaFetchFailed { .. }
-        | MediaEvent::MediaFetchRequested { .. }
-        | MediaEvent::AvatarFetchRequested { .. } => {}
+        MediaEvent::MediaFetchRequested {
+            ingress_id,
+            attachment_index,
+            attempt,
+        } => {
+            let key = MediaFetchKey {
+                ingress_id: *ingress_id,
+                attachment_index: *attachment_index,
+            };
+            let entry = state.media_fetch.entry(key).or_insert(MediaFetchMeta {
+                attempt: *attempt,
+                retry_at_ms: None,
+                last_error: None,
+            });
+            entry.attempt = *attempt;
+            entry.retry_at_ms = None;
+            entry.last_error = None;
+        }
+        MediaEvent::MediaFetchFailed {
+            ingress_id,
+            attachment_index,
+            attempt,
+            retry_at_ms,
+            error,
+        } => {
+            let key = MediaFetchKey {
+                ingress_id: *ingress_id,
+                attachment_index: *attachment_index,
+            };
+            let entry = state.media_fetch.entry(key).or_insert(MediaFetchMeta {
+                attempt: *attempt,
+                retry_at_ms: Some(*retry_at_ms),
+                last_error: Some(error.clone()),
+            });
+            entry.attempt = *attempt;
+            entry.retry_at_ms = Some(*retry_at_ms);
+            entry.last_error = Some(error.clone());
+        }
+        MediaEvent::AvatarFetchRequested { .. } => {}
     }
 }
 
 fn reduce_render(state: &mut StateView, event: &RenderEvent) {
     match event {
-        RenderEvent::RenderRequested { post_id, .. } => {
-            state.render.entry(*post_id).or_insert(RenderMeta {
+        RenderEvent::RenderRequested {
+            post_id,
+            attempt,
+            ..
+        } => {
+            let meta = state.render.entry(*post_id).or_insert(RenderMeta {
                 png_blob: None,
                 last_error: None,
+                last_attempt: 0,
+                retry_at_ms: None,
             });
+            meta.last_attempt = *attempt;
+            meta.retry_at_ms = None;
+            meta.last_error = None;
             state.update_post_stage(*post_id, PostStage::RenderRequested);
         }
         RenderEvent::PngReady { post_id, blob_id } => {
             let meta = state.render.entry(*post_id).or_insert(RenderMeta {
                 png_blob: None,
                 last_error: None,
+                last_attempt: 0,
+                retry_at_ms: None,
             });
             meta.png_blob = Some(*blob_id);
             meta.last_error = None;
+            meta.retry_at_ms = None;
             state.update_post_stage(*post_id, PostStage::Rendered);
         }
-        RenderEvent::RenderFailed { post_id, error, .. } => {
+        RenderEvent::RenderFailed {
+            post_id,
+            attempt,
+            retry_at_ms,
+            error,
+        } => {
             let meta = state.render.entry(*post_id).or_insert(RenderMeta {
                 png_blob: None,
                 last_error: None,
+                last_attempt: 0,
+                retry_at_ms: None,
             });
             meta.last_error = Some(error.clone());
+            meta.last_attempt = *attempt;
+            meta.retry_at_ms = Some(*retry_at_ms);
             state.update_post_stage(*post_id, PostStage::Failed);
         }
     }
@@ -274,6 +332,9 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
                     needs_republish: false,
                     decided_by: None,
                     decided_at_ms: None,
+                    publish_retry_at_ms: None,
+                    publish_last_error: None,
+                    publish_attempt: 0,
                 },
             );
             if let Some(meta) = state.posts.get_mut(post_id) {
@@ -289,6 +350,8 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
             if let Some(meta) = state.reviews.get_mut(review_id) {
                 meta.delayed_until_ms = None;
                 meta.needs_republish = false;
+                meta.publish_retry_at_ms = None;
+                meta.publish_last_error = None;
             }
             if let Some(post_id) = post_id {
                 state.update_post_stage(post_id, PostStage::ReviewPending);
@@ -300,9 +363,24 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
         } => {
             if let Some(meta) = state.reviews.get_mut(review_id) {
                 meta.audit_msg_id = Some(audit_msg_id.clone());
+                meta.publish_retry_at_ms = None;
+                meta.publish_last_error = None;
+                meta.publish_attempt = 0;
                 state
                     .review_by_audit_msg
                     .insert(audit_msg_id.clone(), *review_id);
+            }
+        }
+        ReviewEvent::ReviewPublishFailed {
+            review_id,
+            attempt,
+            retry_at_ms,
+            error,
+        } => {
+            if let Some(meta) = state.reviews.get_mut(review_id) {
+                meta.publish_retry_at_ms = Some(*retry_at_ms);
+                meta.publish_last_error = Some(error.clone());
+                meta.publish_attempt = *attempt;
             }
         }
         ReviewEvent::ReviewDelayed {
@@ -377,14 +455,45 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
                 *entry = next_value;
             }
         }
+        ReviewEvent::ReviewBlacklistRequested { review_id, reason } => {
+            if let Some((group_id, sender_id)) = resolve_review_sender(state, *review_id) {
+                let entry = state
+                    .blacklist
+                    .entry(group_id)
+                    .or_default()
+                    .entry(sender_id)
+                    .or_insert(None);
+                if reason.is_some() {
+                    *entry = reason.clone();
+                }
+            }
+        }
+        ReviewEvent::ReviewBlacklistRemoved {
+            group_id,
+            sender_id,
+        } => {
+            if let Some(group) = state.blacklist.get_mut(group_id) {
+                group.remove(sender_id);
+                if group.is_empty() {
+                    state.blacklist.remove(group_id);
+                }
+            }
+        }
         ReviewEvent::ReviewCommentAdded { .. }
         | ReviewEvent::ReviewReplyRequested { .. }
         | ReviewEvent::ReviewExpandRequested { .. }
         | ReviewEvent::ReviewDisplayRequested { .. }
-        | ReviewEvent::ReviewBlacklistRequested { .. }
         | ReviewEvent::ReviewQuickReplyRequested { .. }
         | ReviewEvent::ReviewInfoSynced { .. } => {}
     }
+}
+
+fn resolve_review_sender(state: &StateView, review_id: crate::ids::ReviewId) -> Option<(String, String)> {
+    let review = state.reviews.get(&review_id)?;
+    let ingress_ids = state.post_ingress.get(&review.post_id)?;
+    let ingress_id = ingress_ids.first()?;
+    let meta = state.ingress_meta.get(ingress_id)?;
+    Some((meta.group_id.clone(), meta.user_id.clone()))
 }
 
 fn reduce_schedule(state: &mut StateView, event: &ScheduleEvent) {

@@ -28,19 +28,23 @@ pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) {
         config.groups.len(),
         config.tz_offset_minutes
     );
+    let core_config = config.build_core_config();
     for group in &config.groups {
         let runtime = NapCatRuntimeConfig {
             napcat: group.napcat.clone(),
             audit_group_id: group.audit_group_id.clone(),
             group_id: group.group_id.clone(),
             tz_offset_minutes: config.tz_offset_minutes,
+            friend_request_window_sec: group.friend_request_window_sec,
+            friend_add_message: group.friend_add_message.clone(),
+            max_queue: core_config.max_queue(&group.group_id),
         };
-        let ws_log = ws_url_for_log(&runtime.napcat.ws_url);
+        let _ws_log = ws_url_for_log(&runtime.napcat.ws_url);
         debug_log!(
             "spawn napcat ws: group_id={} audit_group_id={:?} ws_url={} token_present={}",
             runtime.group_id,
             runtime.audit_group_id,
-            ws_log,
+            _ws_log,
             runtime.napcat.access_token.is_some()
         );
         let bus_rx = handle.subscribe();
@@ -56,6 +60,18 @@ pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) {
     for group in &config.groups {
         napcat_by_group.insert(group.group_id.clone(), group.napcat.clone());
     }
+    let mut max_queue_by_group = HashMap::new();
+    let mut max_images_per_post_by_group = HashMap::new();
+    for group in &config.groups {
+        max_queue_by_group.insert(
+            group.group_id.clone(),
+            core_config.max_queue(&group.group_id),
+        );
+        max_images_per_post_by_group.insert(
+            group.group_id.clone(),
+            core_config.max_images_per_post(&group.group_id),
+        );
+    }
     debug_log!("spawn renderer");
     let renderer_config = RendererRuntimeConfig {
         napcat_by_group: napcat_by_group.clone(),
@@ -70,6 +86,11 @@ pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) {
     let runtime = QzoneRuntimeConfig {
         napcat_by_group,
         default_napcat: config.fallback_napcat.clone(),
+        at_unprived_sender: config.at_unprived_sender,
+        max_queue_by_group,
+        max_images_per_post_by_group,
+        default_max_queue: core_config.default_max_queue,
+        default_max_images_per_post: core_config.default_max_images_per_post,
         #[cfg(debug_assertions)]
         use_virt_qzone: config.dev_config.use_virt_qzone,
     };
@@ -83,4 +104,9 @@ pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) {
 #[cfg(debug_assertions)]
 fn ws_url_for_log(url: &str) -> &str {
     url.split('?').next().unwrap_or(url)
+}
+
+#[cfg(not(debug_assertions))]
+fn ws_url_for_log(_url: &str) -> &str {
+    "<redacted>"
 }

@@ -8,6 +8,7 @@ pub struct CoreConfig {
     pub default_send_windows: Vec<TimeWindow>,
     pub default_min_interval_ms: TimestampMs,
     pub default_max_queue: usize,
+    pub default_max_images_per_post: usize,
     pub default_send_timeout_ms: TimestampMs,
     pub default_send_max_attempts: u32,
     pub groups: HashMap<GroupId, GroupConfig>,
@@ -20,6 +21,7 @@ pub struct GroupConfig {
     pub send_windows: Vec<TimeWindow>,
     pub min_interval_ms: Option<TimestampMs>,
     pub max_queue: Option<usize>,
+    pub max_images_per_post: Option<usize>,
     pub send_schedule_minutes: Vec<u16>,
     pub accounts: Vec<AccountId>,
     pub send_timeout_ms: Option<TimestampMs>,
@@ -62,6 +64,12 @@ impl CoreConfig {
         self.group_config(group_id)
             .and_then(|cfg| cfg.max_queue)
             .unwrap_or(self.default_max_queue)
+    }
+
+    pub fn max_images_per_post(&self, group_id: &GroupId) -> usize {
+        self.group_config(group_id)
+            .and_then(|cfg| cfg.max_images_per_post)
+            .unwrap_or(self.default_max_images_per_post)
     }
 
     pub fn send_timeout_ms(&self, group_id: &GroupId) -> TimestampMs {

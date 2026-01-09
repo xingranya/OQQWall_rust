@@ -16,7 +16,8 @@ use oqqwall_rust_core::draft::{
     Draft, DraftBlock, IngressMessage, MediaKind, MediaReference,
 };
 use oqqwall_rust_core::event::{
-    BlobEvent, DraftEvent, Event, IngressEvent, MediaEvent, RenderEvent, ReviewEvent, SendEvent,
+    BlobEvent, DraftEvent, Event, IngressEvent, MediaEvent, RenderEvent, ReviewEvent,
+    ScheduleEvent, SendEvent, SendPriority,
 };
 use oqqwall_rust_core::ids::{
     BlobId, ExternalCode, IngressId, PostId, ReviewCode, ReviewId, TimestampMs,
@@ -60,6 +61,11 @@ const EMUQZONE_MAX_POSTS: usize = 50;
 pub struct QzoneRuntimeConfig {
     pub napcat_by_group: HashMap<String, NapCatConfig>,
     pub default_napcat: Option<NapCatConfig>,
+    pub at_unprived_sender: bool,
+    pub max_queue_by_group: HashMap<String, usize>,
+    pub max_images_per_post_by_group: HashMap<String, usize>,
+    pub default_max_queue: usize,
+    pub default_max_images_per_post: usize,
     #[cfg(debug_assertions)]
     pub use_virt_qzone: bool,
 }
@@ -116,6 +122,13 @@ struct IngressAuthor {
     sender_name: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct SendPlanMeta {
+    group_id: String,
+    priority: SendPriority,
+    seq: u64,
+}
+
 #[derive(Default)]
 struct QzoneState {
     drafts: HashMap<PostId, Draft>,
@@ -126,6 +139,7 @@ struct QzoneState {
     ingress_authors: HashMap<IngressId, IngressAuthor>,
     post_ingress: HashMap<PostId, Vec<IngressId>>,
     post_anonymous: HashMap<PostId, bool>,
+    send_plans: HashMap<PostId, SendPlanMeta>,
     review_posts: HashMap<ReviewId, PostId>,
     review_codes: HashMap<PostId, ReviewCode>,
     external_codes: HashMap<PostId, ExternalCode>,
@@ -149,20 +163,20 @@ fn load_state_view_cached() -> StateView {
             let data_dir = env::var("OQQWALL_DATA_DIR").unwrap_or_else(|_| "data".to_string());
             let journal = match LocalJournal::open(&data_dir) {
                 Ok(journal) => journal,
-                Err(err) => {
+                Err(_err) => {
                     debug_log!(
                         "qzone preload skipped: journal open failed: {}",
-                        err
+                        _err
                     );
                     return StateView::default();
                 }
             };
             let snapshot = match SnapshotStore::open(&data_dir) {
                 Ok(snapshot) => snapshot,
-                Err(err) => {
+                Err(_err) => {
                     debug_log!(
                         "qzone preload skipped: snapshot open failed: {}",
-                        err
+                        _err
                     );
                     return StateView::default();
                 }
@@ -176,15 +190,15 @@ fn load_state_view_cached() -> StateView {
                     cursor = loaded.journal_cursor;
                 }
                 Ok(None) => {}
-                Err(err) => {
-                    debug_log!("qzone preload: snapshot load failed: {}", err);
+                Err(_err) => {
+                    debug_log!("qzone preload: snapshot load failed: {}", _err);
                 }
             }
 
-            if let Err(err) = journal.replay(cursor, |env| {
+            if let Err(_err) = journal.replay(cursor, |env| {
                 state = state.reduce(env);
             }) {
-                debug_log!("qzone preload: journal replay failed: {}", err);
+                debug_log!("qzone preload: journal replay failed: {}", _err);
             }
 
             state
@@ -216,6 +230,17 @@ fn build_state_from_view(view: &StateView) -> QzoneState {
         state.review_posts.insert(*review_id, review.post_id);
     }
     state.external_codes = view.external_code_by_post.clone();
+
+    for (post_id, plan) in &view.send_plans {
+        state.send_plans.insert(
+            *post_id,
+            SendPlanMeta {
+                group_id: plan.group_id.clone(),
+                priority: plan.priority,
+                seq: plan.seq,
+            },
+        );
+    }
 
     for (post_id, render) in &view.render {
         if render.png_blob.is_some() {
@@ -385,6 +410,34 @@ pub fn spawn_qzone_sender(
                     let mut guard = state.lock().await;
                     guard.external_codes.insert(post_id, external_code);
                 }
+                Event::Schedule(ScheduleEvent::SendPlanCreated {
+                    post_id,
+                    group_id,
+                    priority,
+                    seq,
+                    ..
+                })
+                | Event::Schedule(ScheduleEvent::SendPlanRescheduled {
+                    post_id,
+                    group_id,
+                    priority,
+                    seq,
+                    ..
+                }) => {
+                    let mut guard = state.lock().await;
+                    guard.send_plans.insert(
+                        post_id,
+                        SendPlanMeta {
+                            group_id,
+                            priority,
+                            seq,
+                        },
+                    );
+                }
+                Event::Schedule(ScheduleEvent::SendPlanCanceled { post_id }) => {
+                    let mut guard = state.lock().await;
+                    guard.send_plans.remove(&post_id);
+                }
                 Event::Blob(BlobEvent::BlobPersisted { blob_id, path }) => {
                     let mut guard = state.lock().await;
                     guard.blob_paths.insert(blob_id, path);
@@ -428,22 +481,76 @@ pub fn spawn_qzone_sender(
                         account_id,
                         started_at_ms
                     );
-                    let (draft, blob_paths, preview_blobs, publish_text) = {
-                        let guard = state.lock().await;
-                        let publish_text = build_publish_text(
-                            post_id,
-                            guard.external_codes.get(&post_id).copied(),
-                            guard.review_codes.get(&post_id).copied(),
-                            guard.post_ingress.get(&post_id),
+                    let max_queue = runtime
+                        .max_queue_by_group
+                        .get(&group_id)
+                        .copied()
+                        .unwrap_or(runtime.default_max_queue);
+                    let max_images_per_post = runtime
+                        .max_images_per_post_by_group
+                        .get(&group_id)
+                        .copied()
+                        .unwrap_or(runtime.default_max_images_per_post);
+                    let merging_enabled = max_queue > 1;
+
+                    let batch_result = {
+                        let mut guard = state.lock().await;
+                        let leader_meta = guard.send_plans.remove(&post_id);
+                        let leader_priority = leader_meta
+                            .map(|meta| meta.priority)
+                            .unwrap_or(SendPriority::Normal);
+                        let batch_posts = if merging_enabled
+                            && leader_priority == SendPriority::Normal
+                        {
+                            collect_batch_post_ids(
+                                &guard,
+                                &group_id,
+                                post_id,
+                                leader_priority,
+                            )
+                        } else {
+                            vec![post_id]
+                        };
+                        let publish_text = build_publish_text_for_batch(
+                            &batch_posts,
+                            &guard.external_codes,
+                            &guard.review_codes,
+                            &guard.post_ingress,
                             &guard.ingress_authors,
                             &guard.post_anonymous,
+                            runtime.at_unprived_sender,
                         );
-                        (
-                            resolve_draft_for_send(&guard, post_id),
-                            guard.blob_paths.clone(),
-                            render_preview_blobs(&guard, post_id),
-                            publish_text,
-                        )
+                        match collect_post_assets(&guard, &batch_posts) {
+                            Ok(assets) => Ok((
+                                batch_posts,
+                                assets,
+                                guard.blob_paths.clone(),
+                                publish_text,
+                            )),
+                            Err(err) => Err(err),
+                        }
+                    };
+
+                    let (batch_posts, assets, blob_paths, publish_text) = match batch_result {
+                        Ok(data) => data,
+                        Err(err) => {
+                            debug_log!(
+                                "qzone send failed: kind={:?} message={}",
+                                err.kind,
+                                err.message
+                            );
+                            let retry_at =
+                                started_at_ms.saturating_add(retry_delay_ms(err.kind, 1));
+                            let event = SendEvent::SendFailed {
+                                post_id,
+                                account_id,
+                                attempt: 1,
+                                retry_at_ms: retry_at,
+                                error: format!("[{:?}] {}", err.kind, err.message),
+                            };
+                            let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
+                            continue;
+                        }
                     };
                     #[cfg(debug_assertions)]
                     if runtime.use_virt_qzone {
@@ -462,42 +569,7 @@ pub fn spawn_qzone_sender(
                             let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
                             continue;
                         };
-                        let Some(draft) = draft.as_ref() else {
-                            debug_log!("emuqzone send failed: missing draft post_id={}", post_id.0);
-                            let err = QzoneError::unknown("missing draft");
-                            let retry_at = started_at_ms
-                                .saturating_add(retry_delay_ms(err.kind, 1));
-                            let event = SendEvent::SendFailed {
-                                post_id,
-                                account_id,
-                                attempt: 1,
-                                retry_at_ms: retry_at,
-                                error: format!("[{:?}] {}", err.kind, err.message),
-                            };
-                            let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
-                            continue;
-                        };
-                        if preview_blobs.is_empty() {
-                            debug_log!(
-                                "emuqzone send failed: missing render preview post_id={}",
-                                post_id.0
-                            );
-                            let err = QzoneError::unknown("missing render preview");
-                            let retry_at = started_at_ms
-                                .saturating_add(retry_delay_ms(err.kind, 1));
-                            let event = SendEvent::SendFailed {
-                                post_id,
-                                account_id,
-                                attempt: 1,
-                                retry_at_ms: retry_at,
-                                error: format!("[{:?}] {}", err.kind, err.message),
-                            };
-                            let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
-                            continue;
-                        }
-                        let content = publish_text.clone();
-                        let images =
-                            match collect_emuqzone_images(&draft, &blob_paths, &preview_blobs) {
+                        let images = match collect_emuqzone_batch_images(&assets, &blob_paths) {
                             Ok(images) => images,
                             Err(err) => {
                                 debug_log!(
@@ -518,6 +590,20 @@ pub fn spawn_qzone_sender(
                                 continue;
                             }
                         };
+                        if images.is_empty() {
+                            let err = QzoneError::unknown("empty images");
+                            let retry_at = started_at_ms
+                                .saturating_add(retry_delay_ms(err.kind, 1));
+                            let event = SendEvent::SendFailed {
+                                post_id,
+                                account_id,
+                                attempt: 1,
+                                retry_at_ms: retry_at,
+                                error: format!("[{:?}] {}", err.kind, err.message),
+                            };
+                            let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
+                            continue;
+                        }
                         let attempt = {
                             let mut guard = state.lock().await;
                             let entry = guard.attempts.entry(post_id).or_insert(0);
@@ -525,23 +611,39 @@ pub fn spawn_qzone_sender(
                             *entry
                         };
                         debug_log!(
-                            "emuqzone publish attempt: post_id={} attempt={} images={} content_len={}",
+                            "emuqzone publish attempt: post_id={} batch={} attempt={} images={} content_len={}",
                             post_id.0,
+                            batch_posts.len(),
                             attempt,
                             images.len(),
-                            content.len()
+                            publish_text.len()
                         );
-                        append_emuqzone_post(emu_state, content, images);
+                        let chunk_size = if max_images_per_post > 0 {
+                            max_images_per_post
+                        } else {
+                            images.len().max(1)
+                        };
+                        for chunk in images.chunks(chunk_size) {
+                            append_emuqzone_post(emu_state, publish_text.clone(), chunk.to_vec());
+                        }
                         debug_log!("emuqzone publish success: post_id={}", post_id.0);
                         let mut guard = state.lock().await;
                         guard.attempts.remove(&post_id);
-                        let event = SendEvent::SendSucceeded {
-                            post_id,
-                            account_id,
-                            finished_at_ms: started_at_ms,
-                            remote_id: None,
-                        };
-                        let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
+                        for other_post_id in batch_posts.iter().copied().filter(|id| *id != post_id) {
+                            let event = ScheduleEvent::SendPlanCanceled { post_id: other_post_id };
+                            let _ = cmd_tx
+                                .send(Command::DriverEvent(Event::Schedule(event)))
+                                .await;
+                        }
+                        for batch_post_id in batch_posts {
+                            let event = SendEvent::SendSucceeded {
+                                post_id: batch_post_id,
+                                account_id: account_id.clone(),
+                                finished_at_ms: started_at_ms,
+                                remote_id: None,
+                            };
+                            let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
+                        }
                         continue;
                     }
                     let napcat = runtime
@@ -607,46 +709,7 @@ pub fn spawn_qzone_sender(
                             continue;
                         }
                     };
-                    let Some(draft) = draft.as_ref() else {
-                        debug_log!("qzone send failed: missing draft post_id={}", post_id.0);
-                        let err = QzoneError::unknown("missing draft");
-                        let retry_at = started_at_ms
-                            .saturating_add(retry_delay_ms(err.kind, 1));
-                        refresh_cookie_cache(&state, napcat).await;
-                        let event = SendEvent::SendFailed {
-                            post_id,
-                            account_id,
-                            attempt: 1,
-                            retry_at_ms: retry_at,
-                            error: format!("[{:?}] {}", err.kind, err.message),
-                        };
-                        let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
-                        continue;
-                    };
-                    if preview_blobs.is_empty() {
-                        debug_log!(
-                            "qzone send failed: missing render preview post_id={}",
-                            post_id.0
-                        );
-                        let err = QzoneError::unknown("missing render preview");
-                        let retry_at =
-                            started_at_ms.saturating_add(retry_delay_ms(err.kind, 1));
-                        refresh_cookie_cache(&state, napcat).await;
-                        let event = SendEvent::SendFailed {
-                            post_id,
-                            account_id,
-                            attempt: 1,
-                            retry_at_ms: retry_at,
-                            error: format!("[{:?}] {}", err.kind, err.message),
-                        };
-                        let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
-                        continue;
-                    }
-
-                    let content = publish_text;
-                    let images =
-                        match collect_images(&draft, &blob_paths, &preview_blobs).await
-                        {
+                    let images = match collect_batch_images(&assets, &blob_paths).await {
                         Ok(images) => images,
                         Err(err) => {
                             debug_log!(
@@ -654,8 +717,8 @@ pub fn spawn_qzone_sender(
                                 err.kind,
                                 err.message
                             );
-                            let retry_at = started_at_ms
-                                .saturating_add(retry_delay_ms(err.kind, 1));
+                            let retry_at =
+                                started_at_ms.saturating_add(retry_delay_ms(err.kind, 1));
                             refresh_cookie_cache(&state, napcat).await;
                             let event = SendEvent::SendFailed {
                                 post_id,
@@ -668,6 +731,20 @@ pub fn spawn_qzone_sender(
                             continue;
                         }
                     };
+                    if images.is_empty() {
+                        let err = QzoneError::unknown("empty images");
+                        let retry_at =
+                            started_at_ms.saturating_add(retry_delay_ms(err.kind, 1));
+                        let event = SendEvent::SendFailed {
+                            post_id,
+                            account_id,
+                            attempt: 1,
+                            retry_at_ms: retry_at,
+                            error: format!("[{:?}] {}", err.kind, err.message),
+                        };
+                        let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
+                        continue;
+                    }
                     let attempt = {
                         let mut guard = state.lock().await;
                         let entry = guard.attempts.entry(post_id).or_insert(0);
@@ -675,50 +752,84 @@ pub fn spawn_qzone_sender(
                         *entry
                     };
                     debug_log!(
-                        "qzone publish attempt: post_id={} attempt={} images={} content_len={}",
+                        "qzone publish attempt: post_id={} batch={} attempt={} images={} content_len={}",
                         post_id.0,
+                        batch_posts.len(),
                         attempt,
                         images.len(),
-                        content.len()
+                        publish_text.len()
                     );
 
-                    match client.publish_emotion(&content, &images).await {
-                        Ok(tid) => {
-                            debug_log!(
-                                "qzone publish success: post_id={} tid={}",
-                                post_id.0,
-                                tid
-                            );
-                            let mut guard = state.lock().await;
-                            guard.attempts.remove(&post_id);
-                            let event = SendEvent::SendSucceeded {
-                                post_id,
-                                account_id,
-                                finished_at_ms: started_at_ms,
-                                remote_id: Some(tid),
-                            };
-                            let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
+                    let chunk_size = if max_images_per_post > 0 {
+                        max_images_per_post
+                    } else {
+                        images.len().max(1)
+                    };
+                    let mut first_tid: Option<String> = None;
+                    let mut publish_error: Option<QzoneError> = None;
+                    for chunk in images.chunks(chunk_size) {
+                        match client.publish_emotion(&publish_text, chunk).await {
+                            Ok(tid) => {
+                                if first_tid.is_none() {
+                                    first_tid = Some(tid);
+                                }
+                            }
+                            Err(err) => {
+                                publish_error = Some(err);
+                                break;
+                            }
                         }
-                        Err(err) => {
-                            debug_log!(
-                                "qzone publish failed: post_id={} attempt={} kind={:?} message={}",
-                                post_id.0,
-                                attempt,
-                                err.kind,
-                                err.message
-                            );
-                            let retry_at = started_at_ms
-                                .saturating_add(retry_delay_ms(err.kind, attempt));
-                            refresh_cookie_cache(&state, napcat).await;
-                            let event = SendEvent::SendFailed {
-                                post_id,
-                                account_id,
-                                attempt,
-                                retry_at_ms: retry_at,
-                                error: format!("[{:?}] {}", err.kind, err.message),
-                            };
-                            let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
-                        }
+                    }
+                    if let Some(err) = publish_error {
+                        debug_log!(
+                            "qzone publish failed: post_id={} attempt={} kind={:?} message={}",
+                            post_id.0,
+                            attempt,
+                            err.kind,
+                            err.message
+                        );
+                        let retry_at = started_at_ms
+                            .saturating_add(retry_delay_ms(err.kind, attempt));
+                        refresh_cookie_cache(&state, napcat).await;
+                        let event = SendEvent::SendFailed {
+                            post_id,
+                            account_id,
+                            attempt,
+                            retry_at_ms: retry_at,
+                            error: format!("[{:?}] {}", err.kind, err.message),
+                        };
+                        let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
+                        continue;
+                    }
+
+                    let _chunk_count = (images.len() + chunk_size - 1) / chunk_size;
+                    debug_log!(
+                        "qzone publish success: post_id={} chunks={}",
+                        post_id.0,
+                        _chunk_count
+                    );
+                    let mut guard = state.lock().await;
+                    guard.attempts.remove(&post_id);
+                    drop(guard);
+                    for other_post_id in batch_posts.iter().copied().filter(|id| *id != post_id) {
+                        let event = ScheduleEvent::SendPlanCanceled { post_id: other_post_id };
+                        let _ = cmd_tx
+                            .send(Command::DriverEvent(Event::Schedule(event)))
+                            .await;
+                    }
+                    for batch_post_id in batch_posts {
+                        let remote_id = if batch_post_id == post_id {
+                            first_tid.clone()
+                        } else {
+                            None
+                        };
+                        let event = SendEvent::SendSucceeded {
+                            post_id: batch_post_id,
+                            account_id: account_id.clone(),
+                            finished_at_ms: started_at_ms,
+                            remote_id,
+                        };
+                        let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
                     }
                 }
                 _ => {}
@@ -808,16 +919,16 @@ impl QzoneClient {
         }
 
         debug_log!("qzone publish g_tk={}", self.gtk);
-        if let Some(format) = form.get("format") {
-            debug_log!("qzone publish form format={}", format);
+        if let Some(_format) = form.get("format") {
+            debug_log!("qzone publish form format={}", _format);
         }
-        if let Some(pic_bo) = form.get("pic_bo") {
-            debug_log!("qzone publish form pic_bo={}", pic_bo);
+        if let Some(_pic_bo) = form.get("pic_bo") {
+            debug_log!("qzone publish form pic_bo={}", _pic_bo);
         }
-        if let Some(richval) = form.get("richval") {
+        if let Some(_richval) = form.get("richval") {
             debug_log!(
                 "qzone publish form richval={}",
-                richval.replace('\t', "\\t")
+                _richval.replace('\t', "\\t")
             );
         }
 
@@ -872,17 +983,17 @@ impl QzoneClient {
                     debug_log!("qzone publish response empty; treating as success");
                     return Ok("unknown".to_string());
                 }
-                let sample: String = trimmed.chars().take(200).collect();
+                let _sample: String = trimmed.chars().take(200).collect();
                 debug_log!(
                     "qzone publish response unparseable: len={} head={}",
                     trimmed.len(),
-                    sample
+                    _sample
                 );
                 return Err(QzoneError::unknown("invalid publish response body"));
             }
         };
-        if let Ok(pretty) = serde_json::to_string_pretty(&json) {
-            debug_log!("qzone publish response json:\n{}", pretty);
+        if let Ok(_pretty) = serde_json::to_string_pretty(&json) {
+            debug_log!("qzone publish response json:\n{}", _pretty);
         }
         if let Some(err) = classify_response_error(&json) {
             return Err(err.with_context("publish response"));
@@ -993,8 +1104,8 @@ impl QzoneClient {
         let json_str = &body[start..=end];
         let json: Value = serde_json::from_str(json_str)
             .map_err(|err| QzoneError::unknown(format!("invalid upload json: {}", err)))?;
-        if let Ok(pretty) = serde_json::to_string_pretty(&json) {
-            debug_log!("qzone upload response json:\n{}", pretty);
+        if let Ok(_pretty) = serde_json::to_string_pretty(&json) {
+            debug_log!("qzone upload response json:\n{}", _pretty);
         }
         if let Some(err) = classify_response_error(&json) {
             return Err(err.with_context("upload response"));
@@ -1004,27 +1115,48 @@ impl QzoneClient {
 
 }
 
-fn build_publish_text(
-    post_id: PostId,
-    external_code: Option<ExternalCode>,
-    review_code: Option<ReviewCode>,
-    ingress_ids: Option<&Vec<IngressId>>,
+fn build_publish_text_for_batch(
+    post_ids: &[PostId],
+    external_codes: &HashMap<PostId, ExternalCode>,
+    review_codes: &HashMap<PostId, ReviewCode>,
+    post_ingress: &HashMap<PostId, Vec<IngressId>>,
     ingress_authors: &HashMap<IngressId, IngressAuthor>,
     post_anonymous: &HashMap<PostId, bool>,
+    at_unprived_sender: bool,
 ) -> String {
-    let code = external_code
-        .map(|value| value.to_string())
-        .or_else(|| review_code.map(|value| value.to_string()))
-        .unwrap_or_else(|| post_id.0.to_string());
-    let mut text = format!("#{}", code);
+    let mut codes = Vec::new();
+    for post_id in post_ids {
+        let code = external_codes
+            .get(post_id)
+            .map(|value| *value as u128)
+            .or_else(|| review_codes.get(post_id).map(|value| *value as u128))
+            .unwrap_or(post_id.0);
+        codes.push(code);
+    }
 
-    if post_anonymous.get(&post_id).copied().unwrap_or(false) {
+    let mut text = if let (Some(min), Some(max)) = (codes.iter().min(), codes.iter().max()) {
+        if min == max {
+            format!("#{}", min)
+        } else {
+            format!("#{}~{}", min, max)
+        }
+    } else {
+        "#0".to_string()
+    };
+
+    if !at_unprived_sender {
         return text;
     }
 
     let mut mentions = Vec::new();
     let mut seen = HashSet::new();
-    if let Some(ingress_ids) = ingress_ids {
+    for post_id in post_ids {
+        if post_anonymous.get(post_id).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(ingress_ids) = post_ingress.get(post_id) else {
+            continue;
+        };
         for ingress_id in ingress_ids {
             let Some(author) = ingress_authors.get(ingress_id) else {
                 continue;
@@ -1054,6 +1186,89 @@ fn should_mention(author: &IngressAuthor) -> bool {
     // Missing sender_name is treated as anonymous, so skip @.
     let sender_name = author.sender_name.as_deref().unwrap_or("").trim();
     !sender_name.is_empty()
+}
+
+fn collect_batch_post_ids(
+    state: &QzoneState,
+    group_id: &str,
+    leader: PostId,
+    leader_priority: SendPriority,
+) -> Vec<PostId> {
+    let mut queued = state
+        .send_plans
+        .iter()
+        .filter(|(_, plan)| {
+            plan.group_id == group_id && plan.priority == leader_priority
+        })
+        .map(|(post_id, plan)| (plan.seq, *post_id))
+        .collect::<Vec<_>>();
+    queued.sort_by_key(|(seq, post_id)| (*seq, post_id.0));
+
+    let mut out = Vec::with_capacity(queued.len().saturating_add(1));
+    out.push(leader);
+    for (_, post_id) in queued {
+        if post_id != leader {
+            out.push(post_id);
+        }
+    }
+    out
+}
+
+struct PostAssets {
+    draft: Draft,
+    preview_blobs: Vec<BlobId>,
+}
+
+fn collect_post_assets(
+    state: &QzoneState,
+    post_ids: &[PostId],
+) -> Result<Vec<PostAssets>, QzoneError> {
+    let mut out = Vec::new();
+    for post_id in post_ids {
+        let Some(draft) = resolve_draft_for_send(state, *post_id) else {
+            return Err(QzoneError::unknown(format!(
+                "missing draft post_id={}",
+                post_id.0
+            )));
+        };
+        let preview_blobs = render_preview_blobs(state, *post_id);
+        if preview_blobs.is_empty() {
+            return Err(QzoneError::unknown(format!(
+                "missing render preview post_id={}",
+                post_id.0
+            )));
+        }
+        out.push(PostAssets {
+            draft,
+            preview_blobs,
+        });
+    }
+    Ok(out)
+}
+
+#[cfg(debug_assertions)]
+fn collect_emuqzone_batch_images(
+    posts: &[PostAssets],
+    blob_paths: &HashMap<BlobId, String>,
+) -> Result<Vec<String>, QzoneError> {
+    let mut images = Vec::new();
+    for post in posts {
+        let mut part = collect_emuqzone_images(&post.draft, blob_paths, &post.preview_blobs)?;
+        images.append(&mut part);
+    }
+    Ok(images)
+}
+
+async fn collect_batch_images(
+    posts: &[PostAssets],
+    blob_paths: &HashMap<BlobId, String>,
+) -> Result<Vec<Vec<u8>>, QzoneError> {
+    let mut images = Vec::new();
+    for post in posts {
+        let mut part = collect_images(&post.draft, blob_paths, &post.preview_blobs).await?;
+        images.append(&mut part);
+    }
+    Ok(images)
 }
 
 fn resolve_draft_for_send(state: &QzoneState, post_id: PostId) -> Option<Draft> {
@@ -1113,6 +1328,7 @@ fn resolve_blob_path(
         .ok_or_else(|| QzoneError::unknown("missing blob path"))
 }
 
+#[allow(dead_code)]
 fn resolve_local_image_path(
     kind: MediaKind,
     reference: &MediaReference,
@@ -1124,6 +1340,7 @@ fn resolve_local_image_path(
     }
 }
 
+#[allow(dead_code)]
 fn resolve_remote_image_path(kind: MediaKind, source: &str) -> Result<String, QzoneError> {
     if let Some(path) = source.strip_prefix("file://") {
         return Ok(path.to_string());
@@ -1173,6 +1390,7 @@ fn decode_inline_source(source: &str) -> Result<Option<(Option<String>, Vec<u8>)
     Ok(None)
 }
 
+#[allow(dead_code)]
 fn ext_from_content_type(content_type: &str) -> Option<&'static str> {
     let base = content_type.split(';').next()?.trim().to_ascii_lowercase();
     match base.as_str() {
@@ -1185,6 +1403,7 @@ fn ext_from_content_type(content_type: &str) -> Option<&'static str> {
     }
 }
 
+#[allow(dead_code)]
 fn default_ext_for_kind(kind: MediaKind) -> &'static str {
     match kind {
         MediaKind::Image => "png",
@@ -1195,6 +1414,7 @@ fn default_ext_for_kind(kind: MediaKind) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 fn cache_inline_bytes(bytes: &[u8], ext: &str) -> Result<String, QzoneError> {
     let ext = ext.trim_start_matches('.');
     let parts: Vec<&[u8]> = vec![bytes, ext.as_bytes()];
@@ -1211,6 +1431,7 @@ fn cache_inline_bytes(bytes: &[u8], ext: &str) -> Result<String, QzoneError> {
     Ok(path.to_string_lossy().to_string())
 }
 
+#[allow(dead_code)]
 fn inline_cache_root() -> PathBuf {
     std::env::var("OQQWALL_BLOB_DIR")
         .map(PathBuf::from)
@@ -1261,6 +1482,7 @@ fn resolve_reference_bytes(
     }
 }
 
+#[allow(dead_code)]
 fn id128_hex(value: u128) -> String {
     format!("{:032x}", value)
 }
@@ -1604,13 +1826,13 @@ async fn refresh_cookie_cache(state: &Arc<Mutex<QzoneState>>, napcat: &NapCatCon
             });
             debug_log!("qzone cookies refreshed after send failure");
         }
-        Err(err) => {
+        Err(_err) => {
             let mut guard = state.lock().await;
             guard.cookie_cache = None;
             debug_log!(
                 "qzone cookies refresh failed: kind={:?} message={}",
-                err.kind,
-                err.message
+                _err.kind,
+                _err.message
             );
         }
     }
@@ -1729,8 +1951,8 @@ fn classify_http_status_with_body(context: &str, status: u16, body: &str) -> Qzo
 }
 
 fn debug_log_http_failure(
-    context: &str,
-    status: reqwest::StatusCode,
+    _context: &str,
+    _status: reqwest::StatusCode,
     headers: &reqwest::header::HeaderMap,
     body: &str,
 ) {
@@ -1739,22 +1961,22 @@ fn debug_log_http_failure(
         let value = value.to_str().unwrap_or("<non-utf8>");
         header_lines.push(format!("{}: {}", key.as_str(), value));
     }
-    let header_block = if header_lines.is_empty() {
+    let _header_block = if header_lines.is_empty() {
         "<empty>".to_string()
     } else {
         header_lines.join("\n")
     };
     debug_log!(
         "{} non-200: status={} reason={}\nheaders:\n{}\nbody:\n{}",
-        context,
-        status.as_u16(),
-        status.canonical_reason().unwrap_or("<none>"),
-        header_block,
+        _context,
+        _status.as_u16(),
+        _status.canonical_reason().unwrap_or("<none>"),
+        _header_block,
         body
     );
     if let Ok(json) = serde_json::from_str::<Value>(body) {
-        if let Ok(pretty) = serde_json::to_string_pretty(&json) {
-            debug_log!("{} non-200 json:\n{}", context, pretty);
+        if let Ok(_pretty) = serde_json::to_string_pretty(&json) {
+            debug_log!("{} non-200 json:\n{}", _context, _pretty);
         }
     }
 }

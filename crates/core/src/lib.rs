@@ -26,4 +26,4 @@ pub use ids::{
     ReviewId, SessionId, TimestampMs, TAG_BLOB_ID, TAG_DRAFT_ID, TAG_INGRESS_ID, TAG_POST_ID,
     TAG_REVIEW_ID, TAG_SESSION_ID,
 };
-pub use state::StateView;
+pub use state::{MediaFetchKey, MediaFetchMeta, StateView};
