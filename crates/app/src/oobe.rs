@@ -49,7 +49,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mainqqid = prompt_required("主账号 QQ 号（mainqqid）")?;
     let minorqqid = prompt_csv_strings("副账号 QQ 号列表（逗号分隔，可留空）")?;
 
-    let napcat_ws_url = prompt_with_default("本组 NapCat WS 地址", "ws://127.0.0.1:3001")?;
+    let napcat_ws_url = prompt_with_default("本组 NapCat WS 地址", "ws://127.0.0.1:3001/ws/")?;
     let access_token =
         prompt_optional("本组 NapCat access_token（留空则运行时用环境变量）")?;
     let process_waittime_sec = prompt_u64("聚合窗口秒数（process_waittime_sec）", 20)?;
