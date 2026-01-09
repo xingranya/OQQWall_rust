@@ -23,13 +23,16 @@ Rust 版的目标是把原版脚本链路重构成可测试、可回放、可演
 
 ## 开源项目列表
 
-本项目使用或参考了以下开源项目：  
-[Campux](https://github.com/idoknow/Campux)  
-[napneko](https://napneko.github.io/zh-CN/)  
-[liteloaderqqnt](https://liteloaderqqnt.github.io/)  
-[LLOneBot](https://github.com/LLOneBot/LLOneBot/)  
-[Lagrange.onebot](https://github.com/LSTM-Kirigaya/Lagrange.onebot)  
-[Stapxs QQ lite](https://github.com/Stapxs/Stapxs-QQ-Lite-2.0)  
+本项目在设计/对接上使用或参考了以下开源项目（按名称排序）：
+
+- [Campux](https://github.com/idoknow/Campux)：校园墙相关工具链/项目参考。
+- [napneko（NapCat）](https://napneko.github.io/zh-CN/)：QQNT 侧对接生态（事件来源/接入方案参考）。
+- [LiteLoaderQQNT](https://liteloaderqqnt.github.io/)：QQNT 插件加载框架（用于运行 OneBot 等插件）。
+- [LLOneBot](https://github.com/LLOneBot/LLOneBot/)：OneBot 实现（对接与行为参考）。
+- [Lagrange.onebot](https://github.com/LSTM-Kirigaya/Lagrange.onebot)：OneBot 实现（对接与行为参考）。
+- [Stapxs QQ Lite](https://github.com/Stapxs/Stapxs-QQ-Lite-2.0)：QQ 轻量客户端/交互实现参考。
+
+说明：本仓库不包含或分发上述项目的代码；实际使用时请自行安装，并遵守其各自的开源许可协议与使用条款。
 
 感谢各位对自由软件与本项目作出的贡献！
 
