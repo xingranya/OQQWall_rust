@@ -1,50 +1,36 @@
-# OQQWall_RUST 开放 QQ 校园墙自动运营系统（Rust 单机版）
-
-> OQQWall 的 Rust 重写/单机版实现：采用 Functional Core / Imperative Shell 架构，通过 NapCat/OneBot 接入 QQ 投稿、审核与发送 QQ 空间；当前全链路直接渲染 PNG。
+# OQQWall_RUST 开放 QQ 校园墙自动运营系统（生锈版）
+# 👍 稳定运行数十万秒 👍
 
 ## 简介
-本系统用于“校园墙”日常运营：收稿 → 聚合成稿 → 渲染预览 → 审核群指令 → 排程发送 QQ 空间。  
 Rust 版的目标是把原版脚本链路重构成可测试、可回放、可演进的事件驱动系统（并尽量保持原版的使用体验与指令语义）。
 
-开始前请注意：NapCat/OneBot 属于 QQ 非官方接入方式，存在账号风控风险；请自行评估并在可控账号上使用。
+本系统用于“校园墙”日常运营：收稿 → 聚合成稿 → 渲染预览 → 审核群指令 → 排程发送 QQ 空间。  
+
+本系统专注于“墙”本身，适用于用户量五十万以下的情况，致力于给用户提供QQ校园墙的无感的交互
+
+本系统的技术实现由GPT进行，核心为纯函数式，总体上速度极快
+<br/>RUST版本的目标是尽可能优化性能，相比原版OQQWall,他快了至少一百倍
+<br/>编写和测试平台是主线ArchLinux，作者目前使用的生产环境是阿里云的ubuntu 22.04 x64 UEFI版本，最低兼容glibc版本为glibc v2.31。
+
+本系统拥有处理并发的能力，允许的最小投稿时间间隔是无限小，最大并行处理能力取决于你的电脑内存大小和管理员响应速度。
+
+本系统支持如下类型的消息：文本，表情，表情包，图片，视频，文件，暂不支持卡片和聊天记录
+技术交流请加群1056259167
 
 # <div align=center>文档</div>
 ## <div align=center > [快速开始](OQQWall_rust.wiki/快速开始.md) | [全部文档](OQQWall_rust.wiki/Home.md)</div>
-
-## 功能概览
-- NapCat WS 收稿：群聊/私聊 → Ingress 事件
-- `(chat_id, user_id)` 时间窗口聚合，超时自动成稿
-- Draft 构建 + PNG 渲染
-- 审核群发布 + 审核指令（是/否/删/等），兼容“回复审核消息执行”
-- Qzone Sender：通过 NapCat `get_cookies` 拉取凭据发送空间（短暂缓存）
-- 失败重试/退避（按错误类型）
-
-## 路线图（Rust 版）
-- 接入 `crates/infra` 的 journal/snapshot/blob 落盘，支持重启回放与快速恢复
-- 补齐运维子命令（`doctor/replay/export` 等）与 Web 审核面板（可选）
-- 渲染器补齐更多消息类型与排版细节（对齐原版效果）
-
-## 目录结构
-- `crates/app`：二进制入口与装配（配置、runtime、TUI/OOBE）
-- `crates/core`：纯函数核心（Event/State/Reducer/Decider）
-- `crates/drivers`：IO 驱动（NapCat WS、Qzone Sender、渲染）
-- `crates/infra`：本地基础设施（journal/snapshot/blob，逐步接入）
-
-## 快速开始（摘要）
-1. 启动 NapCat，并开启 OneBot WS（例如：`ws://127.0.0.1:3001/ws`）。
-2. 生成配置（可选）：`cargo run -p OQQWall_RUST -- oobe`
-3. 运行：`cargo run -p OQQWall_RUST`
-
-更完整的从 0 跑通流程见 `OQQWall_rust.wiki/快速开始.md`。
-
-## 文档索引
-- `OQQWall_rust.wiki/Home.md`：Wiki 主页（从此进入）
-- `docs/oobe.md`：OOBE（从 0 到首次跑通）
-- `docs/config.md`：配置规范与字段说明
-- `docs/command.md`：群内指令与审核指令
-- `docs/runbook.md`：部署/运维/排障手册
-- `docs/engineering.md`：工程落地与架构约束
-- `docs/dev_guide.md`：设计与演进路线
+<div align="center">
 
 ## 开源项目列表
-本项目使用/参考了：Rust、Tokio、Serde、Skia（渲染）、NapCat/OneBot 生态等；并继承原版 OQQWall 的指令与交互习惯。
+
+本项目使用或参考了以下开源项目：  
+[Campux](https://github.com/idoknow/Campux)  
+[napneko](https://napneko.github.io/zh-CN/)  
+[liteloaderqqnt](https://liteloaderqqnt.github.io/)  
+[LLOneBot](https://github.com/LLOneBot/LLOneBot/)  
+[Lagrange.onebot](https://github.com/LSTM-Kirigaya/Lagrange.onebot)  
+[Stapxs QQ lite](https://github.com/Stapxs/Stapxs-QQ-Lite-2.0)  
+
+感谢各位对自由软件与本项目作出的贡献！
+
+</div>
