@@ -18,7 +18,7 @@ Rust 版的目标是把原版脚本链路重构成可测试、可回放、可演
 技术交流请加群1056259167
 
 # <div align=center>文档</div>
-## <div align=center > [快速开始](OQQWall_rust.wiki/快速开始.md) | [全部文档](OQQWall_rust.wiki/Home.md)</div>
+## <div align=center > [快速开始](https://github.com/gfhdhytghd/OQQWall_rust/wiki/%E5%BF%AB%E9%80%9F%E5%BC%80%E5%A7%8B) | [全部文档](https://github.com/gfhdhytghd/OQQWall_rust/wiki)</div>
 <div align="center">
 
 ## 开源项目列表
