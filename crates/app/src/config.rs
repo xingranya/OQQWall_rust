@@ -103,9 +103,9 @@ impl AppConfig {
                     .unwrap_or(default_friend_request_window_sec);
             let friend_add_message = parse_string(group_value.get("friend_add_message"))
                 .or_else(|| default_friend_add_message.clone());
-            let _napcat_ws_log = ws_url_for_log(&napcat.ws_url);
+            let _napcat_ws_log = base_url_for_log(&napcat.base_url);
             debug_log!(
-                "config group: group_id={} audit_group_id={:?} napcat_ws_url={} napcat_token_present={}",
+                "config group: group_id={} audit_group_id={:?} napcat_base_url={} napcat_token_present={}",
                 group_id,
                 audit_group_id,
                 _napcat_ws_log,
@@ -121,7 +121,7 @@ impl AppConfig {
         }
         if group_configs.is_empty() {
             let Some(napcat) = fallback_napcat.clone() else {
-                return Err("missing groups and napcat_ws_url".to_string());
+                return Err("missing groups and napcat_base_url".to_string());
             };
             group_configs.push(AppGroupConfig {
                 group_id: "default".to_string(),
@@ -195,6 +195,10 @@ fn parse_string(value: Option<&Value>) -> Option<String> {
         Value::Number(n) => Some(n.to_string()),
         _ => None,
     }
+}
+
+fn nonempty(value: Option<String>) -> Option<String> {
+    value.and_then(|v| if v.trim().is_empty() { None } else { Some(v) })
 }
 
 fn parse_bool(value: Option<&Value>) -> Option<bool> {
@@ -372,42 +376,44 @@ fn parse_schedule_str(value: &str) -> Option<u16> {
 }
 
 fn parse_napcat_config(common: &Value, group: Option<&Value>) -> Result<NapCatConfig, String> {
-    let ws_url = resolve_napcat_ws_url(common, group)
-        .ok_or_else(|| "missing napcat_ws_url".to_string())?;
+    let base_url = nonempty(resolve_napcat_base_url(common, group))
+        .ok_or_else(|| "missing napcat_base_url".to_string())?;
+    let base_url = normalize_napcat_base_url(&base_url);
     let access_token = resolve_napcat_token(common, group);
-
-    let _ws_log = ws_url_for_log(&ws_url);
+    let _base_log = base_url_for_log(&base_url);
     debug_log!(
-        "napcat config resolved: ws_url={} token_present={}",
-        _ws_log,
+        "napcat config resolved: base_url={} token_present={}",
+        _base_log,
         access_token.is_some()
     );
     Ok(NapCatConfig {
-        ws_url,
+        base_url,
         access_token,
     })
 }
 
 fn parse_napcat_config_optional(common: &Value) -> Option<NapCatConfig> {
-    let ws_url = resolve_napcat_ws_url(common, None)?;
+    let base_url = nonempty(resolve_napcat_base_url(common, None))?;
+    let base_url = normalize_napcat_base_url(&base_url);
     let access_token = resolve_napcat_token(common, None);
-    let _ws_log = ws_url_for_log(&ws_url);
+    let _base_log = base_url_for_log(&base_url);
     debug_log!(
-        "napcat config resolved: ws_url={} token_present={}",
-        _ws_log,
+        "napcat config resolved: base_url={} token_present={}",
+        _base_log,
         access_token.is_some()
     );
     Some(NapCatConfig {
-        ws_url,
+        base_url,
         access_token,
     })
 }
 
-fn resolve_napcat_ws_url(common: &Value, group: Option<&Value>) -> Option<String> {
-    let group_ws = group.and_then(|v| parse_string(v.get("napcat_ws_url")));
-    let common_ws = parse_string(common.get("napcat_ws_url"));
-    env_override("OQQWALL_NAPCAT_WS_URL", group_ws.or(common_ws))
+fn resolve_napcat_base_url(common: &Value, group: Option<&Value>) -> Option<String> {
+    let group_base = group.and_then(|v| parse_string(v.get("napcat_base_url")));
+    let common_base = parse_string(common.get("napcat_base_url"));
+    env_override("OQQWALL_NAPCAT_BASE_URL", group_base.or(common_base))
 }
+
 
 fn resolve_napcat_token(common: &Value, group: Option<&Value>) -> Option<String> {
     let group_token = group.and_then(|v| parse_string(v.get("napcat_access_token")));
@@ -415,12 +421,23 @@ fn resolve_napcat_token(common: &Value, group: Option<&Value>) -> Option<String>
     env_override("OQQWALL_NAPCAT_TOKEN", group_token.or(common_token))
 }
 
+fn normalize_napcat_base_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let trimmed = trimmed
+        .strip_prefix("ws://")
+        .or_else(|| trimmed.strip_prefix("wss://"))
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .unwrap_or(trimmed);
+    trimmed.trim_end_matches('/').to_string()
+}
+
 #[cfg(debug_assertions)]
-fn ws_url_for_log(url: &str) -> &str {
+fn base_url_for_log(url: &str) -> &str {
     url.split('?').next().unwrap_or(url)
 }
 
 #[cfg(not(debug_assertions))]
-fn ws_url_for_log(_url: &str) -> &str {
+fn base_url_for_log(_url: &str) -> &str {
     "<redacted>"
 }

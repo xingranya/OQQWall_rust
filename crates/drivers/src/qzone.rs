@@ -11,7 +11,6 @@ use std::{env};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use futures_util::{SinkExt, StreamExt};
 use oqqwall_rust_core::draft::{
     Draft, DraftBlock, IngressMessage, MediaKind, MediaReference,
 };
@@ -27,13 +26,11 @@ use oqqwall_rust_infra::{LocalJournal, SnapshotStore};
 use reqwest::Client;
 #[cfg(debug_assertions)]
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
-use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
 
-use crate::napcat::NapCatConfig;
+use crate::napcat::{napcat_ws_request, NapCatConfig};
 use crate::blob_cache;
 
 #[cfg(debug_assertions)]
@@ -650,7 +647,7 @@ pub fn spawn_qzone_sender(
                         .napcat_by_group
                         .get(&group_id)
                         .or_else(|| runtime.default_napcat.as_ref());
-                    let Some(napcat) = napcat else {
+                    let Some(_napcat) = napcat else {
                         debug_log!(
                             "qzone send failed: missing napcat config for group_id={}",
                             group_id
@@ -665,7 +662,7 @@ pub fn spawn_qzone_sender(
                         let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
                         continue;
                     };
-                    let cookies = match get_cookies(&state, napcat).await {
+    let cookies = match get_cookies(&state, &account_id).await {
                         Ok(cookies) => cookies,
                         Err(err) => {
                             debug_log!(
@@ -675,7 +672,7 @@ pub fn spawn_qzone_sender(
                             );
                             let retry_at = started_at_ms
                                 .saturating_add(retry_delay_ms(err.kind, 1));
-                            refresh_cookie_cache(&state, napcat).await;
+                            refresh_cookie_cache(&state, &account_id).await;
                             let event = SendEvent::SendFailed {
                                 post_id,
                                 account_id,
@@ -697,7 +694,7 @@ pub fn spawn_qzone_sender(
                             );
                             let retry_at = started_at_ms
                                 .saturating_add(retry_delay_ms(err.kind, 1));
-                            refresh_cookie_cache(&state, napcat).await;
+                            refresh_cookie_cache(&state, &account_id).await;
                             let event = SendEvent::SendFailed {
                                 post_id,
                                 account_id,
@@ -719,7 +716,7 @@ pub fn spawn_qzone_sender(
                             );
                             let retry_at =
                                 started_at_ms.saturating_add(retry_delay_ms(err.kind, 1));
-                            refresh_cookie_cache(&state, napcat).await;
+                            refresh_cookie_cache(&state, &account_id).await;
                             let event = SendEvent::SendFailed {
                                 post_id,
                                 account_id,
@@ -790,7 +787,7 @@ pub fn spawn_qzone_sender(
                         );
                         let retry_at = started_at_ms
                             .saturating_add(retry_delay_ms(err.kind, attempt));
-                        refresh_cookie_cache(&state, napcat).await;
+                        refresh_cookie_cache(&state, &account_id).await;
                         let event = SendEvent::SendFailed {
                             post_id,
                             account_id,
@@ -1792,7 +1789,7 @@ fn retry_delay_ms(kind: QzoneErrorKind, attempt: u32) -> TimestampMs {
 
 async fn get_cookies(
     state: &Arc<Mutex<QzoneState>>,
-    napcat: &NapCatConfig,
+    account_id: &str,
 ) -> Result<HashMap<String, String>, QzoneError> {
     let now = now_ms();
     if let Some(cache) = state.lock().await.cookie_cache.as_ref() {
@@ -1806,7 +1803,9 @@ async fn get_cookies(
     }
 
     debug_log!("qzone cookies cache miss: fetching via napcat ws");
-    let cookies = fetch_cookies_ws(napcat).await?;
+    let cookies = fetch_cookies_ws(account_id)
+        .await
+        .map_err(QzoneError::network)?;
     let mut guard = state.lock().await;
     guard.cookie_cache = Some(CookieCache {
         cookies: cookies.clone(),
@@ -1815,8 +1814,11 @@ async fn get_cookies(
     Ok(cookies)
 }
 
-async fn refresh_cookie_cache(state: &Arc<Mutex<QzoneState>>, napcat: &NapCatConfig) {
-    match fetch_cookies_ws(napcat).await {
+async fn refresh_cookie_cache(
+    state: &Arc<Mutex<QzoneState>>,
+    account_id: &str,
+) {
+    match fetch_cookies_ws(account_id).await.map_err(QzoneError::network) {
         Ok(cookies) => {
             let now = now_ms();
             let mut guard = state.lock().await;
@@ -1838,88 +1840,22 @@ async fn refresh_cookie_cache(state: &Arc<Mutex<QzoneState>>, napcat: &NapCatCon
     }
 }
 
-async fn fetch_cookies_ws(napcat: &NapCatConfig) -> Result<HashMap<String, String>, QzoneError> {
-    debug_log!(
-        "qzone fetch cookies ws: ws_url={} token_present={}",
-        ws_url_for_log(&napcat.ws_url),
-        napcat.access_token.is_some()
-    );
-    let ws_url = build_ws_url(&napcat.ws_url, napcat.access_token.as_deref());
-    let mut request = ws_url
-        .into_client_request()
-        .map_err(|err| QzoneError::network(format!("invalid napcat ws url: {}", err)))?;
-    if let Some(token) = napcat.access_token.as_deref() {
-        let header_value = format!("Bearer {}", token);
-        if let Ok(value) = header_value.parse() {
-            request.headers_mut().insert("Authorization", value);
-        }
-    }
-
-    let (ws_stream, _) = connect_async(request)
-        .await
-        .map_err(|err| QzoneError::network(format!("napcat ws connect failed: {}", err)))?;
-    debug_log!("qzone fetch cookies ws connected");
-    let (mut ws_write, mut ws_read) = ws_stream.split();
-    let echo = format!("echo-{}", now_ms());
-    let payload = serde_json::json!({
-        "action": "get_cookies",
-        "params": { "domain": "user.qzone.qq.com" },
-        "echo": echo,
-    });
-    debug_log!("qzone fetch cookies ws send request: echo={}", echo);
-    ws_write
-        .send(tokio_tungstenite::tungstenite::Message::Text(
-            payload.to_string(),
-        ))
-        .await
-        .map_err(|err| QzoneError::network(format!("napcat ws send failed: {}", err)))?;
-
-    let response = timeout(Duration::from_secs(10), async {
-        while let Some(msg) = ws_read.next().await {
-            let msg = msg.map_err(|err| QzoneError::network(format!("napcat ws read failed: {}", err)))?;
-            if !msg.is_text() {
-                continue;
-            }
-            let value: Value = serde_json::from_str(msg.to_text().unwrap_or("{}"))
-                .map_err(|err| QzoneError::network(format!("invalid napcat response: {}", err)))?;
-            let Some(resp_echo) = value.get("echo").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            if resp_echo != echo {
-                continue;
-            }
-            let cookie_str = value
-                .get("data")
-                .and_then(|data| data.get("cookies"))
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| QzoneError::network("napcat response missing cookies"))?;
-            debug_log!("qzone fetch cookies ws received response");
-            return Ok(cookie_str.to_string());
-        }
-        Err(QzoneError::network("napcat ws closed"))
-    })
-    .await
-    .map_err(|_| QzoneError::network("napcat ws timeout"))??;
-
-    Ok(parse_cookie_string(&response))
+async fn fetch_cookies_ws(account_id: &str) -> Result<HashMap<String, String>, String> {
+    let response = napcat_ws_request(
+        account_id,
+        "get_cookies",
+        json!({ "domain": "user.qzone.qq.com" }),
+        Duration::from_secs(10),
+    )
+    .await?;
+    let cookie_str = response
+        .get("data")
+        .and_then(|data| data.get("cookies"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "napcat response missing cookies".to_string())?;
+    Ok(parse_cookie_string(cookie_str))
 }
 
-fn build_ws_url(base: &str, token: Option<&str>) -> String {
-    if let Some(token) = token {
-        if base.contains('?') {
-            format!("{}&access_token={}", base, token)
-        } else {
-            format!("{}?access_token={}", base, token)
-        }
-    } else {
-        base.to_string()
-    }
-}
-
-#[cfg(debug_assertions)]
-fn ws_url_for_log(url: &str) -> &str {
-    url.split('?').next().unwrap_or(url)
-}
 
 fn now_ms() -> i64 {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();

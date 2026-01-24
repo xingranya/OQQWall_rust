@@ -23,13 +23,17 @@ use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use reqwest::Client;
 use serde_json::{json, Value};
 
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
+use tokio::net::TcpListener;
+use tokio_tungstenite::{
+    accept_hdr_async,
+    tungstenite::handshake::server::{ErrorResponse, Request, Response},
+    tungstenite::http::StatusCode,
+};
 
 use crate::blob_cache;
 
@@ -47,7 +51,7 @@ macro_rules! debug_log {
 
 #[derive(Debug, Clone)]
 pub struct NapCatConfig {
-    pub ws_url: String,
+    pub base_url: String,
     pub access_token: Option<String>,
 }
 
@@ -56,6 +60,7 @@ pub struct NapCatRuntimeConfig {
     pub napcat: NapCatConfig,
     pub audit_group_id: Option<String>,
     pub group_id: String,
+    pub accounts: Vec<String>,
     pub tz_offset_minutes: i32,
     pub friend_request_window_sec: u32,
     pub friend_add_message: Option<String>,
@@ -68,6 +73,9 @@ const FRIEND_NOTIFY_DELAY_SEC: u64 = 30;
 const FRIEND_REQUEST_ID_MAX_LEN: usize = 20;
 const FRIEND_SUPPRESS_REMOVE_CHARS: &str = r#"　“”‘’《》〈〉【】。，：；？！（）、「」『』—［］＂＇"'`~!@#$%^&*()_+-={}[]|:;<>?,./"#;
 static STARTUP_NOTICE_SENT: OnceLock<std::sync::Mutex<HashSet<String>>> = OnceLock::new();
+static WS_SESSIONS: OnceLock<std::sync::Mutex<HashMap<String, NapCatWsSession>>> =
+    OnceLock::new();
+static GROUP_ACCOUNTS: OnceLock<std::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 struct ReviewInfo {
@@ -114,9 +122,7 @@ struct MessageChunk {
 
 #[derive(Debug)]
 struct ForwardResolver {
-    client: Client,
-    api_base: String,
-    token: Option<String>,
+    account_id: String,
     cache: HashMap<String, Vec<MessageChunk>>,
     seen: HashSet<String>,
 }
@@ -127,9 +133,12 @@ struct AuditMessage {
     images: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum PendingAction {
     SendAuditMessage { review_id: ReviewId, attempt: u32 },
+    WsRequest {
+        resp_tx: oneshot::Sender<Result<Value, String>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,6 +179,12 @@ struct NapCatState {
     friend_suppression: HashMap<String, Vec<SuppressionEntry>>,
     blob_paths: HashMap<BlobId, String>,
     next_echo: u64,
+}
+
+#[derive(Clone)]
+struct NapCatWsSession {
+    out_tx: mpsc::Sender<String>,
+    state: Arc<Mutex<NapCatState>>,
 }
 
 fn load_state_view_cached() -> StateView {
@@ -323,166 +338,468 @@ fn build_state_from_view(view: &StateView) -> NapCatState {
     state
 }
 
+#[derive(Clone)]
+struct RuntimeEntry {
+    runtime: NapCatRuntimeConfig,
+    state: Arc<Mutex<NapCatState>>,
+}
+
+#[derive(Debug, Clone)]
+struct ReverseBaseUrl {
+    bind_addr: String,
+    path: String,
+}
+
+fn parse_reverse_base_url(raw: &str) -> Result<ReverseBaseUrl, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("napcat base_url is empty".to_string());
+    }
+    let without_scheme = trimmed
+        .strip_prefix("ws://")
+        .or_else(|| trimmed.strip_prefix("wss://"))
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .unwrap_or(trimmed)
+        .trim_end_matches('/');
+    let mut parts = without_scheme.splitn(2, '/');
+    let host_port = parts.next().unwrap_or_default();
+    if host_port.is_empty() {
+        return Err("napcat base_url missing host".to_string());
+    }
+    let path = parts
+        .next()
+        .map(|rest| format!("/{}", rest))
+        .unwrap_or_else(|| "/".to_string());
+    let path = normalize_base_path(&path);
+    let (host, port) = split_host_port(host_port)?;
+    Ok(ReverseBaseUrl {
+        bind_addr: format!("{}:{}", host, port),
+        path,
+    })
+}
+
+fn split_host_port(value: &str) -> Result<(String, u16), String> {
+    if value.starts_with('[') {
+        let end = value
+            .find(']')
+            .ok_or_else(|| "napcat base_url invalid host".to_string())?;
+        let host = &value[..=end];
+        let rest = &value[end + 1..];
+        let port_str = rest
+            .strip_prefix(':')
+            .ok_or_else(|| "napcat base_url missing port".to_string())?;
+        let port = port_str
+            .parse::<u16>()
+            .map_err(|_| "napcat base_url invalid port".to_string())?;
+        return Ok((host.to_string(), port));
+    }
+    let mut parts = value.rsplitn(2, ':');
+    let port_str = parts
+        .next()
+        .ok_or_else(|| "napcat base_url missing port".to_string())?;
+    let host = parts
+        .next()
+        .ok_or_else(|| "napcat base_url missing host".to_string())?;
+    let port = port_str
+        .parse::<u16>()
+        .map_err(|_| "napcat base_url invalid port".to_string())?;
+    Ok((host.to_string(), port))
+}
+
+fn normalize_base_path(raw: &str) -> String {
+    let mut path = raw.trim().to_string();
+    if path.is_empty() {
+        return "/".to_string();
+    }
+    if !path.starts_with('/') {
+        path = format!("/{}", path);
+    }
+    if path.len() > 1 {
+        path = path.trim_end_matches('/').to_string();
+    }
+    path
+}
+
+fn extract_account_from_path(path: &str, base_path: &str) -> Option<String> {
+    let path = if path.is_empty() { "/" } else { path };
+    let path = path.trim_end_matches('/');
+    let base_path = if base_path.is_empty() { "/" } else { base_path };
+    if base_path == "/" {
+        let account = path.trim_start_matches('/');
+        if account.is_empty() || account.contains('/') {
+            return None;
+        }
+        return Some(account.to_string());
+    }
+    if !path.starts_with(base_path) {
+        return None;
+    }
+    let rest = &path[base_path.len()..];
+    let rest = rest.strip_prefix('/')?;
+    if rest.is_empty() || rest.contains('/') {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
+fn request_token(req: &Request) -> Option<String> {
+    if let Some(value) = req.headers().get("Authorization") {
+        if let Ok(raw) = value.to_str() {
+            if let Some(stripped) = raw.strip_prefix("Bearer ") {
+                return Some(stripped.trim().to_string());
+            }
+            if let Some(stripped) = raw.strip_prefix("bearer ") {
+                return Some(stripped.trim().to_string());
+            }
+        }
+    }
+    let query = req.uri().query()?;
+    query_param(query, "access_token")
+        .or_else(|| query_param(query, "token"))
+        .map(|value| value.to_string())
+}
+
+fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    for part in query.split('&') {
+        let mut iter = part.splitn(2, '=');
+        let name = iter.next()?.trim();
+        if name != key {
+            continue;
+        }
+        let value = iter.next().unwrap_or("").trim();
+        if value.is_empty() {
+            return None;
+        }
+        return Some(value);
+    }
+    None
+}
+
+fn reject_response(status: StatusCode, message: &str) -> Result<Response, ErrorResponse> {
+    let response = tokio_tungstenite::tungstenite::http::Response::builder()
+        .status(status)
+        .body(Some(message.to_string()))
+        .unwrap_or_else(|_| {
+            tokio_tungstenite::tungstenite::http::Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(None)
+                .unwrap()
+        });
+    Err(response)
+}
+
 pub fn spawn_napcat_ws(
     cmd_tx: mpsc::Sender<Command>,
     bus_rx: broadcast::Receiver<oqqwall_rust_core::EventEnvelope>,
-    runtime: NapCatRuntimeConfig,
+    base_url: String,
+    runtimes: Vec<NapCatRuntimeConfig>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let base = match parse_reverse_base_url(&base_url) {
+            Ok(base) => base,
+            Err(_err) => {
+                debug_log!(
+                    "napcat ws server skipped: base_url={} err={}",
+                    base_url,
+                    _err
+                );
+                return;
+            }
+        };
         debug_log!(
-            "napcat ws task start: group_id={} audit_group_id={:?} ws_url={} token_present={}",
-            runtime.group_id,
-            runtime.audit_group_id,
-            ws_url_for_log(&runtime.napcat.ws_url),
-            runtime.napcat.access_token.is_some()
+            "napcat ws server start: base_url={} bind_addr={} path={}",
+            base_url,
+            base.bind_addr,
+            base.path
         );
         let state_view = load_state_view_cached();
-        let state = Arc::new(Mutex::new(build_state_from_view(&state_view)));
-        let bus_rx = bus_rx;
+        let mut account_map: HashMap<String, RuntimeEntry> = HashMap::new();
+        let mut fallback_entry: Option<RuntimeEntry> = None;
+        for runtime in runtimes {
+            if runtime.accounts.is_empty() {
+                let entry = RuntimeEntry {
+                    runtime: runtime.clone(),
+                    state: Arc::new(Mutex::new(build_state_from_view(&state_view))),
+                };
+                if fallback_entry.is_none() {
+                    debug_log!(
+                        "napcat ws fallback enabled: group_id={} reason=accounts_empty",
+                        runtime.group_id
+                    );
+                    fallback_entry = Some(entry);
+                } else {
+                    debug_log!(
+                        "napcat ws skipped: group_id={} reason=accounts_empty",
+                        runtime.group_id
+                    );
+                }
+                continue;
+            }
+            let entry = RuntimeEntry {
+                runtime: runtime.clone(),
+                state: Arc::new(Mutex::new(build_state_from_view(&state_view))),
+            };
+            for account in &runtime.accounts {
+                if account_map.contains_key(account) {
+                    debug_log!(
+                        "napcat ws account ignored: account_id={} group_id={}",
+                        account,
+                        runtime.group_id
+                    );
+                    continue;
+                }
+                account_map.insert(account.clone(), entry.clone());
+            }
+        }
+        if account_map.is_empty() && fallback_entry.is_none() {
+            debug_log!("napcat ws server skipped: no accounts registered");
+            return;
+        }
+        let account_map = Arc::new(account_map);
+        let fallback_entry = fallback_entry;
+        let active_accounts: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let listener = match TcpListener::bind(&base.bind_addr).await {
+            Ok(listener) => listener,
+            Err(_err) => {
+                debug_log!(
+                    "napcat ws server bind failed: addr={} err={}",
+                    base.bind_addr,
+                    _err
+                );
+                return;
+            }
+        };
 
         loop {
-            let runtime = runtime.clone();
-            debug_log!(
-                "napcat ws connecting: group_id={} ws_url={}",
-                runtime.group_id,
-                ws_url_for_log(&runtime.napcat.ws_url)
-            );
-            let ws_url =
-                build_ws_url(&runtime.napcat.ws_url, runtime.napcat.access_token.as_deref());
-            let mut request = ws_url.into_client_request().expect("invalid napcat ws url");
-            if let Some(token) = runtime.napcat.access_token.as_deref() {
-                let header_value = format!("Bearer {}", token);
-                if let Ok(value) = header_value.parse() {
-                    request.headers_mut().insert("Authorization", value);
-                }
-            }
-
-            let connect = connect_async(request).await;
-            let (ws_stream, _) = match connect {
+            let (stream, _addr) = match listener.accept().await {
                 Ok(pair) => pair,
-                Err(err) => {
-                    log_ws_connect_error(&runtime.group_id, &runtime.napcat.ws_url, &err);
-                    sleep(Duration::from_secs(5)).await;
+                Err(_err) => {
+                    debug_log!("napcat ws accept failed: err={}", _err);
                     continue;
                 }
             };
-            println!("NapCat WS 已连接: group_id={}", runtime.group_id);
-
-            let (mut ws_write, mut ws_read) = ws_stream.split();
-            debug_log!("napcat ws connected: group_id={}", runtime.group_id);
-            let (out_tx, mut out_rx) = mpsc::channel::<String>(256);
-            let state_ref = Arc::clone(&state);
-            let startup_group_id = runtime
-                .audit_group_id
-                .as_deref()
-                .unwrap_or(&runtime.group_id);
-            if should_send_startup_notice(startup_group_id) {
-                send_group_text(&out_tx, startup_group_id, "系统已启动").await;
-            }
-
-            let writer = tokio::spawn(async move {
-                while let Some(msg) = out_rx.recv().await {
-                    if ws_write
-                        .send(tokio_tungstenite::tungstenite::Message::Text(msg))
-                        .await
-                        .is_err()
-                    {
-                        debug_log!("napcat ws writer send failed");
-                        break;
-                    }
-                }
-            });
-
-            let cmd_tx_read = cmd_tx.clone();
-            let runtime_read = runtime.clone();
-            let state_read = Arc::clone(&state_ref);
-            let out_tx_read = out_tx.clone();
-            let reader = tokio::spawn(async move {
-                while let Some(msg) = ws_read.next().await {
-                    let msg = match msg {
-                        Ok(msg) => msg,
-                        Err(_err) => {
-                            debug_log!("napcat ws read error: {}", _err);
-                            break;
+            let account_map = Arc::clone(&account_map);
+            let active_accounts = Arc::clone(&active_accounts);
+            let fallback_entry = fallback_entry.clone();
+            let base_path = base.path.clone();
+            let cmd_tx = cmd_tx.clone();
+            let bus_rx = bus_rx.resubscribe();
+            tokio::spawn(async move {
+                let account_capture = Arc::new(std::sync::Mutex::new(None::<String>));
+                let capture = Arc::clone(&account_capture);
+                let account_map_cb = Arc::clone(&account_map);
+                let fallback_entry_cb = fallback_entry.clone();
+                let accept_result = accept_hdr_async(stream, move |req: &Request, resp: Response| {
+                    let account = extract_account_from_path(req.uri().path(), &base_path);
+                    *capture.lock().unwrap() = account.clone();
+                    let Some(account) = account else {
+                        return reject_response(StatusCode::NOT_FOUND, "missing account");
+                    };
+                    let entry = account_map_cb
+                        .get(&account)
+                        .cloned()
+                        .or_else(|| fallback_entry_cb.clone());
+                    let Some(entry) = entry else {
+                        return reject_response(StatusCode::NOT_FOUND, "unknown account");
+                    };
+                    if let Some(expected) = entry.runtime.napcat.access_token.as_ref() {
+                        if request_token(req).as_deref() != Some(expected.as_str()) {
+                            return reject_response(StatusCode::UNAUTHORIZED, "invalid token");
                         }
-                    };
-                    if !msg.is_text() {
-                        debug_log!("napcat ws ignoring non-text message");
-                        continue;
                     }
-                    let text = match msg.to_text() {
-                        Ok(text) => text,
-                        Err(_err) => {
-                            debug_log!("napcat ws text decode error: {}", _err);
-                            continue;
-                        }
-                    };
-                    let Ok(value) = serde_json::from_str::<Value>(text) else {
-                        debug_log!("napcat ws invalid json: {}", text);
-                        continue;
-                    };
-                    if let Some(echo) = value.get("echo").and_then(|v| v.as_str()) {
-                        if let Some(event) =
-                            handle_action_response(&state_read, echo, &value).await
-                        {
-                            debug_log!(
-                                "napcat ws action response: echo={} event={:?}",
-                                echo,
-                                event
-                            );
-                            let _ = cmd_tx_read.send(Command::DriverEvent(event)).await;
-                        }
-                        continue;
-                    }
-                    if let Some(command) = parse_inbound_event(
-                        &runtime_read,
-                        &state_read,
-                        &out_tx_read,
-                        &value,
-                    )
-                    .await
-                    {
-                        debug_log!("napcat ws inbound command: {:?}", command);
-                        let _ = cmd_tx_read.send(command).await;
-                    }
-                }
-            });
-
-            let mut bus_task_rx = bus_rx.resubscribe();
-            let state_bus = Arc::clone(&state_ref);
-            let runtime_bus = runtime.clone();
-            let out_tx_bus = out_tx.clone();
-            let bus_task = tokio::spawn(async move {
-                loop {
-                    let env = match bus_task_rx.recv().await {
-                        Ok(env) => env,
-                        Err(broadcast::error::RecvError::Closed) => break,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    };
-
-                    let action = build_action_from_event(
-                        &runtime_bus,
-                        &state_bus,
-                        &out_tx_bus,
-                        env.event,
-                    )
-                    .await;
-                    if let Some(action) = action {
+                    Ok(resp)
+                })
+                .await;
+                let mut ws_stream = match accept_result {
+                    Ok(ws_stream) => ws_stream,
+                    Err(_err) => {
                         debug_log!(
-                            "napcat ws outbound action: group_id={} bytes={}",
-                            runtime_bus.group_id,
-                            action.len()
+                            "napcat ws handshake failed: addr={} err={:?}",
+                            _addr,
+                            _err
                         );
-                        let _ = out_tx_bus.send(action).await;
+                        return;
                     }
+                };
+                let account = {
+                    let guard = account_capture.lock().unwrap();
+                    guard.clone()
+                };
+                let account = match account {
+                    Some(account) => account,
+                    None => {
+                        let _ = ws_stream.close(None).await;
+                        return;
+                    }
+                };
+                let entry = account_map
+                    .get(&account)
+                    .cloned()
+                    .or_else(|| fallback_entry.clone());
+                let Some(entry) = entry else {
+                    let _ = ws_stream.close(None).await;
+                    return;
+                };
+                let inserted = {
+                    let mut guard = active_accounts.lock().await;
+                    if guard.contains(&account) {
+                        false
+                    } else {
+                        guard.insert(account.clone());
+                        true
+                    }
+                };
+                if !inserted {
+                    debug_log!(
+                        "napcat ws duplicate connection ignored: account_id={}",
+                        account
+                    );
+                    let _ = ws_stream.close(None).await;
+                    return;
                 }
+                println!(
+                    "NapCat WS 已连接: account_id={} group_id={}",
+                    account,
+                    entry.runtime.group_id
+                );
+                run_napcat_session(
+                    cmd_tx,
+                    bus_rx,
+                    entry.runtime.clone(),
+                    Arc::clone(&entry.state),
+                    account.clone(),
+                    ws_stream,
+                )
+                .await;
+                let mut guard = active_accounts.lock().await;
+                guard.remove(&account);
+                debug_log!(
+                    "napcat ws disconnected: account_id={} group_id={}",
+                    account,
+                    entry.runtime.group_id
+                );
             });
-
-            let _ = tokio::join!(writer, reader, bus_task);
-            debug_log!("napcat ws disconnected: group_id={}", runtime.group_id);
-            sleep(Duration::from_secs(2)).await;
         }
     })
+}
+
+async fn run_napcat_session(
+    cmd_tx: mpsc::Sender<Command>,
+    bus_rx: broadcast::Receiver<oqqwall_rust_core::EventEnvelope>,
+    runtime: NapCatRuntimeConfig,
+    state: Arc<Mutex<NapCatState>>,
+    account_id: String,
+    ws_stream: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+) {
+    let (mut ws_write, mut ws_read) = ws_stream.split();
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(256);
+    let state_ref = Arc::clone(&state);
+    register_ws_session(
+        &account_id,
+        NapCatWsSession {
+            out_tx: out_tx.clone(),
+            state: Arc::clone(&state_ref),
+        },
+    );
+    register_group_account(&runtime.group_id, &account_id);
+    let startup_group_id = runtime
+        .audit_group_id
+        .as_deref()
+        .unwrap_or(&runtime.group_id);
+    if should_send_startup_notice(startup_group_id) {
+        send_group_text(&out_tx, startup_group_id, "系统已启动").await;
+    }
+
+    let writer = tokio::spawn(async move {
+        while let Some(msg) = out_rx.recv().await {
+            if ws_write
+                .send(tokio_tungstenite::tungstenite::Message::Text(msg))
+                .await
+                .is_err()
+            {
+                debug_log!("napcat ws writer send failed");
+                break;
+            }
+        }
+    });
+
+    let cmd_tx_read = cmd_tx.clone();
+    let runtime_read = runtime.clone();
+    let state_read = Arc::clone(&state_ref);
+    let out_tx_read = out_tx.clone();
+    let reader = tokio::spawn(async move {
+        while let Some(msg) = ws_read.next().await {
+            let msg = match msg {
+                Ok(msg) => msg,
+                Err(_err) => {
+                    debug_log!("napcat ws read error: {}", _err);
+                    break;
+                }
+            };
+            if !msg.is_text() {
+                debug_log!("napcat ws ignoring non-text message");
+                continue;
+            }
+            let text = match msg.to_text() {
+                Ok(text) => text,
+                Err(_err) => {
+                    debug_log!("napcat ws text decode error: {}", _err);
+                    continue;
+                }
+            };
+            let Ok(value) = serde_json::from_str::<Value>(text) else {
+                debug_log!("napcat ws invalid json: {}", text);
+                continue;
+            };
+            if let Some(echo) = value.get("echo").and_then(|v| v.as_str()) {
+                if let Some(event) = handle_action_response(&state_read, echo, &value).await {
+                    debug_log!(
+                        "napcat ws action response: echo={} event={:?}",
+                        echo,
+                        event
+                    );
+                    let _ = cmd_tx_read.send(Command::DriverEvent(event)).await;
+                }
+                continue;
+            }
+            if let Some(command) = parse_inbound_event(&runtime_read, &state_read, &out_tx_read, &value).await {
+                debug_log!("napcat ws inbound command: {:?}", command);
+                let _ = cmd_tx_read.send(command).await;
+            }
+        }
+    });
+
+    let mut bus_task_rx = bus_rx;
+    let state_bus = Arc::clone(&state_ref);
+    let runtime_bus = runtime.clone();
+    let out_tx_bus = out_tx.clone();
+    let bus_task = tokio::spawn(async move {
+        loop {
+            let env = match bus_task_rx.recv().await {
+                Ok(env) => env,
+                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            };
+
+            let action = build_action_from_event(&runtime_bus, &state_bus, &out_tx_bus, env.event).await;
+            if let Some(action) = action {
+                debug_log!(
+                    "napcat ws outbound action: group_id={} bytes={}",
+                    runtime_bus.group_id,
+                    action.len()
+                );
+                if out_tx_bus.send(action).await.is_err() {
+                    debug_log!("napcat ws outbound channel closed");
+                    break;
+                }
+            }
+        }
+    });
+
+    let _ = tokio::join!(writer, reader, bus_task);
+    unregister_ws_session(&account_id);
+    unregister_group_account(&runtime.group_id, &account_id);
 }
 
 fn should_send_startup_notice(group_id: &str) -> bool {
@@ -494,99 +811,98 @@ fn should_send_startup_notice(group_id: &str) -> bool {
     guard.insert(group_id.to_string())
 }
 
-fn build_ws_url(base: &str, token: Option<&str>) -> String {
-    if let Some(token) = token {
-        if base.contains("?") {
-            format!("{}&access_token={}", base, token)
-        } else {
-            format!("{}?access_token={}", base, token)
-        }
-    } else {
-        base.to_string()
+fn ws_sessions() -> &'static std::sync::Mutex<HashMap<String, NapCatWsSession>> {
+    WS_SESSIONS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn group_accounts() -> &'static std::sync::Mutex<HashMap<String, String>> {
+    GROUP_ACCOUNTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn register_ws_session(account_id: &str, session: NapCatWsSession) {
+    let mut guard = match ws_sessions().lock() {
+        Ok(guard) => guard,
+        Err(err) => err.into_inner(),
+    };
+    guard.insert(account_id.to_string(), session);
+}
+
+fn unregister_ws_session(account_id: &str) {
+    let mut guard = match ws_sessions().lock() {
+        Ok(guard) => guard,
+        Err(err) => err.into_inner(),
+    };
+    guard.remove(account_id);
+}
+
+fn lookup_ws_session(account_id: &str) -> Option<NapCatWsSession> {
+    let guard = match ws_sessions().lock() {
+        Ok(guard) => guard,
+        Err(err) => err.into_inner(),
+    };
+    guard.get(account_id).cloned()
+}
+
+fn register_group_account(group_id: &str, account_id: &str) {
+    let mut guard = match group_accounts().lock() {
+        Ok(guard) => guard,
+        Err(err) => err.into_inner(),
+    };
+    guard.insert(group_id.to_string(), account_id.to_string());
+}
+
+fn unregister_group_account(group_id: &str, account_id: &str) {
+    let mut guard = match group_accounts().lock() {
+        Ok(guard) => guard,
+        Err(err) => err.into_inner(),
+    };
+    if guard.get(group_id).map(|v| v == account_id).unwrap_or(false) {
+        guard.remove(group_id);
     }
 }
 
-fn napcat_http_base(ws_url: &str) -> Option<String> {
-    let trimmed = ws_url.split('?').next().unwrap_or(ws_url);
-    if let Some(rest) = trimmed.strip_prefix("ws://") {
-        let mut base = format!("http://{}", rest.trim_end_matches('/'));
-        if base.ends_with("/ws") {
-            base = base.trim_end_matches("/ws").trim_end_matches('/').to_string();
-        }
-        return Some(base);
-    }
-    if let Some(rest) = trimmed.strip_prefix("wss://") {
-        let mut base = format!("https://{}", rest.trim_end_matches('/'));
-        if base.ends_with("/ws") {
-            base = base.trim_end_matches("/ws").trim_end_matches('/').to_string();
-        }
-        return Some(base);
-    }
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        let mut base = trimmed.trim_end_matches('/').to_string();
-        if base.ends_with("/ws") {
-            base = base.trim_end_matches("/ws").trim_end_matches('/').to_string();
-        }
-        return Some(base);
-    }
-    None
+pub fn napcat_account_for_group(group_id: &str) -> Option<String> {
+    let guard = match group_accounts().lock() {
+        Ok(guard) => guard,
+        Err(err) => err.into_inner(),
+    };
+    guard.get(group_id).cloned()
 }
 
-#[cfg(debug_assertions)]
-fn ws_url_for_log(url: &str) -> &str {
-    url.split('?').next().unwrap_or(url)
-}
-
-fn log_ws_connect_error(
-    _group_id: &str,
-    _ws_url: &str,
-    _err: &tokio_tungstenite::tungstenite::Error,
-) {
-    match _err {
-        tokio_tungstenite::tungstenite::Error::Http(response) => {
-            let _status = response.status();
-            let _headers = response.headers();
-            let body = response.body().as_ref();
-            let _body_len = body.map(|bytes| bytes.len()).unwrap_or(0);
-            let _preview = body
-                .and_then(|bytes| std::str::from_utf8(bytes).ok())
-                .map(|text| text.trim())
-                .filter(|text| !text.is_empty())
-                .map(|text| {
-                    let mut out: String = text.chars().take(256).collect();
-                    if text.chars().count() > 256 {
-                        out.push_str("...");
-                    }
-                    out
-                });
-            if let Some(_preview) = _preview {
-                debug_log!(
-                    "napcat ws connect failed: group_id={} ws_url={} status={} headers={:?} body_len={} body_preview=\"{}\"",
-                    _group_id,
-                    ws_url_for_log(_ws_url),
-                    _status,
-                    _headers,
-                    _body_len,
-                    _preview
-                );
-            } else {
-                debug_log!(
-                    "napcat ws connect failed: group_id={} ws_url={} status={} headers={:?} body_len={}",
-                    _group_id,
-                    ws_url_for_log(_ws_url),
-                    _status,
-                    _headers,
-                    _body_len
-                );
-            }
-        }
-        _ => {
-            debug_log!(
-                "napcat ws connect failed: group_id={} ws_url={} err={:?}",
-                _group_id,
-                ws_url_for_log(_ws_url),
-                _err
-            );
+pub async fn napcat_ws_request(
+    account_id: &str,
+    action: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let session = lookup_ws_session(account_id)
+        .ok_or_else(|| format!("napcat ws session missing: {}", account_id))?;
+    let (resp_tx, resp_rx) = oneshot::channel();
+    let echo = {
+        let mut guard = session.state.lock().await;
+        let echo = next_echo(&mut guard);
+        guard
+            .pending
+            .insert(echo.clone(), PendingAction::WsRequest { resp_tx });
+        echo
+    };
+    let payload = serde_json::json!({
+        "action": action,
+        "params": params,
+        "echo": echo
+    });
+    if session.out_tx.send(payload.to_string()).await.is_err() {
+        let mut guard = session.state.lock().await;
+        guard.pending.remove(&echo);
+        return Err("napcat ws send failed".to_string());
+    }
+    match tokio::time::timeout(timeout, resp_rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("napcat ws response channel closed".to_string()),
+        Err(_) => {
+            let mut guard = session.state.lock().await;
+            guard.pending.remove(&echo);
+            Err("napcat ws request timeout".to_string())
         }
     }
 }
@@ -1255,6 +1571,22 @@ async fn handle_action_response(
                 audit_msg_id: message_id,
             }))
         }
+        PendingAction::WsRequest { resp_tx } => {
+            if status != "ok" || retcode != 0 {
+                let msg = value
+                    .get("msg")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let mut error = format!("status={} retcode={}", status, retcode);
+                if !msg.is_empty() {
+                    error.push_str(&format!(" msg={}", msg));
+                }
+                let _ = resp_tx.send(Err(error));
+                return None;
+            }
+            let _ = resp_tx.send(Ok(value.clone()));
+            None
+        }
     }
 }
 
@@ -1323,18 +1655,10 @@ async fn parse_inbound_event(
 
     if message_type == "group" {
         let mut forward_resolver = if message_has_forward(value.get("message")) {
-            napcat_http_base(&runtime.napcat.ws_url).and_then(|api_base| {
-                Client::builder()
-                    .timeout(Duration::from_secs(6))
-                    .build()
-                    .ok()
-                    .map(|client| ForwardResolver {
-                        client,
-                        api_base,
-                        token: runtime.napcat.access_token.clone(),
-                        cache: HashMap::new(),
-                        seen: HashSet::new(),
-                    })
+            Some(ForwardResolver {
+                account_id: self_id.clone(),
+                cache: HashMap::new(),
+                seen: HashSet::new(),
             })
         } else {
             None
@@ -1346,28 +1670,28 @@ async fn parse_inbound_event(
             summary_text: _,
             attachments: _attachments,
         } = extracted;
-        debug_log!(
-            "napcat inbound content: text_len={} attachments={} reply_id_present={}",
-            text.len(),
-            _attachments.len(),
-            reply_id.is_some()
-        );
-        let chat_group_id = value_opt_to_string(value.get("group_id"))?;
-        let is_audit_group =
-            runtime.audit_group_id.as_deref() == Some(chat_group_id.as_str());
-        if let Some(command) = parse_audit_command(&text, reply_id.is_some()) {
-            if !is_admin_sender(value) {
-                send_group_text(out_tx, &chat_group_id, "无权限执行指令").await;
-                return None;
-            }
-            if runtime.audit_group_id.is_some() && !is_audit_group {
-                return None;
-            }
-            match command {
-                AuditCommand::Global(GlobalAction::Help) => {
-                    send_group_text(out_tx, &chat_group_id, "已收到指令").await;
-                    send_group_text(out_tx, &chat_group_id, HELP_TEXT).await;
-                    return None;
+	        debug_log!(
+	            "napcat inbound content: text_len={} attachments={} reply_id_present={}",
+	            text.len(),
+	            _attachments.len(),
+	            reply_id.is_some()
+	        );
+	        let chat_group_id = value_opt_to_string(value.get("group_id"))?;
+	        let is_audit_group =
+	            runtime.audit_group_id.as_deref() == Some(chat_group_id.as_str());
+	        if runtime.audit_group_id.is_some() && !is_audit_group {
+	            return None;
+	        }
+	        if let Some(command) = parse_audit_command(&text, reply_id.is_some()) {
+	            if !is_admin_sender(value) {
+	                send_group_text(out_tx, &chat_group_id, "无权限执行指令").await;
+	                return None;
+	            }
+	            match command {
+	                AuditCommand::Global(GlobalAction::Help) => {
+	                    send_group_text(out_tx, &chat_group_id, "已收到指令").await;
+	                    send_group_text(out_tx, &chat_group_id, HELP_TEXT).await;
+	                    return None;
                 }
                 AuditCommand::Global(GlobalAction::PendingList) => {
                     let pending_text = {
@@ -1437,6 +1761,7 @@ async fn parse_inbound_event(
                         state,
                         out_tx,
                         &user_id,
+                        &self_id,
                         &chat_group_id,
                         review_code,
                         action,
@@ -1961,23 +2286,13 @@ async fn fetch_forward_messages(
     resolver: &ForwardResolver,
     forward_id: &str,
 ) -> Result<Vec<Value>, String> {
-    let url = format!("{}/get_forward_msg", resolver.api_base);
-    let mut req = resolver
-        .client
-        .post(url)
-        .json(&json!({ "message_id": forward_id }));
-    if let Some(token) = resolver.token.as_ref() {
-        req = req.header("Authorization", format!("Bearer {}", token));
-    }
-    let resp = req.send().await.map_err(|err| format!("http error: {}", err))?;
-    let status = resp.status();
-    let body: Value = resp.json().await.map_err(|err| format!("json error: {}", err))?;
-    if !status.is_success() {
-        return Err(format!("http status {}", status));
-    }
-    if body.get("status").and_then(|v| v.as_str()) != Some("ok") {
-        return Err(format!("napcat status {:?}", body.get("status")));
-    }
+    let body = napcat_ws_request(
+        &resolver.account_id,
+        "get_forward_msg",
+        json!({ "message_id": forward_id }),
+        Duration::from_secs(6),
+    )
+    .await?;
     let messages = body
         .get("data")
         .and_then(|v| v.get("messages"))
@@ -2253,38 +2568,26 @@ fn normalize_face_id(raw: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-async fn fetch_review_code_from_reply(
-    runtime: &NapCatRuntimeConfig,
-    reply_id: &str,
-) -> Option<ReviewCode> {
-    let api_base = napcat_http_base(&runtime.napcat.ws_url)?;
-    let client = Client::builder().timeout(Duration::from_secs(6)).build().ok()?;
-    let url = format!("{}/get_msg", api_base);
-    let mut req = client.post(url).json(&json!({ "message_id": reply_id }));
-    if let Some(token) = runtime.napcat.access_token.as_ref() {
-        req = req.header("Authorization", format!("Bearer {}", token));
-    }
-    let resp = req.send().await.ok()?;
-    let status = resp.status();
-    let body: Value = resp.json().await.ok()?;
-    if !status.is_success() {
-        debug_log!(
-            "napcat get_msg failed: message_id={} status={} body={}",
-            reply_id,
-            status,
-            body
-        );
-        return None;
-    }
-    if body.get("status").and_then(|v| v.as_str()) != Some("ok") {
-        debug_log!(
-            "napcat get_msg status not ok: message_id={} status={:?} body={}",
-            reply_id,
-            body.get("status"),
-            body
-        );
-        return None;
-    }
+async fn fetch_review_code_from_reply(account_id: &str, reply_id: &str) -> Option<ReviewCode> {
+    let body = match napcat_ws_request(
+        account_id,
+        "get_msg",
+        json!({ "message_id": reply_id }),
+        Duration::from_secs(6),
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(_err) => {
+            debug_log!(
+                "napcat get_msg ws failed: account_id={} message_id={} err={}",
+                account_id,
+                reply_id,
+                _err
+            );
+            return None;
+        }
+    };
     let data = body.get("data")?;
     let message_value = data.get("message").or_else(|| data.get("raw_message"));
     let extracted = extract_message_lite(message_value);
@@ -2304,6 +2607,7 @@ async fn parse_review_command(
     state: &Arc<Mutex<NapCatState>>,
     out_tx: &mpsc::Sender<String>,
     user_id: &str,
+    account_id: &str,
     group_id: &str,
     review_code: Option<ReviewCode>,
     action: ReviewAction,
@@ -2341,7 +2645,7 @@ async fn parse_review_command(
 
     if review_id.is_none() && review_code.is_none() && reply_missing {
         if let Some(reply_id) = reply_id.as_ref() {
-            if let Some(code) = fetch_review_code_from_reply(runtime, reply_id).await {
+            if let Some(code) = fetch_review_code_from_reply(account_id, reply_id).await {
                 review_code = Some(code);
                 audit_msg_id = None;
                 reply_missing = false;

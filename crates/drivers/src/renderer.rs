@@ -10,7 +10,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use crate::avatar_cache;
 use crate::blob_cache::{self, CacheKind, CacheRetention};
-use crate::napcat::{extract_message_lite, NapCatConfig};
+use crate::napcat::{extract_message_lite, napcat_account_for_group, napcat_ws_request, NapCatConfig};
 use oqqwall_rust_core::decide::builder::build_draft_from_messages;
 use oqqwall_rust_core::event::{BlobEvent, Event, IngressEvent, MediaEvent, RenderEvent, SendEvent};
 use oqqwall_rust_core::{
@@ -18,7 +18,6 @@ use oqqwall_rust_core::{
     MediaReference, PostId, StateView,
 };
 use oqqwall_rust_infra::{LocalJournal, SnapshotStore};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use skia_safe::canvas::SrcRectConstraint;
@@ -578,9 +577,7 @@ fn collect_post_blob_ids(state: &StateView, post_id: PostId) -> Vec<BlobId> {
 }
 
 struct ForwardContext {
-    client: Client,
-    api_base: String,
-    token: Option<String>,
+    account_id: String,
     cache: HashMap<String, Vec<DraftBlock>>,
     seen: HashSet<String>,
 }
@@ -588,27 +585,18 @@ struct ForwardContext {
 async fn resolve_forward_draft(
     draft: &Draft,
     header: &HeaderInfo,
-    config: &RendererRuntimeConfig,
+    _config: &RendererRuntimeConfig,
 ) -> Draft {
     if !draft_has_forward(draft) {
         return draft.clone();
     }
 
-    let Some(napcat) = napcat_config_for_group(config, &header.group_id) else {
+    let Some(account_id) = napcat_account_for_group(&header.group_id) else {
         return draft.clone();
-    };
-    let Some(api_base) = napcat_http_base(&napcat.ws_url) else {
-        return draft.clone();
-    };
-    let client = match Client::builder().timeout(Duration::from_secs(6)).build() {
-        Ok(client) => client,
-        Err(_) => return draft.clone(),
     };
 
     let mut context = ForwardContext {
-        client,
-        api_base,
-        token: napcat.access_token.clone(),
+        account_id,
         cache: HashMap::new(),
         seen: HashSet::new(),
     };
@@ -631,42 +619,6 @@ fn draft_has_forward(draft: &Draft) -> bool {
         DraftBlock::Paragraph { text } => text.contains(FORWARD_PREFIX),
         _ => false,
     })
-}
-
-fn napcat_config_for_group<'a>(
-    config: &'a RendererRuntimeConfig,
-    group_id: &str,
-) -> Option<&'a NapCatConfig> {
-    config
-        .napcat_by_group
-        .get(group_id)
-        .or_else(|| config.default_napcat.as_ref())
-}
-
-fn napcat_http_base(ws_url: &str) -> Option<String> {
-    let trimmed = ws_url.split('?').next().unwrap_or(ws_url);
-    if let Some(rest) = trimmed.strip_prefix("ws://") {
-        let mut base = format!("http://{}", rest.trim_end_matches('/'));
-        if base.ends_with("/ws") {
-            base = base.trim_end_matches("/ws").trim_end_matches('/').to_string();
-        }
-        return Some(base);
-    }
-    if let Some(rest) = trimmed.strip_prefix("wss://") {
-        let mut base = format!("https://{}", rest.trim_end_matches('/'));
-        if base.ends_with("/ws") {
-            base = base.trim_end_matches("/ws").trim_end_matches('/').to_string();
-        }
-        return Some(base);
-    }
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        let mut base = trimmed.trim_end_matches('/').to_string();
-        if base.ends_with("/ws") {
-            base = base.trim_end_matches("/ws").trim_end_matches('/').to_string();
-        }
-        return Some(base);
-    }
-    None
 }
 
 fn forward_placeholder(id: &str) -> String {
@@ -758,20 +710,13 @@ async fn fetch_forward_messages(
     context: &ForwardContext,
     forward_id: &str,
 ) -> Result<Vec<Value>, String> {
-    let url = format!("{}/get_forward_msg", context.api_base);
-    let mut req = context.client.post(url).json(&json!({ "message_id": forward_id }));
-    if let Some(token) = context.token.as_ref() {
-        req = req.header("Authorization", format!("Bearer {}", token));
-    }
-    let resp = req.send().await.map_err(|err| format!("http error: {}", err))?;
-    let status = resp.status();
-    let body: Value = resp.json().await.map_err(|err| format!("json error: {}", err))?;
-    if !status.is_success() {
-        return Err(format!("http status {}", status));
-    }
-    if body.get("status").and_then(|v| v.as_str()) != Some("ok") {
-        return Err(format!("napcat status {:?}", body.get("status")));
-    }
+    let body = napcat_ws_request(
+        &context.account_id,
+        "get_forward_msg",
+        json!({ "message_id": forward_id }),
+        Duration::from_secs(6),
+    )
+    .await?;
     let messages = body
         .get("data")
         .and_then(|v| v.get("messages"))

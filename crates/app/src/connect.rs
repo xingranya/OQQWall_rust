@@ -29,26 +29,38 @@ pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) {
         config.tz_offset_minutes
     );
     let core_config = config.build_core_config();
+    let mut runtimes_by_base: HashMap<String, Vec<NapCatRuntimeConfig>> = HashMap::new();
     for group in &config.groups {
+        let accounts = core_config
+            .group_config(&group.group_id)
+            .map(|cfg| cfg.accounts.clone())
+            .unwrap_or_default();
         let runtime = NapCatRuntimeConfig {
             napcat: group.napcat.clone(),
             audit_group_id: group.audit_group_id.clone(),
             group_id: group.group_id.clone(),
+            accounts,
             tz_offset_minutes: config.tz_offset_minutes,
             friend_request_window_sec: group.friend_request_window_sec,
             friend_add_message: group.friend_add_message.clone(),
             max_queue: core_config.max_queue(&group.group_id),
         };
-        let _ws_log = ws_url_for_log(&runtime.napcat.ws_url);
+        let _ws_log = base_url_for_log(&runtime.napcat.base_url);
         debug_log!(
-            "spawn napcat ws: group_id={} audit_group_id={:?} ws_url={} token_present={}",
+            "spawn napcat ws: group_id={} audit_group_id={:?} base_url={} token_present={}",
             runtime.group_id,
             runtime.audit_group_id,
             _ws_log,
             runtime.napcat.access_token.is_some()
         );
+        runtimes_by_base
+            .entry(runtime.napcat.base_url.clone())
+            .or_default()
+            .push(runtime);
+    }
+    for (base_url, runtimes) in runtimes_by_base {
         let bus_rx = handle.subscribe();
-        spawn_napcat_ws(handle.cmd_tx.clone(), bus_rx, runtime);
+        spawn_napcat_ws(handle.cmd_tx.clone(), bus_rx, base_url, runtimes);
     }
     debug_log!("spawn media fetcher");
     spawn_media_fetcher(
@@ -102,11 +114,11 @@ pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) {
 }
 
 #[cfg(debug_assertions)]
-fn ws_url_for_log(url: &str) -> &str {
+fn base_url_for_log(url: &str) -> &str {
     url.split('?').next().unwrap_or(url)
 }
 
 #[cfg(not(debug_assertions))]
-fn ws_url_for_log(_url: &str) -> &str {
+fn base_url_for_log(_url: &str) -> &str {
     "<redacted>"
 }

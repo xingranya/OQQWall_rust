@@ -76,7 +76,7 @@
 | friend_request_window_sec    |    u32 |               300 | 已支持               | 好友请求/私聊抑制窗口（原版 TUI 提示）                                |
 | use_web_review               |   bool |             false | 未支持               | 是否启用网页审核面板（原版提示）                                      |
 | web_review_port              |    u16 |             10923 | 未支持               | 网页审核监听端口（原版提示）                                        |
-| napcat_ws_url                | string |                "" | 已支持               | 作为默认 NapCat WS 地址（当组内未配置时兜底）                             |
+| napcat_base_url              | string |                "" | 已支持               | 作为默认 NapCat 反向 WS base url（推荐，优先级最高）                        |
 | napcat_access_token          | string |                "" | 已支持               | 作为默认 NapCat token（可被 `OQQWALL_NAPCAT_TOKEN` 覆盖）             |
 | tz_offset_minutes            |    i32 |                 0 | 已支持               | 时区偏移（分钟，用于 schedule/defer 计算）                           |
 | min_interval_ms              |    u32 |                 0 | 已支持               | 发送最小间隔（毫秒）                                             |
@@ -90,7 +90,7 @@
 ### 3.2 环境变量覆盖优先级（推荐）
 
 * `OQQWALL_NAPCAT_TOKEN` > `groups.<id>.napcat_access_token`（全局覆盖所有组）
-* `OQQWALL_NAPCAT_WS_URL` > `groups.<id>.napcat_ws_url`（全局覆盖所有组）
+* `OQQWALL_NAPCAT_BASE_URL` > `groups.<id>.napcat_base_url`（全局覆盖所有组）
 
 ---
 
@@ -102,8 +102,8 @@
 
 | JSON Key                  |                         类型 | 默认/规则            | 当前支持状态                 | 原版行为/参考                                                         |
 | ------------------------- | -------------------------: | ---------------- | ---------------------- | --------------------------------------------------------------- |
-| mangroupid                |                     string | 必填               | 已支持                   | 用于识别/管理群（`serv.py` 把它加入受管群集合）                                   |
-| napcat_ws_url             |                     string | 必填               | 已支持                   | 本组 NapCat OneBot WS 地址                                          |
+| mangroupid                |                     string | 必填               | 已支持                   | 审核群 ID：审核指令/回复仅在该群处理；其他群消息会被忽略                           |
+| napcat_base_url           |                     string | 必填               | 已支持                   | 本组 NapCat 反向 WS base url（推荐）                                  |
 | napcat_access_token       |                     string | 必填（可 env 覆盖）   | 已支持                   | 本组 NapCat token；可用 `OQQWALL_NAPCAT_TOKEN` 覆盖                 |
 | mainqqid                  |                     string | 必填               | 已支持                   | 主账号 QQ 号，用于组归属等                                                 |
 | minorqqid                 |              array[string] | 可空               | 已支持                   | 副账号 QQ 列表                                                       |
@@ -116,6 +116,8 @@
 | friend_add_message        |                     string | 默认 ""            | 已支持                   | 用于自动通过好友申请后发送文本（你样例包含）                                        |
 | quick_replies             |     object{string->string} | 默认 {}            | 未支持                   | 用于快捷回复              |
 | admins                    | array[{username,password}] | 默认 []            | 未支持                   | 用于 web_review 管理员）                                      |
+
+> 反向 WS 连接格式：NapCat 里填写 `ws://<host>/<base_path>/<QQ号>`，其中 `<base_path>` 来自 `napcat_base_url`（示例：`ws://127.0.0.1:3001/oqqwall/ws/456787654`）。
 
 ### 4.2 send_schedule 的语义（必须写清楚）
 
@@ -145,7 +147,7 @@ Rust 版落地建议：
 
 ### 5.2 校验失败策略（建议）
 
-* **启动时**：关键字段缺失（如 napcat_ws_url、napcat_access_token、mangroupid、mainqqid）→ 直接报错退出
+* **启动时**：关键字段缺失（如 napcat_base_url、napcat_access_token、mangroupid、mainqqid）→ 直接报错退出
 * **热更新时**：新配置解析失败 → 保留旧 `EffectiveConfig`，并发出告警/日志
 
 ---
@@ -202,7 +204,7 @@ Rust 版落地建议：
   "groups": {
     "MethGroup": {
       "mangroupid": "993802974",
-      "napcat_ws_url": "ws://127.0.0.1:8081",
+      "napcat_base_url": "0.0.0.0:3001/oqqwall/ws",
       "napcat_access_token": "REDACTED",
       "mainqqid": "3995477265",
       "minorqqid": [],

@@ -1,20 +1,24 @@
 {
   "common": {
-    "render_png": true,
-    "tz_offset_minutes": 480,
-    "max_cache_mb":"512"
+    "at_unprived_sender": true,
+    "max_cache_mb": 256,
+    "max_image_number_one_post": 30,
+    "max_post_stack": 1,
+    "process_waittime_sec": 20,
+    "tz_offset_minutes": 480
   },
   "groups": {
     "default": {
-      "process_waittime_sec": 5,
-      "individual_image_in_posts": false,
+      "individual_image_in_posts": true,
       "mainqqid": "3995477265",
       "mangroupid": "993802974",
-      "max_image_number_one_post": 5,
-      "max_post_stack": 3,
-      "minorqqid": [],
-      "napcat_access_token": "admin147",
-      "napcat_ws_url": "ws://127.0.0.1:3001/ws"
+      "max_image_number_one_post": 30,
+      "max_post_stack": 1,
+      "minorqqid": [
+        "1050373508"
+      ],
+      "napcat_access_token": "IH5PMytdMEQeDqO5maeAoDGW",
+      "napcat_base_url": "0.0.0.0:3001/oqqwall/ws"
     }
   },
   "schema_version": 1
