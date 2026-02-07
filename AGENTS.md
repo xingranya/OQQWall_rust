@@ -37,3 +37,16 @@
 - `devconfig.json` is read only in debug builds; release ignores it.
 - Debug builds mirror stderr logs to `data/logs/debug.log` (base `OQQWALL_DATA_DIR`), override with `OQQWALL_DEBUG_LOG`.
 - Persistent data and snapshots belong under `data/`; do not commit generated files in `target/`.
+
+## Container Build Environment
+- Use `Dockerfile.rust-glibc231-toolchain` to build a fixed toolchain image based on `rust-glibc231:20.04`.
+- The image includes required build deps: `python3`, `pkg-config`, `libfreetype6-dev`, `libfontconfig1-dev`, `ca-certificates`.
+- `cargo build`, `cargo test`, and `cargo check` should all run in this container environment for consistency.
+- Build image:
+  - `docker build --network host -t rust-glibc231:20.04-oqqwall -f Dockerfile.rust-glibc231-toolchain .`
+- Run build container:
+  - `docker run --rm -it --network host -v "$HOME/data:/data" -w /data -v "$HOME/.cargo/registry:/root/.cargo/registry" -v "$HOME/.cargo/git:/root/.cargo/git" -v "$PWD/target:/work/target" rust-glibc231:20.04-oqqwall bash`
+- In container:
+  - `cd /data/OQQWall_rust && cargo check`
+  - `cd /data/OQQWall_rust && cargo test`
+  - `cd /data/OQQWall_rust && cargo build -r`

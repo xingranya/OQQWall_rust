@@ -1,0 +1,12 @@
+FROM rust-glibc231:20.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3 \
+        pkg-config \
+        libfreetype6-dev \
+        libfontconfig1-dev \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
