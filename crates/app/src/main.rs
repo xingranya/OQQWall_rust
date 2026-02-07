@@ -3,6 +3,7 @@ mod connect;
 mod engine;
 mod oobe;
 mod status;
+mod web_api;
 
 #[cfg(debug_assertions)]
 macro_rules! debug_log {
@@ -64,6 +65,12 @@ async fn main() {
     debug_log!("engine created: data_dir={}", data_dir);
     let _status = status::spawn_status_logger(&handle);
     debug_log!("status logger spawned");
+    web_api::spawn_web_api(&handle, &app_config);
+    debug_log!(
+        "web api init: enabled={} port={}",
+        app_config.web_api_enabled,
+        app_config.web_api_port
+    );
     spawn_napcat_drivers(&handle, &app_config);
     debug_log!("drivers spawned");
 

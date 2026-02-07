@@ -13,6 +13,7 @@ dependencies = [
  "oqqwall_rust_core",
  "oqqwall_rust_drivers",
  "oqqwall_rust_infra",
+ "rand 0.8.5",
  "ratatui",
  "serde",
  "serde_json",

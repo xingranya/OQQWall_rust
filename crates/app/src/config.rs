@@ -36,6 +36,9 @@ pub struct AppConfig {
     pub fallback_napcat: Option<NapCatConfig>,
     pub max_cache_mb: u64,
     pub at_unprived_sender: bool,
+    pub web_api_enabled: bool,
+    pub web_api_port: u16,
+    pub web_api_root_token: Option<String>,
     core_config: CoreConfig,
     #[cfg(debug_assertions)]
     pub dev_config: DevConfig,
@@ -87,12 +90,25 @@ impl AppConfig {
         let default_friend_request_window_sec =
             parse_u32(common.get("friend_request_window_sec")).unwrap_or(300);
         let default_friend_add_message = parse_string(common.get("friend_add_message"));
+        let web_api_enabled = parse_bool(common.get("use_web_review")).unwrap_or(false);
+        let web_api_port = parse_u32(common.get("web_review_port"))
+            .and_then(|value| u16::try_from(value).ok())
+            .unwrap_or(10923);
+        let web_api_root_token = env_override(
+            "OQQWALL_API_TOKEN",
+            parse_string(common.get("api_token"))
+                .or_else(|| parse_string(common.get("token"))),
+        )
+        .and_then(|value| nonempty(Some(value)));
         debug_log!(
-            "config parsed: tz_offset_minutes={} default_process_waittime_ms={} max_cache_mb={} at_unprived_sender={}",
+            "config parsed: tz_offset_minutes={} default_process_waittime_ms={} max_cache_mb={} at_unprived_sender={} web_api_enabled={} web_api_port={} web_api_token_present={}",
             tz_offset_minutes,
             default_process_waittime_ms,
             max_cache_mb,
-            at_unprived_sender
+            at_unprived_sender,
+            web_api_enabled,
+            web_api_port,
+            web_api_root_token.is_some()
         );
         let core_config = build_core_config(&common, &groups, default_process_waittime_ms);
         let fallback_napcat = parse_napcat_config_optional(&common);
@@ -156,6 +172,9 @@ impl AppConfig {
             fallback_napcat,
             max_cache_mb,
             at_unprived_sender,
+            web_api_enabled,
+            web_api_port,
+            web_api_root_token,
             core_config,
             #[cfg(debug_assertions)]
             dev_config,

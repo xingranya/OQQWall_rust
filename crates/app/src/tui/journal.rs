@@ -1891,6 +1891,20 @@ fn summary_parts(event: &Event) -> (&'static str, String) {
                 "Review.BlacklistRemoved",
                 format!("group={} sender={}", group_id, sender_id),
             ),
+            ReviewEvent::ReviewBlacklistAdded {
+                group_id,
+                sender_id,
+                reason,
+            } => {
+                let reason_len = reason.as_ref().map(|v| v.len()).unwrap_or(0);
+                (
+                    "Review.BlacklistAdded",
+                    format!(
+                        "group={} sender={} reason_len={}",
+                        group_id, sender_id, reason_len
+                    ),
+                )
+            }
             ReviewEvent::ReviewQuickReplyRequested { review_id, key } => (
                 "Review.QuickReplyRequested",
                 format!("review={} key={}", short_id(*review_id), key),

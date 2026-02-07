@@ -246,6 +246,11 @@ pub enum ReviewEvent {
         review_id: ReviewId,
         reason: Option<String>,
     },
+    ReviewBlacklistAdded {
+        group_id: GroupId,
+        sender_id: String,
+        reason: Option<String>,
+    },
     ReviewBlacklistRemoved {
         group_id: GroupId,
         sender_id: String,

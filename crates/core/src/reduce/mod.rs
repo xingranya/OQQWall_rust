@@ -497,6 +497,21 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
                 }
             }
         }
+        ReviewEvent::ReviewBlacklistAdded {
+            group_id,
+            sender_id,
+            reason,
+        } => {
+            let entry = state
+                .blacklist
+                .entry(group_id.clone())
+                .or_default()
+                .entry(sender_id.clone())
+                .or_insert(None);
+            if reason.is_some() {
+                *entry = reason.clone();
+            }
+        }
         ReviewEvent::ReviewBlacklistRemoved {
             group_id,
             sender_id,

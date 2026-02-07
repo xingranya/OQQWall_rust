@@ -74,8 +74,9 @@
 | renewcookies_use_napcat      |   bool |              true | 未支持               | 续 cookies 逻辑使用 NapCat 版本/非 NapCat 版本（原版提示）            |
 | max_attempts_qzone_autologin |    u32 |                 3 | 未支持               | sendcontrol 默认 3 次并校验数字                               |
 | friend_request_window_sec    |    u32 |               300 | 已支持               | 好友请求/私聊抑制窗口（原版 TUI 提示）                                |
-| use_web_review               |   bool |             false | 未支持               | 是否启用网页审核面板（原版提示）                                      |
-| web_review_port              |    u16 |             10923 | 未支持               | 网页审核监听端口（原版提示）                                        |
+| use_web_review               |   bool |             false | 已支持               | 是否启用对外 HTTP 审核 API（复用原版字段名）                                      |
+| web_review_port              |    u16 |             10923 | 已支持               | HTTP API 监听端口（默认 `0.0.0.0:10923`）                                        |
+| api_token                    | string |                "" | 已支持               | API root token（建议 32+ 位；可被环境变量覆盖）                                        |
 | napcat_base_url              | string |                "" | 已支持               | 作为默认 NapCat 反向 WS base url（推荐，优先级最高）                        |
 | napcat_access_token          | string |                "" | 已支持               | 作为默认 NapCat token（可被 `OQQWALL_NAPCAT_TOKEN` 覆盖）             |
 | tz_offset_minutes            |    i32 |                 0 | 已支持               | 时区偏移（分钟，用于 schedule/defer 计算）                           |
@@ -91,6 +92,7 @@
 
 * `OQQWALL_NAPCAT_TOKEN` > `groups.<id>.napcat_access_token`（全局覆盖所有组）
 * `OQQWALL_NAPCAT_BASE_URL` > `groups.<id>.napcat_base_url`（全局覆盖所有组）
+* `OQQWALL_API_TOKEN` > `common.api_token`（覆盖 HTTP API root token）
 
 ---
 

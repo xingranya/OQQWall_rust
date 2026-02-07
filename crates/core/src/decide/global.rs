@@ -141,6 +141,13 @@ pub fn decide_global_action(
                 sender_id: sender_id.clone(),
             })]
         }
+        GlobalAction::BlacklistAdd { sender_id, reason } => {
+            vec![Event::Review(ReviewEvent::ReviewBlacklistAdded {
+                group_id: cmd.group_id.clone(),
+                sender_id: sender_id.clone(),
+                reason: reason.clone(),
+            })]
+        }
         _ => Vec::new(),
     }
 }

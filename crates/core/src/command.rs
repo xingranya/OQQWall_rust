@@ -83,6 +83,7 @@ pub enum GlobalAction {
     SendQueueFlush,
     SendInFlightClear,
     BlacklistList,
+    BlacklistAdd { sender_id: String, reason: Option<String> },
     BlacklistRemove { sender_id: String },
     SetExternalNumber { value: ExternalCode },
     QuickReplyList,

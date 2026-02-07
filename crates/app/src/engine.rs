@@ -1,4 +1,6 @@
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use oqqwall_rust_core::decide::decide;
@@ -33,6 +35,7 @@ pub struct Engine {
     last_cursor: JournalCursor,
     events_since_snapshot: u64,
     last_snapshot_ms: i64,
+    shared_state: Arc<RwLock<StateView>>,
 }
 
 #[derive(Clone)]
@@ -40,12 +43,17 @@ pub struct Engine {
 pub struct EngineHandle {
     pub cmd_tx: mpsc::Sender<Command>,
     bus: broadcast::Sender<EventEnvelope>,
+    state: Arc<RwLock<StateView>>,
 }
 
 impl EngineHandle {
     #[allow(dead_code)]
     pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
         self.bus.subscribe()
+    }
+
+    pub fn state(&self) -> Arc<RwLock<StateView>> {
+        self.state.clone()
     }
 }
 
@@ -56,15 +64,22 @@ impl Engine {
     ) -> Result<(Self, EngineHandle), String> {
         let (cmd_tx, cmd_rx) = mpsc::channel(1024);
         let (bus, _) = broadcast::channel(1024);
+        let shared_state = Arc::new(RwLock::new(StateView::default()));
         let handle = EngineHandle {
             cmd_tx,
             bus: bus.clone(),
+            state: shared_state,
         };
         let mut journal = LocalJournal::open(data_dir.as_ref())
             .map_err(|err| format!("journal init: {}", err))?;
         let snapshot = SnapshotStore::open(data_dir.as_ref())
             .map_err(|err| format!("snapshot init: {}", err))?;
         let (state, last_cursor, last_snapshot_ms) = Self::restore_state(&mut journal, &snapshot)?;
+        {
+            if let Ok(mut guard) = handle.state.write() {
+                *guard = state.clone();
+            }
+        }
         let next_event_id = state
             .last_event_id
             .map(|id| id.0.saturating_add(1))
@@ -81,6 +96,7 @@ impl Engine {
             last_cursor,
             events_since_snapshot: 0,
             last_snapshot_ms,
+            shared_state: handle.state.clone(),
         };
         debug_log!("engine init: groups={}", engine.config.groups.len());
         Ok((engine, handle))
@@ -111,6 +127,11 @@ impl Engine {
                 self.last_cursor = cursor;
                 self.events_since_snapshot = self.events_since_snapshot.saturating_add(1);
                 self.state = self.state.reduce(&env);
+                {
+                    if let Ok(mut guard) = self.shared_state.write() {
+                        *guard = self.state.clone();
+                    }
+                }
                 let send_result = self.bus.send(env);
                 if send_result.is_err() {
                     debug_log!("engine event bus send failed");

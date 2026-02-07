@@ -1254,6 +1254,23 @@ async fn build_action_from_event(
             }
             None
         }
+        Event::Review(ReviewEvent::ReviewBlacklistAdded {
+            group_id,
+            sender_id,
+            reason,
+        }) => {
+            let mut guard = state.lock().await;
+            let entry = guard
+                .blacklist
+                .entry(group_id)
+                .or_default()
+                .entry(sender_id)
+                .or_insert(None);
+            if reason.is_some() {
+                *entry = reason.clone();
+            }
+            None
+        }
         Event::Review(ReviewEvent::ReviewBlacklistRemoved {
             group_id,
             sender_id,
