@@ -60,8 +60,10 @@ pub struct QzoneRuntimeConfig {
     pub at_unprived_sender: bool,
     pub max_queue_by_group: HashMap<String, usize>,
     pub max_images_per_post_by_group: HashMap<String, usize>,
+    pub individual_images_by_group: HashMap<String, bool>,
     pub default_max_queue: usize,
     pub default_max_images_per_post: usize,
+    pub default_individual_images: bool,
     #[cfg(debug_assertions)]
     pub use_virt_qzone: bool,
 }
@@ -500,6 +502,11 @@ pub fn spawn_qzone_sender(
                         .get(&group_id)
                         .copied()
                         .unwrap_or(runtime.default_max_images_per_post);
+                    let include_original_images = runtime
+                        .individual_images_by_group
+                        .get(&group_id)
+                        .copied()
+                        .unwrap_or(runtime.default_individual_images);
                     let merging_enabled = max_queue > 1;
 
                     let batch_result = {
@@ -523,7 +530,7 @@ pub fn spawn_qzone_sender(
                             &guard.post_anonymous,
                             runtime.at_unprived_sender,
                         );
-                        match collect_post_assets(&guard, &batch_posts) {
+                        match collect_post_assets(&guard, &batch_posts, include_original_images) {
                             Ok(assets) => {
                                 Ok((batch_posts, assets, guard.blob_paths.clone(), publish_text))
                             }
@@ -1153,11 +1160,13 @@ fn collect_batch_post_ids(
 struct PostAssets {
     draft: Draft,
     preview_blobs: Vec<BlobId>,
+    include_original_images: bool,
 }
 
 fn collect_post_assets(
     state: &QzoneState,
     post_ids: &[PostId],
+    include_original_images: bool,
 ) -> Result<Vec<PostAssets>, QzoneError> {
     let mut out = Vec::new();
     for post_id in post_ids {
@@ -1177,6 +1186,7 @@ fn collect_post_assets(
         out.push(PostAssets {
             draft,
             preview_blobs,
+            include_original_images,
         });
     }
     Ok(out)
@@ -1189,7 +1199,12 @@ fn collect_emuqzone_batch_images(
 ) -> Result<Vec<String>, QzoneError> {
     let mut images = Vec::new();
     for post in posts {
-        let mut part = collect_emuqzone_images(&post.draft, blob_paths, &post.preview_blobs)?;
+        let mut part = collect_emuqzone_images(
+            &post.draft,
+            blob_paths,
+            &post.preview_blobs,
+            post.include_original_images,
+        )?;
         images.append(&mut part);
     }
     Ok(images)
@@ -1201,7 +1216,13 @@ async fn collect_batch_images(
 ) -> Result<Vec<Vec<u8>>, QzoneError> {
     let mut images = Vec::new();
     for post in posts {
-        let mut part = collect_images(&post.draft, blob_paths, &post.preview_blobs).await?;
+        let mut part = collect_images(
+            &post.draft,
+            blob_paths,
+            &post.preview_blobs,
+            post.include_original_images,
+        )
+        .await?;
         images.append(&mut part);
     }
     Ok(images)
@@ -1438,6 +1459,7 @@ fn collect_emuqzone_images(
     draft: &Draft,
     blob_paths: &HashMap<BlobId, String>,
     preview_blobs: &[BlobId],
+    include_original_images: bool,
 ) -> Result<Vec<String>, QzoneError> {
     let mut images = Vec::new();
     for blob_id in preview_blobs {
@@ -1448,25 +1470,28 @@ fn collect_emuqzone_images(
             images.push(process_emuqzone_image(&path));
         }
     }
-    for block in &draft.blocks {
-        if let DraftBlock::Attachment {
-            kind: MediaKind::Image,
-            reference,
-            ..
-        } = block
-        {
-            match reference {
-                MediaReference::Blob { blob_id } => {
-                    if let Some(entry) = blob_cache::get_entry(*blob_id) {
-                        images.push(data_url_from_cache(&entry));
-                    } else {
-                        let path = resolve_blob_path(blob_paths, *blob_id)?;
+    if include_original_images {
+        for block in &draft.blocks {
+            if let DraftBlock::Attachment {
+                kind: MediaKind::Image,
+                reference,
+                ..
+            } = block
+            {
+                match reference {
+                    MediaReference::Blob { blob_id } => {
+                        if let Some(entry) = blob_cache::get_entry(*blob_id) {
+                            images.push(data_url_from_cache(&entry));
+                        } else {
+                            let path = resolve_blob_path(blob_paths, *blob_id)?;
+                            images.push(process_emuqzone_image(&path));
+                        }
+                    }
+                    _ => {
+                        let path =
+                            resolve_local_image_path(MediaKind::Image, reference, blob_paths)?;
                         images.push(process_emuqzone_image(&path));
                     }
-                }
-                _ => {
-                    let path = resolve_local_image_path(MediaKind::Image, reference, blob_paths)?;
-                    images.push(process_emuqzone_image(&path));
                 }
             }
         }
@@ -2001,10 +2026,14 @@ async fn collect_images(
     draft: &Draft,
     blob_paths: &HashMap<BlobId, String>,
     preview_blobs: &[BlobId],
+    include_original_images: bool,
 ) -> Result<Vec<Vec<u8>>, QzoneError> {
     let mut images = Vec::new();
     for blob_id in preview_blobs {
         images.push(resolve_blob_bytes(blob_paths, *blob_id)?);
+    }
+    if !include_original_images {
+        return Ok(images);
     }
     for block in &draft.blocks {
         if let DraftBlock::Attachment {

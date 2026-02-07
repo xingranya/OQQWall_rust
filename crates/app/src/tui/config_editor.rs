@@ -38,9 +38,45 @@ struct FieldSpec {
 
 const COMMON_FIELDS: &[FieldSpec] = &[
     FieldSpec {
-        key: "http-serv-port",
+        key: "web_api.enabled",
+        kind: FieldKind::Bool { default: false },
+        hint: "Enable root-token API service",
+        aliases: &["use_web_review"],
+    },
+    FieldSpec {
+        key: "web_api.port",
         kind: FieldKind::Text,
-        hint: "HTTP service port (legacy)",
+        hint: "Web API port",
+        aliases: &["web_review_port"],
+    },
+    FieldSpec {
+        key: "web_api.root_token",
+        kind: FieldKind::Text,
+        hint: "Web API root token",
+        aliases: &["api_token", "token"],
+    },
+    FieldSpec {
+        key: "webview.enabled",
+        kind: FieldKind::Bool { default: false },
+        hint: "Enable webview review frontend",
+        aliases: &[],
+    },
+    FieldSpec {
+        key: "webview.host",
+        kind: FieldKind::Text,
+        hint: "Webview bind host (e.g. 127.0.0.1 or 0.0.0.0)",
+        aliases: &[],
+    },
+    FieldSpec {
+        key: "webview.port",
+        kind: FieldKind::Text,
+        hint: "Webview port",
+        aliases: &[],
+    },
+    FieldSpec {
+        key: "webview.session_ttl_sec",
+        kind: FieldKind::Text,
+        hint: "Webview session TTL (seconds)",
         aliases: &[],
     },
     FieldSpec {
@@ -54,12 +90,6 @@ const COMMON_FIELDS: &[FieldSpec] = &[
         kind: FieldKind::Text,
         hint: "Minimum send interval in milliseconds",
         aliases: &["min_interval_sec"],
-    },
-    FieldSpec {
-        key: "max_queue",
-        kind: FieldKind::Text,
-        hint: "Maximum queued posts before flush",
-        aliases: &[],
     },
     FieldSpec {
         key: "max_image_number_one_post",
@@ -92,36 +122,6 @@ const COMMON_FIELDS: &[FieldSpec] = &[
         aliases: &[],
     },
     FieldSpec {
-        key: "apikey",
-        kind: FieldKind::Text,
-        hint: "LLM API key",
-        aliases: &[],
-    },
-    FieldSpec {
-        key: "text_model",
-        kind: FieldKind::Text,
-        hint: "Text model name",
-        aliases: &[],
-    },
-    FieldSpec {
-        key: "vision_model",
-        kind: FieldKind::Text,
-        hint: "Vision model name",
-        aliases: &[],
-    },
-    FieldSpec {
-        key: "vision_pixel_limit",
-        kind: FieldKind::Text,
-        hint: "Image pixel limit",
-        aliases: &[],
-    },
-    FieldSpec {
-        key: "vision_size_limit_mb",
-        kind: FieldKind::Text,
-        hint: "Image size limit in MB",
-        aliases: &[],
-    },
-    FieldSpec {
         key: "napcat_base_url",
         kind: FieldKind::Text,
         hint: "NapCat reverse WS base URL",
@@ -132,30 +132,6 @@ const COMMON_FIELDS: &[FieldSpec] = &[
         kind: FieldKind::Text,
         hint: "NapCat access token",
         aliases: &[],
-    },
-    FieldSpec {
-        key: "manage_napcat_internal",
-        kind: FieldKind::Bool { default: false },
-        hint: "Manage NapCat internally",
-        aliases: &[],
-    },
-    FieldSpec {
-        key: "renewcookies_use_napcat",
-        kind: FieldKind::Bool { default: true },
-        hint: "Use NapCat for cookie renewal",
-        aliases: &[],
-    },
-    FieldSpec {
-        key: "max_attempts_qzone_autologin",
-        kind: FieldKind::Text,
-        hint: "Max Qzone auto-login attempts",
-        aliases: &[],
-    },
-    FieldSpec {
-        key: "force_chromium_no_sandbox",
-        kind: FieldKind::Bool { default: false },
-        hint: "Force Chromium no-sandbox",
-        aliases: &["force_chromium_no-sandbox"],
     },
     FieldSpec {
         key: "at_unprived_sender",
@@ -173,18 +149,6 @@ const COMMON_FIELDS: &[FieldSpec] = &[
         key: "friend_add_message",
         kind: FieldKind::Text,
         hint: "Friend add message override",
-        aliases: &[],
-    },
-    FieldSpec {
-        key: "use_web_review",
-        kind: FieldKind::Bool { default: false },
-        hint: "Enable web review panel",
-        aliases: &[],
-    },
-    FieldSpec {
-        key: "web_review_port",
-        kind: FieldKind::Text,
-        hint: "Web review port",
         aliases: &[],
     },
 ];
@@ -287,12 +251,19 @@ const GROUP_FIELDS: &[FieldSpec] = &[
         aliases: &[],
     },
     FieldSpec {
-        key: "admins",
+        key: "webview_admins",
         kind: FieldKind::AdminList,
-        hint: "Web review admins (username/password)",
-        aliases: &[],
+        hint: "Webview admins (username/password, support sha256: prefix)",
+        aliases: &["admins"],
     },
 ];
+
+const ROOT_FIELDS: &[FieldSpec] = &[FieldSpec {
+    key: "webview_global_admins",
+    kind: FieldKind::AdminList,
+    hint: "Global webview admins (username/password, support sha256: prefix)",
+    aliases: &[],
+}];
 
 #[derive(Clone)]
 struct FieldEntry {
@@ -329,6 +300,7 @@ enum GroupAction {
 
 #[derive(Clone)]
 enum SectionKind {
+    Root,
     Common,
     Group(String),
 }
@@ -451,14 +423,18 @@ impl ConfigEditor {
         let path = path.into();
         match fs::read_to_string(&path) {
             Ok(data) => {
-                let root: Value =
-                    serde_json::from_str(&data).map_err(|err| format!("invalid json: {err}"))?;
+                let mut root: Value =
+                    serde_json::from_str(&data).map_err(|err| format!("JSON 格式错误: {err}"))?;
+                if normalize_tui_config_in_place(&mut root)? {
+                    write_tui_normalized_config(&path, &root)?;
+                }
                 Self::from_value(path, root)
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                Ok(Self::empty(path, Some("config not found, starting empty")))
-            }
-            Err(err) => Err(format!("failed to read {}: {err}", path.display())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::empty(
+                path,
+                Some("未找到配置文件，已使用空配置初始化"),
+            )),
+            Err(err) => Err(format!("读取 {} 失败: {err}", path.display())),
         }
     }
 
@@ -588,17 +564,18 @@ impl ConfigEditor {
 
         let section_lines = self.section_lines(&sections, body[0].width as usize);
         let sections_widget = Paragraph::new(Text::from(section_lines))
-            .block(Block::default().borders(Borders::ALL).title("Sections"));
+            .block(Block::default().borders(Borders::ALL).title("分区"));
         f.render_widget(sections_widget, body[0]);
 
         let field_lines = self.field_lines(&fields, body[1].width as usize);
         let fields_title = match self.current_section() {
-            SectionKind::Common => "Fields".to_string(),
+            SectionKind::Root => "字段（根配置）".to_string(),
+            SectionKind::Common => "字段（公共配置）".to_string(),
             SectionKind::Group(name) => {
                 if name.is_empty() {
-                    "Fields (group)".to_string()
+                    "字段（组配置）".to_string()
                 } else {
-                    format!("Fields ({name})")
+                    format!("字段（组 {name}）")
                 }
             }
         };
@@ -660,7 +637,7 @@ impl ConfigEditor {
     fn from_value(path: PathBuf, root: Value) -> Result<Self, String> {
         let obj = root
             .as_object()
-            .ok_or_else(|| "config must be a json object".to_string())?;
+            .ok_or_else(|| "配置根节点必须是 JSON 对象".to_string())?;
         let mut warnings = Vec::new();
         let (common, common_warn) = map_from_value(obj.get("common"));
         if let Some(message) = common_warn {
@@ -673,7 +650,7 @@ impl ConfigEditor {
             for (name, value) in groups_obj {
                 let (map, warn) = map_from_value(Some(value));
                 if let Some(message) = warn {
-                    warnings.push(format!("group {name}: {message}"));
+                    warnings.push(format!("组 {name}: {message}"));
                 }
                 groups.insert(name.clone(), map);
             }
@@ -693,11 +670,11 @@ impl ConfigEditor {
                     other_root.insert(key.clone(), value.clone());
                     continue;
                 }
-                let (map, warn) = map_from_value(Some(value));
-                if let Some(message) = warn {
-                    warnings.push(format!("group {key}: {message}"));
+                if let Some(group_obj) = value.as_object() {
+                    groups.insert(key.clone(), group_obj.clone());
+                    continue;
                 }
-                groups.insert(key.clone(), map);
+                other_root.insert(key.clone(), value.clone());
             }
             GroupStorage::Inline
         };
@@ -742,17 +719,17 @@ impl ConfigEditor {
     fn save_current(&mut self) {
         let (errors, warnings) = self.validate();
         if !errors.is_empty() {
-            let msg = summarize_messages(&errors, 1, "errors");
-            self.set_status(format!("save blocked: {msg}"), StatusLevel::Error);
+            let msg = summarize_messages(&errors, 1, "条错误");
+            self.set_status(format!("保存失败: {msg}"), StatusLevel::Error);
             return;
         }
         match self.save() {
             Ok(()) => {
                 if warnings.is_empty() {
-                    self.set_status("saved config", StatusLevel::Info);
+                    self.set_status("配置已保存", StatusLevel::Info);
                 } else {
-                    let msg = summarize_messages(&warnings, 1, "warnings");
-                    self.set_status(format!("saved with warning: {msg}"), StatusLevel::Warn);
+                    let msg = summarize_messages(&warnings, 1, "条告警");
+                    self.set_status(format!("保存成功，但有告警: {msg}"), StatusLevel::Warn);
                 }
             }
             Err(err) => self.set_status(err, StatusLevel::Error),
@@ -768,10 +745,10 @@ impl ConfigEditor {
                 if let Some(status) = had_status {
                     self.status = Some(status);
                 } else {
-                    self.set_status("reloaded config", StatusLevel::Info);
+                    self.set_status("配置已重载", StatusLevel::Info);
                 }
             }
-            Err(err) => self.set_status(format!("reload failed: {err}"), StatusLevel::Error),
+            Err(err) => self.set_status(format!("重载失败: {err}"), StatusLevel::Error),
         }
     }
 
@@ -813,23 +790,28 @@ impl ConfigEditor {
         }
 
         let output = serde_json::to_string_pretty(&Value::Object(root))
-            .map_err(|err| format!("serialize failed: {err}"))?;
-        fs::write(&self.path, format!("{output}\n"))
-            .map_err(|err| format!("write failed: {err}"))?;
+            .map_err(|err| format!("序列化失败: {err}"))?;
+        fs::write(&self.path, format!("{output}\n")).map_err(|err| format!("写入失败: {err}"))?;
         self.dirty = false;
         Ok(())
     }
 
     fn section_labels(&self) -> Vec<String> {
-        vec!["Common".to_string(), "Group".to_string()]
+        vec![
+            "根配置".to_string(),
+            "公共配置".to_string(),
+            "组配置".to_string(),
+        ]
     }
 
     fn current_section(&self) -> SectionKind {
-        if self.selected_section == 0 {
-            SectionKind::Common
-        } else {
-            let name = self.current_group.clone().unwrap_or_default();
-            SectionKind::Group(name)
+        match self.selected_section {
+            0 => SectionKind::Root,
+            1 => SectionKind::Common,
+            _ => {
+                let name = self.current_group.clone().unwrap_or_default();
+                SectionKind::Group(name)
+            }
         }
     }
 
@@ -841,6 +823,7 @@ impl ConfigEditor {
             }
         }
         let specs = match &section {
+            SectionKind::Root => ROOT_FIELDS,
             SectionKind::Common => COMMON_FIELDS,
             SectionKind::Group(_) => GROUP_FIELDS,
         };
@@ -853,8 +836,14 @@ impl ConfigEditor {
                 spec: Some(*spec),
             });
             seen.insert(spec.key);
+            if let Some((prefix, _)) = spec.key.split_once('.') {
+                seen.insert(prefix);
+            }
             for alias in spec.aliases {
                 seen.insert(*alias);
+                if let Some((prefix, _)) = alias.split_once('.') {
+                    seen.insert(prefix);
+                }
             }
         }
 
@@ -893,13 +882,13 @@ impl ConfigEditor {
         self.group_tabs.clear();
         self.group_actions.clear();
         let mut spans = Vec::new();
-        let prefix = "Group: ";
+        let prefix = "组: ";
         spans.push(Span::raw(prefix.to_string()));
         let mut col = UnicodeWidthStr::width(prefix) as u16;
 
         let names = self.group_names();
         if names.is_empty() {
-            let label = "<none>";
+            let label = "<暂无>";
             spans.push(Span::styled(label, Style::default().fg(Color::Yellow)));
             col = col.saturating_add(UnicodeWidthStr::width(label) as u16);
         } else {
@@ -920,9 +909,7 @@ impl ConfigEditor {
                     end: col.saturating_add(width_label),
                 };
                 let style = if active {
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD)
+                    Style::default().fg(Color::Green)
                 } else {
                     Style::default()
                 };
@@ -970,7 +957,7 @@ impl ConfigEditor {
             .unwrap_or(0);
         let next = if idx == 0 { names.len() - 1 } else { idx - 1 };
         self.current_group = Some(names[next].clone());
-        self.selected_section = 1;
+        self.selected_section = 2;
         self.selected_field = 0;
         self.field_offset = 0;
         self.pending_group_delete = None;
@@ -988,7 +975,7 @@ impl ConfigEditor {
             .unwrap_or(0);
         let next = (idx + 1) % names.len();
         self.current_group = Some(names[next].clone());
-        self.selected_section = 1;
+        self.selected_section = 2;
         self.selected_field = 0;
         self.field_offset = 0;
         self.pending_group_delete = None;
@@ -1000,6 +987,7 @@ impl ConfigEditor {
 
     fn section_map(&self, section: &SectionKind) -> Option<&Map<String, Value>> {
         match section {
+            SectionKind::Root => Some(&self.other_root),
             SectionKind::Common => Some(&self.common),
             SectionKind::Group(name) => self.groups.get(name),
         }
@@ -1007,6 +995,7 @@ impl ConfigEditor {
 
     fn section_map_mut(&mut self, section: &SectionKind) -> Option<&mut Map<String, Value>> {
         match section {
+            SectionKind::Root => Some(&mut self.other_root),
             SectionKind::Common => Some(&mut self.common),
             SectionKind::Group(name) => self.groups.get_mut(name),
         }
@@ -1050,13 +1039,10 @@ impl ConfigEditor {
         );
     }
 
-    fn selection_style(&self, selected: bool, focused: bool) -> Style {
+    fn selection_style(&self, selected: bool, _focused: bool) -> Style {
         let mut style = Style::default();
-        if selected {
+        if selected && _focused {
             style = style.add_modifier(Modifier::REVERSED);
-        }
-        if focused {
-            style = style.add_modifier(Modifier::BOLD);
         }
         style
     }
@@ -1064,7 +1050,7 @@ impl ConfigEditor {
     fn section_lines(&self, sections: &[String], width: usize) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         if sections.is_empty() {
-            lines.push(Line::raw("No sections"));
+            lines.push(Line::raw("没有可用分区"));
             return lines;
         }
         let start = self.section_offset.min(sections.len());
@@ -1084,10 +1070,10 @@ impl ConfigEditor {
     fn field_lines(&self, fields: &[FieldEntry], width: usize) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         if fields.is_empty() {
-            if self.selected_section == 1 && self.current_group.is_none() {
-                lines.push(Line::raw("No groups. Press 'g' to add."));
+            if self.selected_section == 2 && self.current_group.is_none() {
+                lines.push(Line::raw("还没有组，按 g 新建组"));
             } else {
-                lines.push(Line::raw("No fields. Press 'a' to add."));
+                lines.push(Line::raw("当前无字段，按 a 新增字段"));
             }
             return lines;
         }
@@ -1120,7 +1106,8 @@ impl ConfigEditor {
             } else {
                 self.field_preview(&section, entry)
             };
-            let line = format!("{} = {}", entry.key, preview);
+            let summary = entry.spec.map(field_summary_text).unwrap_or("自定义字段");
+            let line = format!("{} | {} | {}", entry.key, summary, preview);
             let text = truncate_to_width(&line, width.saturating_sub(2));
             lines.push(Line::styled(text, style));
         }
@@ -1130,27 +1117,27 @@ impl ConfigEditor {
     fn field_preview(&self, section: &SectionKind, entry: &FieldEntry) -> String {
         let map = match self.section_map(section) {
             Some(map) => map,
-            None => return "<unset>".to_string(),
+            None => return "<未设置>".to_string(),
         };
         let Some(spec) = entry.spec else {
             return map
                 .get(&entry.key)
                 .map(value_display)
-                .unwrap_or_else(|| "<unset>".to_string());
+                .unwrap_or_else(|| "<未设置>".to_string());
         };
 
-        let value = resolve_value(map, &spec).or_else(|| map.get(spec.key));
+        let value = resolve_value(map, &spec);
         match spec.kind {
             FieldKind::Bool { default } => {
                 let (val, missing, invalid) = bool_value(value, default);
                 if invalid {
                     value
                         .map(value_display)
-                        .unwrap_or_else(|| "<invalid>".to_string())
+                        .unwrap_or_else(|| "<非法值>".to_string())
                 } else {
                     let display = if val { "[x]" } else { "[ ]" };
                     if missing {
-                        format!("{display} (default)")
+                        format!("{display} (默认)")
                     } else {
                         display.to_string()
                     }
@@ -1159,42 +1146,42 @@ impl ConfigEditor {
             FieldKind::StringList => {
                 let items = extract_string_list(value);
                 if is_unset_value(value) {
-                    "<unset>".to_string()
+                    "<未设置>".to_string()
                 } else {
-                    format!("list({})", items.len())
+                    format!("列表({})", items.len())
                 }
             }
             FieldKind::PairList { left, right } => {
                 let items = extract_pair_list(map, left, right);
                 if map.get(left).is_none() && map.get(right).is_none() {
-                    "<unset>".to_string()
+                    "<未设置>".to_string()
                 } else {
-                    format!("pairs({})", items.len())
+                    format!("成对({})", items.len())
                 }
             }
             FieldKind::MapList => {
                 let items = extract_map_list(value);
                 if is_unset_value(value) {
-                    "<unset>".to_string()
+                    "<未设置>".to_string()
                 } else {
-                    format!("map({})", items.len())
+                    format!("映射({})", items.len())
                 }
             }
             FieldKind::AdminList => {
                 let items = extract_admin_list(value);
                 if is_unset_value(value) {
-                    "<unset>".to_string()
+                    "<未设置>".to_string()
                 } else {
-                    format!("admins({})", items.len())
+                    format!("管理员({})", items.len())
                 }
             }
             FieldKind::Text => {
                 if is_unset_value(value) {
-                    "<unset>".to_string()
+                    "<未设置>".to_string()
                 } else {
                     value
                         .map(value_display)
-                        .unwrap_or_else(|| "<unset>".to_string())
+                        .unwrap_or_else(|| "<未设置>".to_string())
                 }
             }
         }
@@ -1202,43 +1189,45 @@ impl ConfigEditor {
 
     fn header_line(&self, width: usize) -> Line<'static> {
         let dirty = if self.dirty { " *" } else { "" };
-        let text = format!("Config: {}{}", self.path.display(), dirty);
+        let text = format!("配置文件: {}{}", self.path.display(), dirty);
         Line::raw(truncate_to_width(&text, width))
     }
 
     fn hint_line(&self, width: usize) -> Line<'static> {
-        let hint = self.current_hint();
-        if hint.is_empty() {
-            return Line::raw(truncate_to_width("Hint: -", width));
+        let detail = self.current_detail();
+        if detail.is_empty() {
+            return Line::raw(truncate_to_width("详细说明: -", width));
         }
-        let text = format!("Hint: {hint}");
+        let text = format!("详细说明: {detail}");
         Line::raw(truncate_to_width(&text, width))
     }
 
-    fn current_hint(&self) -> String {
+    fn current_detail(&self) -> String {
         let fields = self.current_fields();
         let Some(entry) = self.selected_field_entry(&fields) else {
             return String::new();
         };
-        entry
-            .spec
-            .map(|spec| spec.hint.to_string())
-            .unwrap_or_else(|| "Custom field".to_string())
+        entry.spec.map(field_detail_text).unwrap_or_else(|| {
+            format!(
+                "自定义字段 `{}`：请确认值类型后保存；支持直接输入 JSON（如 true、123、[\"a\"]）。",
+                entry.key
+            )
+        })
     }
 
     fn footer_line(&self, width: usize) -> Line<'static> {
         if let Some(edit) = &self.editing {
             let label = match &edit.mode {
-                EditMode::Value { key, .. } => format!("Edit {key}: "),
-                EditMode::NewKeyName { .. } => "New key name: ".to_string(),
-                EditMode::NewKeyValue { key, .. } => format!("New value for {key}: "),
-                EditMode::NewGroupName => "New group id: ".to_string(),
+                EditMode::Value { key, .. } => format!("编辑 {key}: "),
+                EditMode::NewKeyName { .. } => "新字段名: ".to_string(),
+                EditMode::NewKeyValue { key, .. } => format!("字段 {key} 的新值: "),
+                EditMode::NewGroupName => "新组名: ".to_string(),
             };
             let text = format!("{label}{}", edit.buffer);
             return Line::raw(truncate_to_width(&text, width));
         }
 
-        let help = "mouse click | Tab focus | arrows move | enter/e edit | space toggle | a add key | g add group | x delete group | [ ] switch group | s save | r reload";
+        let help = "鼠标点击 | Tab 切焦点 | 方向键移动 | Enter/e 编辑 | 空格切换布尔 | a 新增字段 | g 新增组 | x 删除组 | [ ] 切组 | s 保存 | r 重载";
         self.status_with_help(help, width)
     }
 
@@ -1348,13 +1337,13 @@ impl ConfigEditor {
         }
         let fields = self.current_fields();
         if fields.is_empty() {
-            self.set_status("no field selected", StatusLevel::Warn);
+            self.set_status("未选中字段", StatusLevel::Warn);
             return;
         }
         let entry = fields[self.selected_field].clone();
         let section = self.current_section();
         if matches!(section, SectionKind::Group(ref name) if name.is_empty()) {
-            self.set_status("no group selected", StatusLevel::Warn);
+            self.set_status("未选中组", StatusLevel::Warn);
             return;
         }
         if let Some(spec) = entry.spec {
@@ -1395,7 +1384,7 @@ impl ConfigEditor {
     fn begin_new_key(&mut self) {
         let section = self.current_section();
         if matches!(section, SectionKind::Group(ref name) if name.is_empty()) {
-            self.set_status("no group selected", StatusLevel::Warn);
+            self.set_status("未选中组", StatusLevel::Warn);
             return;
         }
         self.editing = Some(EditState {
@@ -1417,11 +1406,11 @@ impl ConfigEditor {
         }
         let section = self.current_section();
         let SectionKind::Group(name) = section else {
-            self.set_status("cannot delete common section", StatusLevel::Warn);
+            self.set_status("只能在“组配置”分区删除组", StatusLevel::Warn);
             return;
         };
         if name.is_empty() {
-            self.set_status("no group selected", StatusLevel::Warn);
+            self.set_status("未选中组", StatusLevel::Warn);
             return;
         }
         if self.pending_group_delete.as_deref() == Some(&name) {
@@ -1430,17 +1419,14 @@ impl ConfigEditor {
             if self.current_group.as_deref() == Some(&name) {
                 self.current_group = self.groups.keys().next().cloned();
             }
-            self.selected_section = 1;
+            self.selected_section = 2;
             self.selected_field = 0;
             self.field_offset = 0;
             self.dirty = true;
-            self.set_status(format!("deleted group {name}"), StatusLevel::Info);
+            self.set_status(format!("已删除组 {name}"), StatusLevel::Info);
         } else {
             self.pending_group_delete = Some(name.clone());
-            self.set_status(
-                format!("press x again to delete group {name}"),
-                StatusLevel::Warn,
-            );
+            self.set_status(format!("再次按 x 确认删除组 {name}"), StatusLevel::Warn);
         }
     }
 
@@ -1475,7 +1461,7 @@ impl ConfigEditor {
             .or_else(|| map.get(&entry.key));
         let (current, _, invalid) = bool_value(value, default);
         if !bool_field && invalid {
-            self.set_status("selected field is not a bool", StatusLevel::Warn);
+            self.set_status("当前字段不是布尔值", StatusLevel::Warn);
             return;
         }
         let next = !current;
@@ -1484,9 +1470,9 @@ impl ConfigEditor {
             if let Some(spec) = spec {
                 clear_aliases(map, &spec);
             }
-            map.insert(key.clone(), Value::Bool(next));
+            set_path_value(map, &key, Value::Bool(next));
             self.dirty = true;
-            self.set_status(format!("set {key} = {next}"), StatusLevel::Info);
+            self.set_status(format!("已设置 {key} = {next}"), StatusLevel::Info);
         }
     }
 
@@ -1541,7 +1527,7 @@ impl ConfigEditor {
             for tab in &self.group_tabs {
                 if tab.bounds.contains(local_x) {
                     self.current_group = Some(tab.name.clone());
-                    self.selected_section = 1;
+                    self.selected_section = 2;
                     self.selected_field = 0;
                     self.field_offset = 0;
                     self.pending_group_delete = None;
@@ -1631,21 +1617,21 @@ impl ConfigEditor {
                         clear_aliases(map, &spec);
                     }
                     if edit.buffer.trim().is_empty() {
-                        map.remove(&key);
+                        remove_path_value(map, &key);
                         self.dirty = true;
-                        self.set_status(format!("unset {key}"), StatusLevel::Info);
+                        self.set_status(format!("已清空 {key}"), StatusLevel::Info);
                         return;
                     }
                     let value = parse_input_value(&edit.buffer);
-                    map.insert(key.clone(), value);
+                    set_path_value(map, &key, value);
                     self.dirty = true;
-                    self.set_status(format!("updated {key}"), StatusLevel::Info);
+                    self.set_status(format!("已更新 {key}"), StatusLevel::Info);
                 }
             }
             EditMode::NewKeyName { section } => {
                 let key = edit.buffer.trim();
                 if key.is_empty() {
-                    self.set_status("key name is empty", StatusLevel::Warn);
+                    self.set_status("字段名不能为空", StatusLevel::Warn);
                     return;
                 }
                 let exists = self
@@ -1653,7 +1639,7 @@ impl ConfigEditor {
                     .map(|map| map.contains_key(key))
                     .unwrap_or(false);
                 if exists {
-                    self.set_status("key already exists", StatusLevel::Warn);
+                    self.set_status("字段名已存在", StatusLevel::Warn);
                     self.editing = Some(EditState {
                         mode: EditMode::NewKeyName { section },
                         buffer: key.to_string(),
@@ -1673,41 +1659,42 @@ impl ConfigEditor {
                     if edit.buffer.trim().is_empty() {
                         self.dirty = true;
                         self.select_key(&key);
-                        self.set_status(format!("unset {key}"), StatusLevel::Info);
+                        self.set_status(format!("已清空 {key}"), StatusLevel::Info);
                         return;
                     }
                     let value = parse_input_value(&edit.buffer);
-                    map.insert(key.clone(), value);
+                    set_path_value(map, &key, value);
                     self.dirty = true;
                     self.select_key(&key);
-                    self.set_status(format!("added {key}"), StatusLevel::Info);
+                    self.set_status(format!("已新增字段 {key}"), StatusLevel::Info);
                 }
             }
             EditMode::NewGroupName => {
                 let name = edit.buffer.trim();
                 if name.is_empty() {
-                    self.set_status("group name is empty", StatusLevel::Warn);
+                    self.set_status("组名不能为空", StatusLevel::Warn);
                     return;
                 }
                 if name.eq_ignore_ascii_case("common") || name.eq_ignore_ascii_case("groups") {
-                    self.set_status("group name is reserved", StatusLevel::Warn);
+                    self.set_status("组名为保留字", StatusLevel::Warn);
                     return;
                 }
                 if !is_valid_group_name(name) {
-                    self.set_status("group name must be alnum or underscore", StatusLevel::Warn);
+                    self.set_status("组名只能包含字母、数字和下划线", StatusLevel::Warn);
                     return;
                 }
                 if self.groups.contains_key(name) {
-                    self.set_status("group already exists", StatusLevel::Warn);
+                    self.set_status("组名已存在", StatusLevel::Warn);
                     return;
                 }
-                self.groups.insert(name.to_string(), Map::new());
+                self.groups
+                    .insert(name.to_string(), default_group_config_template());
                 self.current_group = Some(name.to_string());
-                self.selected_section = 1;
+                self.selected_section = 2;
                 self.selected_field = 0;
                 self.field_offset = 0;
                 self.dirty = true;
-                self.set_status(format!("added group {name}"), StatusLevel::Info);
+                self.set_status(format!("已新增组 {name}"), StatusLevel::Info);
             }
         }
     }
@@ -1778,10 +1765,10 @@ impl ConfigEditor {
                 let value = spec.and_then(|spec| resolve_value(map, &spec));
                 let value = value.or_else(|| map.get(key));
                 extract_map_list(value)
+                    .into_iter()
+                    .map(|(k, v)| ListItem::MapEntry(k, v))
+                    .collect()
             }
-            .into_iter()
-            .map(|(k, v)| ListItem::MapEntry(k, v))
-            .collect(),
             ListKind::AdminList => {
                 let value = spec.and_then(|spec| resolve_value(map, &spec));
                 let value = value.or_else(|| map.get(key));
@@ -1856,7 +1843,7 @@ impl ConfigEditor {
         if editor.dirty {
             if let Some(map) = self.section_map_mut(&editor.section) {
                 for alias in &editor.aliases {
-                    map.remove(*alias);
+                    remove_path_value(map, alias);
                 }
                 editor.apply_to_map(map);
                 self.dirty = true;
@@ -1888,7 +1875,7 @@ impl ConfigEditor {
         editor.ensure_visible(list_height);
         let list_lines = editor.list_lines(layout[1].width as usize, list_height, self.cursor_on);
         let list_widget = Paragraph::new(Text::from(list_lines))
-            .block(Block::default().borders(Borders::ALL).title("List"));
+            .block(Block::default().borders(Borders::ALL).title("列表编辑"));
         f.render_widget(list_widget, layout[1]);
 
         let footer = editor.footer_line(self.status.as_ref(), layout[2].width as usize);
@@ -1899,73 +1886,96 @@ impl ConfigEditor {
 
     fn validate(&self) -> (Vec<String>, Vec<String>) {
         let mut errors = Vec::new();
-        let warnings = Vec::new();
+        let mut warnings = Vec::new();
 
         let mut account_ids = HashSet::new();
 
-        let audit_cmds = [
-            "\u{662f}",
-            "\u{5426}",
-            "\u{533f}",
-            "\u{7b49}",
-            "\u{5220}",
-            "\u{62d2}",
-            "\u{7acb}\u{5373}",
-            "\u{5237}\u{65b0}",
-            "\u{91cd}\u{6e32}\u{67d3}",
-            "\u{6269}\u{5217}\u{5ba1}\u{67e5}",
-            "\u{8bc4}\u{8bba}",
-            "\u{56de}\u{590d}",
-            "\u{5c55}\u{793a}",
-            "\u{62c9}\u{9ed1}",
-            "\u{6d88}\u{606f}\u{5168}\u{9009}",
-        ];
+        let (web_api_enabled, _, web_api_invalid) =
+            bool_value(get_path_value(&self.common, "web_api.enabled"), false);
+        if web_api_invalid {
+            errors.push("common: web_api.enabled 必须是布尔值".to_string());
+        }
+        if web_api_enabled
+            && value_to_string(get_path_value(&self.common, "web_api.root_token"))
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+        {
+            warnings.push("common: web_api.enabled=true 但 web_api.root_token 为空".to_string());
+        }
+
+        let (webview_enabled, _, webview_invalid) =
+            bool_value(get_path_value(&self.common, "webview.enabled"), false);
+        if webview_invalid {
+            errors.push("common: webview.enabled 必须是布尔值".to_string());
+        }
+        if webview_enabled
+            && value_to_string(get_path_value(&self.common, "webview.host"))
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+        {
+            errors.push("common: 启用 webview 时 webview.host 不能为空".to_string());
+        }
+
+        let global_admins = extract_admin_list(self.other_root.get("webview_global_admins"));
+        for (username, password) in &global_admins {
+            if username.trim().is_empty() {
+                errors.push("webview_global_admins 存在空用户名".to_string());
+                continue;
+            }
+            if !password.trim().is_empty() && !password.starts_with("sha256:") {
+                warnings.push(format!(
+                    "webview_global_admins[{username}] 使用明文密码，建议使用 sha256:..."
+                ));
+            }
+        }
 
         for (group, obj) in &self.groups {
             if !is_valid_group_name(group) {
                 errors.push(format!(
-                    "group '{group}' contains invalid characters (alnum/_ only)"
+                    "group '{group}' 名称非法（仅允许字母/数字/下划线）"
                 ));
                 continue;
             }
 
             let mangroupid = value_to_string(obj.get("mangroupid")).unwrap_or_default();
             if mangroupid.is_empty() || !is_numeric(&mangroupid) {
-                errors.push(format!("{group}: mangroupid must be numeric"));
+                errors.push(format!("{group}: mangroupid 必须是数字"));
             }
-            let mut accounts = extract_string_list(obj.get("accounts"));
+            let accounts = extract_string_list(obj.get("accounts"));
             if accounts.is_empty() {
-                if let Some(main) = value_to_string(obj.get("mainqqid")) {
-                    accounts.push(main);
-                }
-                accounts.extend(extract_string_list(obj.get("minorqqid")));
-            }
-            if accounts.is_empty() {
-                errors.push(format!("{group}: accounts is missing or empty"));
+                errors.push(format!("{group}: accounts 缺失或为空"));
             }
             for account in &accounts {
                 if account.is_empty() {
                     continue;
                 }
                 if !is_numeric(account) {
-                    errors.push(format!("{group}: accounts contains non-numeric {account}"));
+                    errors.push(format!("{group}: accounts 包含非数字账号 {account}"));
                 } else if !account_ids.insert(account.clone()) {
-                    errors.push(format!("accounts {account} is duplicated"));
+                    errors.push(format!("accounts 账号 {account} 重复"));
                 }
             }
 
             for key in ["max_post_stack", "max_image_number_one_post"] {
                 let val = value_to_string(obj.get(key)).unwrap_or_default();
                 if !val.is_empty() && !is_numeric(&val) {
-                    errors.push(format!("{group}: {key} must be numeric"));
+                    errors.push(format!("{group}: {key} 必须是数字"));
                 }
             }
 
             for key in ["friend_add_message", "watermark_text"] {
                 if let Some(value) = obj.get(key) {
                     if !matches!(value, Value::String(_)) {
-                        errors.push(format!("{group}: {key} must be a string"));
+                        errors.push(format!("{group}: {key} 必须是字符串"));
                     }
+                }
+            }
+
+            if let Some(value) = obj.get("individual_image_in_posts") {
+                if !matches!(value, Value::Bool(_)) {
+                    errors.push(format!("{group}: individual_image_in_posts 必须是布尔值"));
                 }
             }
 
@@ -1975,37 +1985,41 @@ impl ConfigEditor {
                         for item in items {
                             if let Some(s) = value_to_string(Some(item)) {
                                 if !s.is_empty() && parse_schedule_str(&s).is_none() {
-                                    errors.push(format!("{group}: send_schedule invalid time {s}"));
+                                    errors.push(format!("{group}: send_schedule 时间格式错误 {s}"));
                                 }
                             }
                         }
                     }
                     Value::Null => {}
                     _ => {
-                        errors.push(format!("{group}: send_schedule must be an array"));
+                        errors.push(format!("{group}: send_schedule 必须是数组"));
                     }
                 }
             }
 
             if let Some(value) = obj.get("quick_replies") {
                 match value {
-                    Value::Object(map) => {
-                        for (cmd, val) in map {
-                            if audit_cmds.contains(&cmd.as_str()) {
-                                errors.push(format!(
-                                    "{group}: quick_replies command {cmd} conflicts with audit"
-                                ));
-                            }
-                            if !matches!(val, Value::String(_)) {
-                                errors.push(format!(
-                                    "{group}: quick_replies value for {cmd} must be string"
-                                ));
+                    Value::Object(entries) => {
+                        for (cmd, content) in entries {
+                            if cmd.trim().is_empty() {
+                                errors.push(format!("{group}: quick_replies 存在空指令名"));
                                 continue;
                             }
-                            if let Some(text) = val.as_str() {
-                                if text.trim().is_empty() {
+                            if quick_reply_conflicts_with_review_command(cmd) {
+                                errors.push(format!(
+                                    "{group}: quick_replies 指令 {cmd} 与审核指令冲突"
+                                ));
+                            }
+                            match content {
+                                Value::String(text) if !text.trim().is_empty() => {}
+                                Value::String(_) => {
                                     errors.push(format!(
-                                        "{group}: quick_replies value for {cmd} is empty"
+                                        "{group}: quick_replies[{cmd}] 内容不能为空"
+                                    ));
+                                }
+                                _ => {
+                                    errors.push(format!(
+                                        "{group}: quick_replies[{cmd}] 必须是字符串"
                                     ));
                                 }
                             }
@@ -2013,9 +2027,52 @@ impl ConfigEditor {
                     }
                     Value::Null => {}
                     _ => {
-                        errors.push(format!("{group}: quick_replies must be an object"));
+                        errors.push(format!("{group}: quick_replies 必须是对象"));
                     }
                 }
+            }
+
+            let admins = extract_admin_list(resolve_value(
+                obj,
+                &FieldSpec {
+                    key: "webview_admins",
+                    kind: FieldKind::AdminList,
+                    hint: "",
+                    aliases: &["admins"],
+                },
+            ));
+            for (username, password) in admins {
+                if username.trim().is_empty() {
+                    errors.push(format!("{group}: webview_admins 存在空用户名"));
+                    continue;
+                }
+                if !password.trim().is_empty() && !password.starts_with("sha256:") {
+                    warnings.push(format!(
+                        "{group}: 管理员 {username} 使用明文密码，建议使用 sha256:..."
+                    ));
+                }
+            }
+        }
+
+        if webview_enabled {
+            let mut group_admin_count = 0usize;
+            for obj in self.groups.values() {
+                group_admin_count += extract_admin_list(resolve_value(
+                    obj,
+                    &FieldSpec {
+                        key: "webview_admins",
+                        kind: FieldKind::AdminList,
+                        hint: "",
+                        aliases: &["admins"],
+                    },
+                ))
+                .len();
+            }
+            if global_admins.is_empty() && group_admin_count == 0 {
+                warnings.push(
+                    "common: webview.enabled=true 但未配置 webview_global_admins/webview_admins"
+                        .to_string(),
+                );
             }
         }
 
@@ -2033,43 +2090,45 @@ impl ConfigEditor {
 impl ListEditor {
     fn header_line(&self, width: usize) -> Line<'static> {
         let section = match &self.section {
-            SectionKind::Common => "common".to_string(),
-            SectionKind::Group(name) => format!("group {name}"),
+            SectionKind::Root => "根配置".to_string(),
+            SectionKind::Common => "公共配置".to_string(),
+            SectionKind::Group(name) => format!("组 {name}"),
         };
         let key_label = match &self.kind {
             ListKind::PairList { left, right } => format!("{left}/{right}"),
+            ListKind::MapList => format!("{}(key/value)", self.key),
             _ => self.key.clone(),
         };
         let focus = match self.focus {
-            ListFocus::Left => "left",
-            ListFocus::Right => "right",
+            ListFocus::Left => "左列",
+            ListFocus::Right => "右列",
         };
-        let text = format!("Edit {section}::{key_label} (col={focus})");
+        let text = format!("编辑 {section}::{key_label}（当前列: {focus}）");
         Line::raw(truncate_to_width(&text, width))
     }
 
     fn footer_line(&self, status: Option<&StatusMessage>, width: usize) -> Line<'static> {
         if let Some(input) = &self.input {
             let label = match self.kind {
-                ListKind::StringList => "Edit item: ".to_string(),
+                ListKind::StringList => "编辑项: ".to_string(),
                 ListKind::PairList { .. } => match input.focus {
-                    ListFocus::Left => "Edit left: ".to_string(),
-                    ListFocus::Right => "Edit right: ".to_string(),
+                    ListFocus::Left => "编辑左值: ".to_string(),
+                    ListFocus::Right => "编辑右值: ".to_string(),
                 },
                 ListKind::MapList => match input.focus {
-                    ListFocus::Left => "Edit key: ".to_string(),
-                    ListFocus::Right => "Edit value: ".to_string(),
+                    ListFocus::Left => "编辑指令: ".to_string(),
+                    ListFocus::Right => "编辑内容: ".to_string(),
                 },
                 ListKind::AdminList => match input.focus {
-                    ListFocus::Left => "Edit username: ".to_string(),
-                    ListFocus::Right => "Edit password: ".to_string(),
+                    ListFocus::Left => "编辑用户名: ".to_string(),
+                    ListFocus::Right => "编辑密码: ".to_string(),
                 },
             };
             let text = format!("{label}{}", input.buffer);
             return Line::raw(truncate_to_width(&text, width));
         }
 
-        let help = "mouse click | arrows move | enter/e edit | a add | d delete | Tab switch col | Esc back";
+        let help = "鼠标点击 | 方向键移动 | Enter/e 编辑 | a 新增 | d 删除 | Tab 切列 | Esc 返回";
         if let Some(status) = status {
             let status_text = truncate_to_width(&status.text, width.saturating_sub(help.len() + 3));
             let style = match status.level {
@@ -2090,7 +2149,7 @@ impl ListEditor {
     fn list_lines(&self, width: usize, height: usize, cursor_on: bool) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         if self.items.is_empty() {
-            lines.push(Line::raw("No items. Press 'a' to add."));
+            lines.push(Line::raw("暂无条目，按 a 新增"));
             return lines;
         }
         let start = self.offset.min(self.items.len());
@@ -2101,7 +2160,7 @@ impl ListEditor {
             let mut body = match item {
                 ListItem::Single(val) => val.clone(),
                 ListItem::Pair(left, right) => format!("{left} | {right}"),
-                ListItem::MapEntry(key, value) => format!("{key} => {value}"),
+                ListItem::MapEntry(key, value) => format!("{key} | {value}"),
                 ListItem::Admin(user, pass) => format!("{user} | {pass}"),
             };
             if let Some(input) = &self.input {
@@ -2114,8 +2173,8 @@ impl ListEditor {
                             ListFocus::Right => format!("{left} | {}{}", input.buffer, cursor),
                         },
                         ListItem::MapEntry(key, value) => match input.focus {
-                            ListFocus::Left => format!("{}{} => {value}", input.buffer, cursor),
-                            ListFocus::Right => format!("{key} => {}{}", input.buffer, cursor),
+                            ListFocus::Left => format!("{}{} | {value}", input.buffer, cursor),
+                            ListFocus::Right => format!("{key} | {}{}", input.buffer, cursor),
                         },
                         ListItem::Admin(user, pass) => match input.focus {
                             ListFocus::Left => format!("{}{} | {pass}", input.buffer, cursor),
@@ -2214,7 +2273,7 @@ impl ListEditor {
             }
             ListKind::MapList => self
                 .items
-                .push(ListItem::MapEntry("new_key".to_string(), "".to_string())),
+                .push(ListItem::MapEntry(String::new(), String::new())),
             ListKind::AdminList => self
                 .items
                 .push(ListItem::Admin(String::new(), String::new())),
@@ -2271,9 +2330,9 @@ impl ListEditor {
                     }
                 }
                 if values.is_empty() {
-                    map.remove(&self.key);
+                    remove_path_value(map, &self.key);
                 } else {
-                    map.insert(self.key, Value::Array(values));
+                    set_path_value(map, &self.key, Value::Array(values));
                 }
             }
             ListKind::PairList { left, right } => {
@@ -2296,22 +2355,6 @@ impl ListEditor {
                     map.insert(right, Value::Array(right_values));
                 }
             }
-            ListKind::MapList => {
-                let mut map_val = Map::new();
-                for item in self.items {
-                    if let ListItem::MapEntry(key, value) = item {
-                        if key.trim().is_empty() {
-                            continue;
-                        }
-                        map_val.insert(key, Value::String(value));
-                    }
-                }
-                if map_val.is_empty() {
-                    map.remove(&self.key);
-                } else {
-                    map.insert(self.key, Value::Object(map_val));
-                }
-            }
             ListKind::AdminList => {
                 let mut list = Vec::new();
                 for item in self.items {
@@ -2326,9 +2369,27 @@ impl ListEditor {
                     }
                 }
                 if list.is_empty() {
-                    map.remove(&self.key);
+                    remove_path_value(map, &self.key);
                 } else {
-                    map.insert(self.key, Value::Array(list));
+                    set_path_value(map, &self.key, Value::Array(list));
+                }
+            }
+            ListKind::MapList => {
+                let mut map_val = Map::new();
+                for item in self.items {
+                    if let ListItem::MapEntry(key, value) = item {
+                        let key = key.trim();
+                        let value = value.trim();
+                        if key.is_empty() || value.is_empty() {
+                            continue;
+                        }
+                        map_val.insert(key.to_string(), Value::String(value.to_string()));
+                    }
+                }
+                if map_val.is_empty() {
+                    remove_path_value(map, &self.key);
+                } else {
+                    set_path_value(map, &self.key, Value::Object(map_val));
                 }
             }
         }
@@ -2407,12 +2468,159 @@ fn normalize_group_accounts_map(map: &mut Map<String, Value>) {
     }
 }
 
+fn normalize_tui_config_in_place(root: &mut Value) -> Result<bool, String> {
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| "配置根节点必须是 JSON 对象".to_string())?;
+    let mut changed = false;
+
+    if let Some(common_obj) = obj.get_mut("common").and_then(|v| v.as_object_mut()) {
+        if normalize_tui_common(common_obj) {
+            changed = true;
+        }
+    }
+
+    if let Some(groups_obj) = obj.get_mut("groups").and_then(|v| v.as_object_mut()) {
+        for group in groups_obj.values_mut() {
+            let Some(group_obj) = group.as_object_mut() else {
+                continue;
+            };
+            if normalize_tui_group(group_obj) {
+                changed = true;
+            }
+        }
+        return Ok(changed);
+    }
+
+    for (key, value) in obj.iter_mut() {
+        if key == "common" || key == "schema_version" || key == "webview_global_admins" {
+            continue;
+        }
+        let Some(group_obj) = value.as_object_mut() else {
+            continue;
+        };
+        if normalize_tui_group(group_obj) {
+            changed = true;
+        }
+    }
+
+    Ok(changed)
+}
+
+fn normalize_tui_common(common_obj: &mut Map<String, Value>) -> bool {
+    let mut changed = false;
+    let mut web_api_obj = common_obj
+        .get("web_api")
+        .and_then(|value| value.as_object())
+        .cloned()
+        .unwrap_or_default();
+
+    if let Some(value) = common_obj.remove("use_web_review") {
+        if !web_api_obj.contains_key("enabled") {
+            web_api_obj.insert("enabled".to_string(), value);
+        }
+        changed = true;
+    }
+    if let Some(value) = common_obj.remove("web_review_port") {
+        if !web_api_obj.contains_key("port") {
+            web_api_obj.insert("port".to_string(), value);
+        }
+        changed = true;
+    }
+    if let Some(value) = common_obj.remove("api_token") {
+        if !web_api_obj.contains_key("root_token") {
+            web_api_obj.insert("root_token".to_string(), value);
+        }
+        changed = true;
+    }
+    if let Some(value) = common_obj.remove("token") {
+        if !web_api_obj.contains_key("root_token") {
+            web_api_obj.insert("root_token".to_string(), value);
+        }
+        changed = true;
+    }
+    if !web_api_obj.is_empty() {
+        if common_obj
+            .get("web_api")
+            .and_then(|value| value.as_object())
+            != Some(&web_api_obj)
+        {
+            common_obj.insert("web_api".to_string(), Value::Object(web_api_obj));
+            changed = true;
+        }
+    }
+
+    for key in [
+        "manage_napcat_internal",
+        "renewcookies_use_napcat",
+        "max_attempts_qzone_autologin",
+        "force_chromium_no_sandbox",
+        "http-serv-port",
+        "max_queue",
+    ] {
+        if common_obj.remove(key).is_some() {
+            changed = true;
+        }
+    }
+
+    changed
+}
+
+fn normalize_tui_group(group_obj: &mut Map<String, Value>) -> bool {
+    let mut changed = false;
+    let before = group_obj.clone();
+    normalize_group_accounts_map(group_obj);
+    if *group_obj != before {
+        changed = true;
+    }
+
+    if !group_obj.contains_key("webview_admins") {
+        if let Some(admins) = group_obj.remove("admins") {
+            group_obj.insert("webview_admins".to_string(), admins);
+            changed = true;
+        }
+    } else if group_obj.contains_key("admins") {
+        group_obj.remove("admins");
+        changed = true;
+    }
+
+    changed
+}
+
+fn write_tui_normalized_config(path: &PathBuf, root: &Value) -> Result<(), String> {
+    let mut output =
+        serde_json::to_string_pretty(root).map_err(|err| format!("序列化迁移配置失败: {err}"))?;
+    output.push('\n');
+    fs::write(path, output).map_err(|err| format!("写入迁移后的配置失败: {err}"))
+}
+
+fn default_group_config_template() -> Map<String, Value> {
+    let mut map = Map::new();
+    map.insert("mangroupid".to_string(), Value::String(String::new()));
+    map.insert("accounts".to_string(), Value::Array(Vec::new()));
+    map.insert("webview_admins".to_string(), Value::Array(Vec::new()));
+    map.insert("max_post_stack".to_string(), Value::String("1".to_string()));
+    map.insert(
+        "max_image_number_one_post".to_string(),
+        Value::String("18".to_string()),
+    );
+    map.insert(
+        "friend_add_message".to_string(),
+        Value::String(String::new()),
+    );
+    map.insert("individual_image_in_posts".to_string(), Value::Bool(true));
+    map.insert("watermark_text".to_string(), Value::String(String::new()));
+    map.insert("quick_replies".to_string(), Value::Object(Map::new()));
+    map.insert("send_schedule".to_string(), Value::Array(Vec::new()));
+    map
+}
+
 fn resolve_value<'a>(map: &'a Map<String, Value>, spec: &FieldSpec) -> Option<&'a Value> {
-    if let Some(value) = map.get(spec.key) {
+    if let Some(value) = get_path_value(map, spec.key) {
         return Some(value);
     }
     for alias in spec.aliases {
-        if let Some(value) = map.get(*alias) {
+        if let Some(value) = get_path_value(map, alias) {
             return Some(value);
         }
     }
@@ -2421,8 +2629,92 @@ fn resolve_value<'a>(map: &'a Map<String, Value>, spec: &FieldSpec) -> Option<&'
 
 fn clear_aliases(map: &mut Map<String, Value>, spec: &FieldSpec) {
     for alias in spec.aliases {
-        map.remove(*alias);
+        remove_path_value(map, alias);
     }
+}
+
+fn get_path_value<'a>(map: &'a Map<String, Value>, path: &str) -> Option<&'a Value> {
+    if !path.contains('.') {
+        return map.get(path);
+    }
+    let mut parts = path.split('.');
+    let first = parts.next()?;
+    let mut current = map.get(first)?;
+    for part in parts {
+        current = match current {
+            Value::Object(obj) => obj.get(part)?,
+            _ => return None,
+        };
+    }
+    Some(current)
+}
+
+fn set_path_value(map: &mut Map<String, Value>, path: &str, value: Value) {
+    if !path.contains('.') {
+        map.insert(path.to_string(), value);
+        return;
+    }
+
+    let mut parts: Vec<&str> = path.split('.').collect();
+    if parts.is_empty() {
+        return;
+    }
+    let leaf = parts.pop().unwrap_or_default();
+    if leaf.is_empty() {
+        return;
+    }
+
+    let mut current = map;
+    for part in parts {
+        if part.is_empty() {
+            return;
+        }
+        let entry = current
+            .entry(part.to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !entry.is_object() {
+            *entry = Value::Object(Map::new());
+        }
+        let Value::Object(obj) = entry else {
+            return;
+        };
+        current = obj;
+    }
+    current.insert(leaf.to_string(), value);
+}
+
+fn remove_path_value(map: &mut Map<String, Value>, path: &str) -> bool {
+    if !path.contains('.') {
+        return map.remove(path).is_some();
+    }
+
+    let mut parts: Vec<&str> = path.split('.').collect();
+    if parts.is_empty() {
+        return false;
+    }
+    let leaf = parts.pop().unwrap_or_default();
+    if leaf.is_empty() {
+        return false;
+    }
+
+    remove_nested_path(map, &parts, leaf)
+}
+
+fn remove_nested_path(map: &mut Map<String, Value>, parts: &[&str], leaf: &str) -> bool {
+    if parts.is_empty() {
+        return map.remove(leaf).is_some();
+    }
+    let (removed, should_prune) = {
+        let Some(Value::Object(child)) = map.get_mut(parts[0]) else {
+            return false;
+        };
+        let removed = remove_nested_path(child, &parts[1..], leaf);
+        (removed, removed && child.is_empty())
+    };
+    if should_prune {
+        map.remove(parts[0]);
+    }
+    removed
 }
 
 fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
@@ -2449,7 +2741,7 @@ fn list_click_index(rect: Rect, y: u16, offset: usize, len: usize) -> Option<usi
 fn map_from_value(value: Option<&Value>) -> (Map<String, Value>, Option<String>) {
     match value {
         Some(Value::Object(map)) => (map.clone(), None),
-        Some(_) => (Map::new(), Some("expected object".to_string())),
+        Some(_) => (Map::new(), Some("应为对象类型".to_string())),
         None => (Map::new(), None),
     }
 }
@@ -2460,7 +2752,7 @@ fn summarize_messages(items: &[String], max: usize, label: &str) -> String {
         out.push_str(first);
     }
     if items.len() > max {
-        out.push_str(&format!(" (and {} more {label})", items.len() - max));
+        out.push_str(&format!("（另有 {} {label}）", items.len() - max));
     }
     out
 }
@@ -2500,13 +2792,91 @@ fn parse_input_value(input: &str) -> Value {
     Value::String(input.to_string())
 }
 
+fn field_summary_text(spec: FieldSpec) -> &'static str {
+    match spec.key {
+        "web_api.enabled" => "启用 HTTP 审核 API",
+        "web_api.port" => "HTTP API 监听端口",
+        "web_api.root_token" => "HTTP API 根令牌",
+        "webview.enabled" => "启用 WebView 前端",
+        "webview.host" => "WebView 监听地址",
+        "webview.port" => "WebView 监听端口",
+        "webview.session_ttl_sec" => "WebView 会话有效期",
+        "webview_global_admins" => "全局 WebView 管理员",
+        "webview_admins" => "本组 WebView 管理员",
+        "http-serv-port" => "旧版 HTTP 端口（兼容）",
+        "process_waittime_sec" => "处理等待时长（秒）",
+        "min_interval_ms" => "最小发送间隔（毫秒）",
+        "max_post_stack" => "暂存堆栈上限",
+        "max_image_number_one_post" => "单条最大图片数",
+        "send_timeout_ms" => "发送超时（毫秒）",
+        "send_max_attempts" => "发送重试次数",
+        "tz_offset_minutes" => "时区偏移（分钟）",
+        "max_cache_mb" => "内存图片缓存（MB）",
+        "napcat_base_url" => "NapCat 反向 WS 地址",
+        "napcat_access_token" => "NapCat 访问令牌",
+        "manage_napcat_internal" => "内部管理 NapCat",
+        "renewcookies_use_napcat" => "NapCat 续 Cookie",
+        "max_attempts_qzone_autologin" => "QZone 自动登录重试",
+        "force_chromium_no_sandbox" => "Chromium 关闭沙箱",
+        "at_unprived_sender" => "私密空间时 @ 投稿人",
+        "friend_request_window_sec" => "好友请求窗口（秒）",
+        "friend_add_message" => "好友通过自动私信",
+        "mangroupid" => "审核群号",
+        "accounts" => "账号列表（首项主号）",
+        "send_schedule" => "定时发送时间（HH:MM）",
+        "individual_image_in_posts" => "发件时同时发原图",
+        "watermark_text" => "渲染水印文本",
+        "quick_replies" => "快捷回复映射",
+        _ => spec.hint,
+    }
+}
+
+fn field_detail_text(spec: FieldSpec) -> String {
+    match spec.key {
+        "web_api.enabled" => "是否启用根令牌 API。仅当你需要脚本/外部系统远程审核时开启。".to_string(),
+        "web_api.port" => "Web API 监听端口。建议与 WebView 端口不同，默认 10923。".to_string(),
+        "web_api.root_token" => "Web API 认证令牌。建议使用 32 位以上随机串，可通过 OQQWALL_API_TOKEN 覆盖。".to_string(),
+        "webview.enabled" => "是否启用内置 Web 审核前端。开启后需要至少配置一个 webview 管理员账号。".to_string(),
+        "webview.host" => "WebView 绑定地址。127.0.0.1 仅本机可访问，0.0.0.0 允许局域网/外网访问（需自行做好安全控制）。".to_string(),
+        "webview.port" => "WebView 监听端口，默认 10924。避免与其他服务冲突。".to_string(),
+        "webview.session_ttl_sec" => "登录会话有效期（秒）。太短会频繁掉线，太长会增加会话泄露风险。".to_string(),
+        "webview_global_admins" => "全局管理员可访问所有组。建议使用 sha256: 前缀密码哈希，避免明文口令。".to_string(),
+        "webview_admins" => "组管理员仅可操作当前组。支持 [{\"username\":\"u\",\"password\":\"sha256:...\"}]。".to_string(),
+        "accounts" => "账号列表，首项为主账号。系统会按顺序选可用账号发送。".to_string(),
+        "mangroupid" => "审核群号（数字）。审核指令通常只在该群内生效。".to_string(),
+        "send_schedule" => "每天定时触发发送，格式 HH:MM，例如 [\"08:30\",\"22:10\"]。".to_string(),
+        "quick_replies" => "快捷回复映射（指令 -> 文本）。避免与审核指令（是/否/删等）重名。".to_string(),
+        "individual_image_in_posts" => "开启后发送时会附带原图；关闭则更偏向仅发送渲染结果。".to_string(),
+        "napcat_base_url" => "NapCat 反向 WS 基础地址，支持组覆盖。示例：0.0.0.0:3001/oqqwall/ws".to_string(),
+        "napcat_access_token" => "NapCat access_token。建议使用环境变量 OQQWALL_NAPCAT_TOKEN 统一覆盖。".to_string(),
+        "process_waittime_sec" => "聚合等待窗口（秒）。越大越可能合并更多内容，但发送延迟更高。".to_string(),
+        "min_interval_ms" => "最小发送间隔（毫秒），用于限速防刷。".to_string(),
+        "send_timeout_ms" => "发送超时时间（毫秒）。网络慢时可适度调大。".to_string(),
+        "send_max_attempts" => "单次发送失败后的最大重试次数。".to_string(),
+        "max_post_stack" => "暂存区上限。达到上限时通常会触发刷新/发送策略。".to_string(),
+        "max_image_number_one_post" => "单条内容允许的最大图片数，超限可能拆分发送。".to_string(),
+        "friend_add_message" => "通过好友后自动发送的提示语。留空则不主动发送。".to_string(),
+        "friend_request_window_sec" => "好友请求窗口（秒），用于限频/防重复处理。".to_string(),
+        "tz_offset_minutes" => "时区偏移（分钟）。中国大陆通常为 480。".to_string(),
+        "max_cache_mb" => "内存图片缓存上限（MB）。过小会频繁回源，过大会占用更多内存。".to_string(),
+        _ => match spec.kind {
+            FieldKind::Bool { .. } => "布尔配置：可填 true/false，或用空格键快速切换。".to_string(),
+            FieldKind::Text => "文本配置：支持直接输入字符串；留空后保存会清除该键。".to_string(),
+            FieldKind::StringList => "字符串列表：按 Enter 进入列表编辑器维护多项。".to_string(),
+            FieldKind::PairList { .. } => "成对列表：左列/右列一一对应。".to_string(),
+            FieldKind::MapList => "映射列表：按 Enter 进入列表编辑器维护 key/value。".to_string(),
+            FieldKind::AdminList => "管理员列表：每项包含用户名和密码（建议 sha256: 哈希）。".to_string(),
+        },
+    }
+}
+
 fn value_display(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
         Value::Number(n) => n.to_string(),
         Value::Bool(b) => b.to_string(),
-        Value::Null => "<unset>".to_string(),
-        _ => serde_json::to_string(value).unwrap_or_else(|_| "<unset>".to_string()),
+        Value::Null => "<未设置>".to_string(),
+        _ => serde_json::to_string(value).unwrap_or_else(|_| "<未设置>".to_string()),
     }
 }
 
@@ -2575,6 +2945,30 @@ fn extract_map_list(value: Option<&Value>) -> Vec<(String, String)> {
         .collect();
     items.sort_by(|a, b| a.0.cmp(&b.0));
     items
+}
+
+fn quick_reply_conflicts_with_review_command(key: &str) -> bool {
+    matches!(
+        key,
+        "是" | "否"
+            | "等"
+            | "删"
+            | "拒"
+            | "立即"
+            | "刷新"
+            | "重渲染"
+            | "消息全选"
+            | "匿"
+            | "扩列审查"
+            | "扩列"
+            | "查"
+            | "查成分"
+            | "展示"
+            | "评论"
+            | "回复"
+            | "合并"
+            | "拉黑"
+    )
 }
 
 fn extract_admin_list(value: Option<&Value>) -> Vec<(String, String)> {

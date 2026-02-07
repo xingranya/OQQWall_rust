@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use oqqwall_rust_core::{CoreConfig, GroupConfig};
 use oqqwall_rust_drivers::napcat::NapCatConfig;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 #[cfg(debug_assertions)]
 macro_rules! debug_log {
@@ -27,6 +28,23 @@ pub struct AppGroupConfig {
     pub napcat: NapCatConfig,
     pub friend_request_window_sec: u32,
     pub friend_add_message: Option<String>,
+    pub individual_image_in_posts: bool,
+    pub watermark_text: Option<String>,
+    pub quick_replies: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebviewRole {
+    GlobalAdmin,
+    GroupAdmin,
+}
+
+#[derive(Debug, Clone)]
+pub struct WebviewAdminAccount {
+    pub username: String,
+    pub password_hash: String,
+    pub role: WebviewRole,
+    pub groups: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +57,11 @@ pub struct AppConfig {
     pub web_api_enabled: bool,
     pub web_api_port: u16,
     pub web_api_root_token: Option<String>,
+    pub webview_enabled: bool,
+    pub webview_host: String,
+    pub webview_port: u16,
+    pub webview_session_ttl_sec: i64,
+    pub webview_admins: Vec<WebviewAdminAccount>,
     core_config: CoreConfig,
     #[cfg(debug_assertions)]
     pub dev_config: DevConfig,
@@ -70,6 +93,9 @@ impl AppConfig {
     }
 
     fn from_value(root: &Value) -> Result<Self, String> {
+        let root_obj = root
+            .as_object()
+            .ok_or_else(|| "config must be a json object".to_string())?;
         let (common, groups) = split_config(root)?;
         let default_process_waittime_ms = env::var("OQQWALL_PROCESS_WAITTIME_MS")
             .ok()
@@ -90,30 +116,54 @@ impl AppConfig {
         let default_friend_request_window_sec =
             parse_u32(common.get("friend_request_window_sec")).unwrap_or(300);
         let default_friend_add_message = parse_string(common.get("friend_add_message"));
-        let web_api_enabled = parse_bool(common.get("use_web_review")).unwrap_or(false);
-        let web_api_port = parse_u32(common.get("web_review_port"))
+        let common_web_api = common.get("web_api").and_then(|value| value.as_object());
+        let common_webview = common.get("webview").and_then(|value| value.as_object());
+        let web_api_enabled = common_web_api
+            .and_then(|obj| parse_bool(obj.get("enabled")))
+            .unwrap_or(false);
+        let web_api_port = common_web_api
+            .and_then(|obj| parse_u32(obj.get("port")))
             .and_then(|value| u16::try_from(value).ok())
             .unwrap_or(10923);
         let web_api_root_token = env_override(
             "OQQWALL_API_TOKEN",
-            parse_string(common.get("api_token"))
-                .or_else(|| parse_string(common.get("token"))),
+            common_web_api
+                .and_then(|obj| parse_string(obj.get("root_token")))
+                .or_else(|| parse_string(common.get("root_token"))),
         )
         .and_then(|value| nonempty(Some(value)));
+        let webview_enabled = common_webview
+            .and_then(|obj| parse_bool(obj.get("enabled")))
+            .unwrap_or(false);
+        let webview_host = nonempty(common_webview.and_then(|obj| parse_string(obj.get("host"))))
+            .unwrap_or_else(|| "0.0.0.0".to_string());
+        let webview_port = common_webview
+            .and_then(|obj| parse_u32(obj.get("port")))
+            .and_then(|value| u16::try_from(value).ok())
+            .unwrap_or(10924);
+        let webview_session_ttl_sec = common_webview
+            .and_then(|obj| parse_i64(obj.get("session_ttl_sec")))
+            .unwrap_or(12 * 60 * 60)
+            .clamp(300, 7 * 24 * 60 * 60);
         debug_log!(
-            "config parsed: tz_offset_minutes={} default_process_waittime_ms={} max_cache_mb={} at_unprived_sender={} web_api_enabled={} web_api_port={} web_api_token_present={}",
+            "config parsed: tz_offset_minutes={} default_process_waittime_ms={} max_cache_mb={} at_unprived_sender={} web_api_enabled={} web_api_port={} web_api_token_present={} webview_enabled={} webview_host={} webview_port={} webview_admins={}",
             tz_offset_minutes,
             default_process_waittime_ms,
             max_cache_mb,
             at_unprived_sender,
             web_api_enabled,
             web_api_port,
-            web_api_root_token.is_some()
+            web_api_root_token.is_some(),
+            webview_enabled,
+            webview_host,
+            webview_port,
+            parse_admin_entries(root_obj.get("webview_global_admins")).len()
         );
         let core_config = build_core_config(&common, &groups, default_process_waittime_ms);
         let fallback_napcat = parse_napcat_config_optional(&common);
 
         let mut group_configs = Vec::new();
+        let mut grouped_admins: HashMap<String, (String, Vec<String>)> = HashMap::new();
         for (group_id, group_value) in &groups {
             let audit_group_id = parse_string(group_value.get("mangroupid"))
                 .ok_or_else(|| format!("group {}: missing required field mangroupid", group_id))?;
@@ -136,6 +186,11 @@ impl AppConfig {
                 .unwrap_or(default_friend_request_window_sec);
             let friend_add_message = parse_string(group_value.get("friend_add_message"))
                 .or_else(|| default_friend_add_message.clone());
+            let individual_image_in_posts =
+                parse_bool(group_value.get("individual_image_in_posts")).unwrap_or(true);
+            let watermark_text = nonempty(parse_string(group_value.get("watermark_text")));
+            let quick_replies = parse_quick_replies(group_value.get("quick_replies"))
+                .map_err(|err| format!("group {}: {}", group_id, err))?;
             let _napcat_ws_log = base_url_for_log(&napcat.base_url);
             debug_log!(
                 "config group: group_id={} audit_group_id={:?} napcat_base_url={} napcat_token_present={}",
@@ -150,7 +205,25 @@ impl AppConfig {
                 napcat,
                 friend_request_window_sec,
                 friend_add_message,
+                individual_image_in_posts,
+                watermark_text,
+                quick_replies,
             });
+            for admin in parse_admin_entries(group_value.get("webview_admins")) {
+                let username = admin.username.trim().to_string();
+                if username.is_empty() {
+                    continue;
+                }
+                let password_hash = normalize_password_hash(&admin.password);
+                grouped_admins
+                    .entry(username)
+                    .and_modify(|(existing_hash, group_ids)| {
+                        if *existing_hash == password_hash && !group_ids.contains(group_id) {
+                            group_ids.push(group_id.clone());
+                        }
+                    })
+                    .or_insert_with(|| (password_hash, vec![group_id.clone()]));
+            }
         }
         if group_configs.is_empty() {
             let Some(napcat) = fallback_napcat.clone() else {
@@ -162,10 +235,36 @@ impl AppConfig {
                 napcat,
                 friend_request_window_sec: default_friend_request_window_sec,
                 friend_add_message: default_friend_add_message,
+                individual_image_in_posts: true,
+                watermark_text: None,
+                quick_replies: HashMap::new(),
             });
         }
         #[cfg(debug_assertions)]
         let dev_config = load_dev_config()?;
+        let mut webview_admins = Vec::new();
+        for admin in parse_admin_entries(root_obj.get("webview_global_admins")) {
+            let username = admin.username.trim().to_string();
+            if username.is_empty() {
+                continue;
+            }
+            webview_admins.push(WebviewAdminAccount {
+                username,
+                password_hash: normalize_password_hash(&admin.password),
+                role: WebviewRole::GlobalAdmin,
+                groups: Vec::new(),
+            });
+        }
+        for (username, (password_hash, mut group_ids)) in grouped_admins {
+            group_ids.sort();
+            group_ids.dedup();
+            webview_admins.push(WebviewAdminAccount {
+                username,
+                password_hash,
+                role: WebviewRole::GroupAdmin,
+                groups: group_ids,
+            });
+        }
         Ok(Self {
             groups: group_configs,
             tz_offset_minutes,
@@ -175,6 +274,11 @@ impl AppConfig {
             web_api_enabled,
             web_api_port,
             web_api_root_token,
+            webview_enabled,
+            webview_host,
+            webview_port,
+            webview_session_ttl_sec,
+            webview_admins,
             core_config,
             #[cfg(debug_assertions)]
             dev_config,
@@ -287,7 +391,7 @@ fn build_core_config(
     let mut core = CoreConfig::default();
     core.default_process_waittime_ms = default_process_waittime_ms;
     core.default_min_interval_ms = parse_duration_ms(common.get("min_interval_ms")).unwrap_or(0);
-    core.default_max_queue = parse_usize(common.get("max_queue")).unwrap_or(0);
+    core.default_max_queue = 1;
     core.default_max_images_per_post =
         parse_usize(common.get("max_image_number_one_post")).unwrap_or(30);
     core.default_send_timeout_ms =
@@ -341,20 +445,7 @@ fn build_core_config(
 }
 
 fn parse_accounts(value: &Value) -> Vec<String> {
-    let mut accounts = parse_string_list(value.get("accounts"));
-    if accounts.is_empty() {
-        accounts = parse_string_list(value.get("acount"));
-    }
-    if !accounts.is_empty() {
-        return normalize_account_ids(accounts);
-    }
-
-    let mut out = Vec::new();
-    if let Some(main) = parse_string(value.get("mainqqid")) {
-        out.push(main);
-    }
-    out.extend(parse_string_list(value.get("minorqqid")));
-    normalize_account_ids(out)
+    normalize_account_ids(parse_string_list(value.get("accounts")))
 }
 
 fn normalize_account_ids(ids: Vec<String>) -> Vec<String> {
@@ -377,6 +468,20 @@ fn normalize_config_in_place(root: &mut Value) -> Result<bool, String> {
         .as_object_mut()
         .ok_or_else(|| "config must be a json object".to_string())?;
     let mut changed = false;
+    if let Some(common_obj) = obj
+        .get_mut("common")
+        .and_then(|value| value.as_object_mut())
+    {
+        if normalize_common_web(common_obj) {
+            changed = true;
+        }
+        if normalize_common_unsupported(common_obj) {
+            changed = true;
+        }
+    }
+    if normalize_global_admins(obj) {
+        changed = true;
+    }
     if let Some(groups) = obj
         .get_mut("groups")
         .and_then(|value| value.as_object_mut())
@@ -386,6 +491,12 @@ fn normalize_config_in_place(root: &mut Value) -> Result<bool, String> {
                 continue;
             };
             if normalize_group_accounts(group_obj) {
+                changed = true;
+            }
+            if normalize_group_webview_admins(group_obj) {
+                changed = true;
+            }
+            if normalize_group_unsupported(group_obj) {
                 changed = true;
             }
         }
@@ -402,8 +513,132 @@ fn normalize_config_in_place(root: &mut Value) -> Result<bool, String> {
         if normalize_group_accounts(group_obj) {
             changed = true;
         }
+        if normalize_group_webview_admins(group_obj) {
+            changed = true;
+        }
+        if normalize_group_unsupported(group_obj) {
+            changed = true;
+        }
     }
     Ok(changed)
+}
+
+fn normalize_common_web(common_obj: &mut Map<String, Value>) -> bool {
+    let mut changed = false;
+    let mut web_api_obj = common_obj
+        .get("web_api")
+        .and_then(|value| value.as_object())
+        .cloned()
+        .unwrap_or_default();
+    if let Some(value) = common_obj.remove("use_web_review") {
+        if !web_api_obj.contains_key("enabled") {
+            web_api_obj.insert("enabled".to_string(), value);
+        }
+        changed = true;
+    }
+    if let Some(value) = common_obj.remove("web_review_port") {
+        if !web_api_obj.contains_key("port") {
+            web_api_obj.insert("port".to_string(), value);
+        }
+        changed = true;
+    }
+    if let Some(value) = common_obj.remove("api_token") {
+        if !web_api_obj.contains_key("root_token") {
+            web_api_obj.insert("root_token".to_string(), value);
+        }
+        changed = true;
+    }
+    if let Some(value) = common_obj.remove("token") {
+        if !web_api_obj.contains_key("root_token") {
+            web_api_obj.insert("root_token".to_string(), value);
+        }
+        changed = true;
+    }
+    if !web_api_obj.is_empty() {
+        if common_obj
+            .get("web_api")
+            .and_then(|value| value.as_object())
+            != Some(&web_api_obj)
+        {
+            common_obj.insert("web_api".to_string(), Value::Object(web_api_obj));
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn normalize_common_unsupported(common_obj: &mut Map<String, Value>) -> bool {
+    let mut changed = false;
+    for key in [
+        "manage_napcat_internal",
+        "renewcookies_use_napcat",
+        "max_attempts_qzone_autologin",
+        "force_chromium_no_sandbox",
+        "http-serv-port",
+        "max_queue",
+    ] {
+        if common_obj.remove(key).is_some() {
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn normalize_group_webview_admins(group_obj: &mut Map<String, Value>) -> bool {
+    let mut changed = false;
+    if !group_obj.contains_key("webview_admins") {
+        if let Some(admins) = group_obj.remove("admins") {
+            group_obj.insert("webview_admins".to_string(), admins);
+            changed = true;
+        }
+    } else if group_obj.contains_key("admins") {
+        group_obj.remove("admins");
+        changed = true;
+    }
+    let Some(raw_admins) = group_obj.get("webview_admins").cloned() else {
+        return changed;
+    };
+    let normalized = normalize_admin_value(&raw_admins, false);
+    if normalized != raw_admins {
+        group_obj.insert("webview_admins".to_string(), normalized);
+        changed = true;
+    }
+    changed
+}
+
+fn normalize_global_admins(root_obj: &mut Map<String, Value>) -> bool {
+    let Some(raw_admins) = root_obj.get("webview_global_admins").cloned() else {
+        return false;
+    };
+    let normalized = normalize_admin_value(&raw_admins, true);
+    if normalized == raw_admins {
+        return false;
+    }
+    root_obj.insert("webview_global_admins".to_string(), normalized);
+    true
+}
+
+fn normalize_admin_value(value: &Value, default_global_role: bool) -> Value {
+    let entries = parse_admin_entries(Some(value))
+        .into_iter()
+        .map(|entry| {
+            let role = if entry.role.trim().is_empty() {
+                if default_global_role {
+                    "global_admin".to_string()
+                } else {
+                    "group_admin".to_string()
+                }
+            } else {
+                entry.role
+            };
+            serde_json::json!({
+                "username": entry.username,
+                "password": normalize_password_hash(&entry.password),
+                "role": role
+            })
+        })
+        .collect::<Vec<_>>();
+    Value::Array(entries)
 }
 
 fn normalize_group_accounts(group_obj: &mut Map<String, Value>) -> bool {
@@ -454,6 +689,11 @@ fn normalize_group_accounts(group_obj: &mut Map<String, Value>) -> bool {
     }
 
     changed
+}
+
+fn normalize_group_unsupported(group_obj: &mut Map<String, Value>) -> bool {
+    let _ = group_obj;
+    false
 }
 
 fn write_normalized_config(path: &str, root: &Value) -> Result<(), String> {
@@ -511,6 +751,111 @@ fn parse_string_list(value: Option<&Value>) -> Vec<String> {
         Value::Number(n) => vec![n.to_string()],
         _ => Vec::new(),
     }
+}
+
+fn parse_quick_replies(value: Option<&Value>) -> Result<HashMap<String, String>, String> {
+    let Some(value) = value else {
+        return Ok(HashMap::new());
+    };
+    let Value::Object(map) = value else {
+        return Err("quick_replies must be an object".to_string());
+    };
+    let mut out = HashMap::new();
+    for (raw_key, raw_value) in map {
+        let key = raw_key.trim();
+        if key.is_empty() {
+            return Err("quick_replies contains empty key".to_string());
+        }
+        if quick_reply_conflicts_with_review_command(key) {
+            return Err(format!(
+                "quick_replies key '{}' conflicts with review command",
+                key
+            ));
+        }
+        let Some(value_text) = parse_string(Some(raw_value)) else {
+            return Err(format!(
+                "quick_replies['{}'] must be string",
+                raw_key.replace('\'', "\\'")
+            ));
+        };
+        let value_text = value_text.trim();
+        if value_text.is_empty() {
+            return Err(format!(
+                "quick_replies['{}'] must not be empty",
+                raw_key.replace('\'', "\\'")
+            ));
+        }
+        out.insert(key.to_string(), value_text.to_string());
+    }
+    Ok(out)
+}
+
+fn quick_reply_conflicts_with_review_command(key: &str) -> bool {
+    matches!(
+        key,
+        "是" | "否"
+            | "等"
+            | "删"
+            | "拒"
+            | "立即"
+            | "刷新"
+            | "重渲染"
+            | "消息全选"
+            | "匿"
+            | "扩列审查"
+            | "扩列"
+            | "查"
+            | "查成分"
+            | "展示"
+            | "评论"
+            | "回复"
+            | "合并"
+            | "拉黑"
+    )
+}
+
+#[derive(Debug, Clone)]
+struct RawAdminEntry {
+    username: String,
+    password: String,
+    role: String,
+}
+
+fn parse_admin_entries(value: Option<&Value>) -> Vec<RawAdminEntry> {
+    let Some(Value::Array(items)) = value else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let obj = item.as_object()?;
+            let username = parse_string(obj.get("username"))?;
+            let password = parse_string(obj.get("password"))?;
+            let role = parse_string(obj.get("role")).unwrap_or_default();
+            Some(RawAdminEntry {
+                username,
+                password,
+                role,
+            })
+        })
+        .collect()
+}
+
+fn normalize_password_hash(password: &str) -> String {
+    let trimmed = password.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Some(existing) = trimmed.strip_prefix("sha256:") {
+        let normalized = existing.trim().to_ascii_lowercase();
+        if normalized.len() == 64 && normalized.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return format!("sha256:{}", normalized);
+        }
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(trimmed.as_bytes());
+    let digest = hasher.finalize();
+    format!("sha256:{:x}", digest)
 }
 
 fn parse_schedule_minutes(value: Option<&Value>) -> Vec<u16> {
@@ -668,5 +1013,28 @@ mod tests {
             group.get("accounts"),
             Some(&json!(["12345", "12346", "12347"]))
         );
+    }
+
+    #[test]
+    fn parse_quick_replies_accepts_valid_object() {
+        let value = json!({
+            "格式错误": "请按模板重新发送",
+            "补充信息": "请补充时间地点"
+        });
+        let parsed = parse_quick_replies(Some(&value)).expect("quick replies");
+        assert_eq!(
+            parsed.get("格式错误"),
+            Some(&"请按模板重新发送".to_string())
+        );
+        assert_eq!(parsed.get("补充信息"), Some(&"请补充时间地点".to_string()));
+    }
+
+    #[test]
+    fn parse_quick_replies_rejects_conflicting_command() {
+        let value = json!({
+            "是": "冲突指令"
+        });
+        let err = parse_quick_replies(Some(&value)).expect_err("should fail");
+        assert!(err.contains("conflicts"));
     }
 }

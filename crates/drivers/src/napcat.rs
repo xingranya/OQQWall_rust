@@ -65,6 +65,7 @@ pub struct NapCatRuntimeConfig {
     pub friend_request_window_sec: u32,
     pub friend_add_message: Option<String>,
     pub max_queue: usize,
+    pub quick_replies: Arc<std::sync::Mutex<HashMap<String, String>>>,
 }
 
 const MAX_FORWARD_DEPTH: u32 = 4;
@@ -1237,6 +1238,53 @@ async fn build_action_from_event(
             });
             Some(payload.to_string())
         }
+        Event::Review(ReviewEvent::ReviewQuickReplyRequested { review_id, key }) => {
+            let key = key.trim();
+            if key.is_empty() {
+                return None;
+            }
+            let submitter = {
+                let guard = state.lock().await;
+                resolve_review_submitter(&guard, review_id)
+            };
+            let Some((group_id, user_id)) = submitter else {
+                debug_log!("napcat quick reply skipped: missing submitter info");
+                return None;
+            };
+            if !group_id.is_empty() && group_id != runtime.group_id {
+                return None;
+            }
+            let reply_text = {
+                let guard = runtime
+                    .quick_replies
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner());
+                guard.get(key).cloned()
+            };
+            let Some(reply_text) = reply_text else {
+                let audit_group = runtime
+                    .audit_group_id
+                    .as_deref()
+                    .unwrap_or(runtime.group_id.as_str());
+                let msg = format!("快捷回复不存在：{}", key);
+                send_group_text(out_tx, audit_group, &msg).await;
+                return None;
+            };
+            let payload = serde_json::json!({
+                "action": "send_private_msg",
+                "params": {
+                    "user_id": json_id(&user_id),
+                    "message": message_segments_from_text(&reply_text)
+                }
+            });
+            let audit_group = runtime
+                .audit_group_id
+                .as_deref()
+                .unwrap_or(runtime.group_id.as_str());
+            let ack = format!("已发送快捷回复：{}", key);
+            send_group_text(out_tx, audit_group, &ack).await;
+            Some(payload.to_string())
+        }
         Event::Review(ReviewEvent::ReviewBlacklistRequested { review_id, reason }) => {
             let mut guard = state.lock().await;
             let Some((group_id, sender_id)) = resolve_review_submitter(&guard, review_id) else {
@@ -1951,6 +1999,111 @@ async fn parse_inbound_event(
                         now_ms: timestamp_ms,
                         tz_offset_minutes: runtime.tz_offset_minutes,
                     }));
+                }
+                AuditCommand::Global(GlobalAction::QuickReplyList) => {
+                    send_group_text(out_tx, &chat_group_id, "已收到指令").await;
+                    let list_text = build_quick_reply_list_text(runtime);
+                    send_group_text(out_tx, &chat_group_id, &list_text).await;
+                    return None;
+                }
+                AuditCommand::Global(GlobalAction::QuickReplyAdd { key, text }) => {
+                    send_group_text(out_tx, &chat_group_id, "已收到指令").await;
+                    let key = key.trim().to_string();
+                    let text = text.trim().to_string();
+                    if key.is_empty() || text.is_empty() {
+                        send_group_text(out_tx, &chat_group_id, "错误：快捷回复键和值均不能为空")
+                            .await;
+                        return None;
+                    }
+                    if quick_reply_key_conflicts(&key) {
+                        send_group_text(
+                            out_tx,
+                            &chat_group_id,
+                            "错误：快捷回复指令与审核指令冲突，请更换指令名",
+                        )
+                        .await;
+                        return None;
+                    }
+                    let mut snapshot = {
+                        let mut guard = runtime
+                            .quick_replies
+                            .lock()
+                            .unwrap_or_else(|err| err.into_inner());
+                        guard.insert(key.clone(), text.clone());
+                        guard.clone()
+                    };
+                    sort_quick_reply_map(&mut snapshot);
+                    match persist_group_quick_replies(&runtime.group_id, &snapshot) {
+                        Ok(()) => {
+                            let msg = format!("已添加快捷回复：{}", key);
+                            send_group_text(out_tx, &chat_group_id, &msg).await;
+                        }
+                        Err(err) => {
+                            {
+                                let mut guard = runtime
+                                    .quick_replies
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                guard.remove(&key);
+                            }
+                            let msg = format!("添加快捷回复失败：{}", err);
+                            send_group_text(out_tx, &chat_group_id, &msg).await;
+                        }
+                    }
+                    return None;
+                }
+                AuditCommand::Global(GlobalAction::QuickReplyDelete { key }) => {
+                    send_group_text(out_tx, &chat_group_id, "已收到指令").await;
+                    let key = key.trim().to_string();
+                    if key.is_empty() {
+                        send_group_text(out_tx, &chat_group_id, "错误：请提供要删除的快捷回复")
+                            .await;
+                        return None;
+                    }
+                    let removed_snapshot = {
+                        let mut guard = runtime
+                            .quick_replies
+                            .lock()
+                            .unwrap_or_else(|err| err.into_inner());
+                        let removed = guard.remove(&key);
+                        (removed, guard.clone())
+                    };
+                    if removed_snapshot.0.is_none() {
+                        let msg = format!("快捷回复不存在：{}", key);
+                        send_group_text(out_tx, &chat_group_id, &msg).await;
+                        return None;
+                    }
+                    let mut sorted = removed_snapshot.1;
+                    sort_quick_reply_map(&mut sorted);
+                    match persist_group_quick_replies(&runtime.group_id, &sorted) {
+                        Ok(()) => {
+                            let msg = format!("已删除快捷回复：{}", key);
+                            send_group_text(out_tx, &chat_group_id, &msg).await;
+                        }
+                        Err(err) => {
+                            if let Some(removed_text) = removed_snapshot.0 {
+                                {
+                                    let mut guard = runtime
+                                        .quick_replies
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner());
+                                    guard.insert(key.clone(), removed_text);
+                                }
+                            }
+                            let msg = format!("删除快捷回复失败：{}", err);
+                            send_group_text(out_tx, &chat_group_id, &msg).await;
+                        }
+                    }
+                    return None;
+                }
+                AuditCommand::Global(GlobalAction::SelfCheck) => {
+                    send_group_text(out_tx, &chat_group_id, "已收到指令").await;
+                    let report = {
+                        let guard = state.lock().await;
+                        build_selfcheck_report(runtime, &guard)
+                    };
+                    send_group_text(out_tx, &chat_group_id, &report).await;
+                    return None;
                 }
                 AuditCommand::Global(action) => {
                     if let GlobalAction::Recall { review_code } = &action {
@@ -3224,6 +3377,169 @@ fn build_blacklist_list_text(state: &NapCatState, group_id: &str) -> String {
     lines.join("\n")
 }
 
+fn build_quick_reply_list_text(runtime: &NapCatRuntimeConfig) -> String {
+    let guard = runtime
+        .quick_replies
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if guard.is_empty() {
+        return "当前账号组未配置快捷回复".to_string();
+    }
+    let mut items = guard
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect::<Vec<_>>();
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut lines = vec![format!("快捷回复列表（{}）:", items.len())];
+    for (key, value) in items {
+        lines.push(format!("{} = {}", key, value));
+    }
+    lines.join("\n")
+}
+
+fn build_selfcheck_report(runtime: &NapCatRuntimeConfig, state: &NapCatState) -> String {
+    let pending_reviews = state
+        .review_info
+        .iter()
+        .filter(|(review_id, info)| {
+            info.group_id == runtime.group_id && !state.processed_reviews.contains(review_id)
+        })
+        .count();
+    let pending_send = state
+        .send_plans
+        .values()
+        .filter(|plan| plan.group_id == runtime.group_id)
+        .count();
+    let sending = state
+        .sending
+        .values()
+        .filter(|sending| sending.group_id == runtime.group_id)
+        .count();
+    let blacklist = state
+        .blacklist
+        .get(&runtime.group_id)
+        .map(|entries| entries.len())
+        .unwrap_or(0);
+    let quick_replies = runtime
+        .quick_replies
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .len();
+    let accounts_cfg = runtime.accounts.len();
+    let online_accounts = group_accounts()
+        .lock()
+        .map(|m| m.get(&runtime.group_id).map(|list| list.len()).unwrap_or(0))
+        .unwrap_or(0);
+    let ws_base = base_url_for_log(&runtime.napcat.base_url);
+    let ws_token = if runtime.napcat.access_token.is_some() {
+        "已配置"
+    } else {
+        "未配置"
+    };
+    let audit_group = runtime
+        .audit_group_id
+        .clone()
+        .unwrap_or_else(|| "未配置".to_string());
+    let account_ids = if runtime.accounts.is_empty() {
+        "无".to_string()
+    } else {
+        runtime.accounts.join(", ")
+    };
+
+    format!(
+        "系统自检报告\n组: {}\n审核群: {}\nNapCat: {} (token {})\n账号: 配置 {} 个, 在线 {} 个\n账号列表: {}\n待审核: {}\n待发送: {}\n发送中: {}\n黑名单: {}\n快捷回复: {}\n队列策略: max_post_stack={}",
+        runtime.group_id,
+        audit_group,
+        ws_base,
+        ws_token,
+        accounts_cfg,
+        online_accounts,
+        account_ids,
+        pending_reviews,
+        pending_send,
+        sending,
+        blacklist,
+        quick_replies,
+        runtime.max_queue
+    )
+}
+
+fn quick_reply_key_conflicts(key: &str) -> bool {
+    matches!(
+        key,
+        "是" | "否"
+            | "等"
+            | "删"
+            | "拒"
+            | "立即"
+            | "刷新"
+            | "重渲染"
+            | "消息全选"
+            | "匿"
+            | "扩列审查"
+            | "扩列"
+            | "查"
+            | "查成分"
+            | "展示"
+            | "评论"
+            | "回复"
+            | "合并"
+            | "拉黑"
+    )
+}
+
+fn sort_quick_reply_map(map: &mut HashMap<String, String>) {
+    let mut pairs = map
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect::<Vec<_>>();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    map.clear();
+    for (k, v) in pairs {
+        map.insert(k, v);
+    }
+}
+
+fn persist_group_quick_replies(
+    group_id: &str,
+    quick_replies: &HashMap<String, String>,
+) -> Result<(), String> {
+    let config_path = env::var("OQQWALL_CONFIG").unwrap_or_else(|_| "config.json".to_string());
+    let data = fs::read_to_string(&config_path)
+        .map_err(|err| format!("读取配置失败 {}: {}", config_path, err))?;
+    let mut root: Value = serde_json::from_str(&data)
+        .map_err(|err| format!("配置 JSON 解析失败 {}: {}", config_path, err))?;
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| "配置根节点必须是对象".to_string())?;
+    let mut qr_obj = serde_json::Map::new();
+    let mut entries = quick_replies
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect::<Vec<_>>();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    for (k, v) in entries {
+        qr_obj.insert(k, Value::String(v));
+    }
+    if let Some(groups) = obj.get_mut("groups").and_then(|v| v.as_object_mut()) {
+        let group = groups
+            .get_mut(group_id)
+            .and_then(|v| v.as_object_mut())
+            .ok_or_else(|| format!("配置中不存在 groups.{}", group_id))?;
+        group.insert("quick_replies".to_string(), Value::Object(qr_obj));
+    } else {
+        let group = obj
+            .get_mut(group_id)
+            .and_then(|v| v.as_object_mut())
+            .ok_or_else(|| format!("配置中不存在组 {}", group_id))?;
+        group.insert("quick_replies".to_string(), Value::Object(qr_obj));
+    }
+    let mut output =
+        serde_json::to_string_pretty(&root).map_err(|err| format!("配置序列化失败: {}", err))?;
+    output.push('\n');
+    fs::write(&config_path, output).map_err(|err| format!("配置写入失败: {}", err))
+}
+
 fn collect_batch_post_ids_for_notify(
     state: &NapCatState,
     group_id: &str,
@@ -3639,6 +3955,10 @@ fn id128_hex(value: u128) -> String {
     format!("{:032x}", value)
 }
 
+fn base_url_for_log(url: &str) -> &str {
+    url.split('?').next().unwrap_or(url)
+}
+
 const HELP_TEXT: &str = r#"全局指令:
 这些是可以在任何时刻@本账号调用的指令
 语法: @本账号/次要账号 指令
@@ -3667,7 +3987,7 @@ const HELP_TEXT: &str = r#"全局指令:
 清空待处理列表，相当于对列表中的所有项目执行"删"审核指令
 
 删除暂存区:
-清空暂存区内容，并回滚外部编号
+清空暂存区内容（仅清理待发送队列，不回滚外部编号）
 
 发送暂存区:
 将暂存区内容发送到QQ空间
@@ -3692,10 +4012,12 @@ const HELP_TEXT: &str = r#"全局指令:
 快捷回复 添加:
 添加快捷回复指令
 用法：快捷回复 添加 指令名=内容
+说明：会校验不与审核指令冲突，并写回配置文件
 
 快捷回复 删除:
 删除指定快捷回复指令
 用法：快捷回复 删除 指令名
+说明：删除后会写回配置文件
 
 自检:
 系统与服务自检
@@ -3759,7 +4081,8 @@ const HELP_TEXT: &str = r#"全局指令:
 
 快捷回复指令:
 使用预设模板向投稿人发送消息
-用法：<快捷指令名>"#;
+用法：回复审核消息 <快捷指令名>
+或：@本账号 <review_code> <快捷指令名>"#;
 
 fn is_admin_sender(value: &Value) -> bool {
     value
@@ -3872,6 +4195,7 @@ mod tests {
             friend_request_window_sec: 0,
             friend_add_message: None,
             max_queue: 1,
+            quick_replies: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 

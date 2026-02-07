@@ -74,14 +74,17 @@
 | renewcookies_use_napcat      |   bool |              true | 未支持               | 续 cookies 逻辑使用 NapCat 版本/非 NapCat 版本（原版提示）            |
 | max_attempts_qzone_autologin |    u32 |                 3 | 未支持               | sendcontrol 默认 3 次并校验数字                               |
 | friend_request_window_sec    |    u32 |               300 | 已支持               | 好友请求/私聊抑制窗口（原版 TUI 提示）                                |
-| use_web_review               |   bool |             false | 已支持               | 是否启用对外 HTTP 审核 API（复用原版字段名）                                      |
-| web_review_port              |    u16 |             10923 | 已支持               | HTTP API 监听端口（默认 `0.0.0.0:10923`）                                        |
-| api_token                    | string |                "" | 已支持               | API root token（建议 32+ 位；可被环境变量覆盖）                                        |
+| web_api.enabled              |   bool |             false | 已支持               | 是否启用对外 HTTP 审核 API（替代旧 `use_web_review`）                            |
+| web_api.port                 |    u16 |             10923 | 已支持               | HTTP API 监听端口（默认 `0.0.0.0:10923`，替代旧 `web_review_port`）              |
+| web_api.root_token           | string |                "" | 已支持               | API root token（建议 32+ 位；可被环境变量覆盖，替代旧 `api_token`）               |
+| webview.enabled              |   bool |             false | 已支持               | 是否启用内置 WebView 审核前端（账号密码登录）                                     |
+| webview.host                 | string |         `0.0.0.0` | 已支持               | WebView 监听主机（可设为 `127.0.0.1` 仅本机访问）                                |
+| webview.port                 |    u16 |             10924 | 已支持               | WebView 服务监听端口（默认 `0.0.0.0:10924`）                                      |
+| webview.session_ttl_sec      |    i64 |             43200 | 已支持               | WebView 会话有效期（秒，默认 12h）                                                |
 | napcat_base_url              | string |                "" | 已支持               | 作为默认 NapCat 反向 WS base url（推荐，优先级最高）                        |
 | napcat_access_token          | string |                "" | 已支持               | 作为默认 NapCat token（可被 `OQQWALL_NAPCAT_TOKEN` 覆盖）             |
 | tz_offset_minutes            |    i32 |                 0 | 已支持               | 时区偏移（分钟，用于 schedule/defer 计算）                           |
 | min_interval_ms              |    u32 |                 0 | 已支持               | 发送最小间隔（毫秒）                                             |
-| max_queue                    |    u32 |                 0 | 已支持               | 发送队列上限（=0 表示不限制）                                     |
 | max_image_number_one_post    |    u32 |                30 | 已支持               | 单条最大图片数；超限会拆分发送，并触发暂存区 flush                       |
 | send_timeout_ms              |    u32 |            300000 | 已支持               | 发送超时（毫秒）                                               |
 | send_max_attempts            |    u32 |                 3 | 已支持               | 发送失败最大重试次数                                             |
@@ -92,7 +95,13 @@
 
 * `OQQWALL_NAPCAT_TOKEN` > `groups.<id>.napcat_access_token`（全局覆盖所有组）
 * `OQQWALL_NAPCAT_BASE_URL` > `groups.<id>.napcat_base_url`（全局覆盖所有组）
-* `OQQWALL_API_TOKEN` > `common.api_token`（覆盖 HTTP API root token）
+* `OQQWALL_API_TOKEN` > `common.web_api.root_token`（覆盖 HTTP API root token）
+
+兼容迁移说明（启动时自动改写）：
+* `common.use_web_review` -> `common.web_api.enabled`
+* `common.web_review_port` -> `common.web_api.port`
+* `common.api_token` / `common.token` -> `common.web_api.root_token`
+* `groups.<id>.admins` -> `groups.<id>.webview_admins`
 
 ---
 
@@ -110,13 +119,13 @@
 | accounts                  |              array[string] | 必填（至少 1 个；首项为主账号） | 已支持                   | 账号列表，按顺序作为主号/替补优先级；审核相关群消息仅由当前有效主账号发送，主号离线按顺序替补 |
 | max_post_stack            |                        int | 默认 1；只允许正整数（1 表示单条直接发送，>1 启用暂存堆栈） | 已支持                   | sendcontrol 对此字段做默认值与数字校验                                       |
 | max_image_number_one_post |                        int | 默认 30；只允许正整数     | 已支持                   | 单条最大图片数；超限会拆分发送，并触发暂存区 flush                       |
-| individual_image_in_posts |                       bool | 默认 true          | 未支持                   | preprocess 缺省为 true，决定是否把用户原图也发送到空间（否则只发送概览图）                  |
+| individual_image_in_posts |                       bool | 默认 true          | 已支持                   | true=发送渲染图+原图，false=仅发送渲染图                                   |
 | at_unprived_sender           | at_unprived_sender           |   bool |             false | 已支持               | 发件时是否 @ 非匿名的投稿人（sendcontrol 读取此 key）                |
 | send_schedule             |             array["HH:MM"] | 默认空（不启用定时 flush） | 已支持                   | sendcontrol scheduler 从该字段读出 HH:MM 列表并按分钟触发 flush；同一时间点当日只触发一次  |
-| watermark_text            |                     string | 默认 ""            | 未支持                   | 用于渲染/展示（Rust 可保留用于渲染主题）                                    |
+| watermark_text            |                     string | 默认 ""            | 已支持                   | 用于渲染水印文本（空字符串不绘制水印）                                    |
 | friend_add_message        |                     string | 默认 ""            | 已支持                   | 用于自动通过好友申请后发送文本（你样例包含）                                        |
-| quick_replies             |     object{string->string} | 默认 {}            | 未支持                   | 用于快捷回复              |
-| admins                    | array[{username,password}] | 默认 []            | 未支持                   | 用于 web_review 管理员）                                      |
+| quick_replies             |     object{string->string} | 默认 {}            | 已支持                   | 用于快捷回复（键和值均为非空字符串，且键不能与审核指令冲突）              |
+| webview_admins           | array[{username,password,role}] | 默认 []            | 已支持                   | WebView 组管理员；`role` 缺省为 `group_admin`，密码会归一化为 `sha256:` |
 
 > 反向 WS 连接格式：NapCat 里填写 `ws://<host>/<base_path>/<QQ号>`，其中 `<base_path>` 来自 `napcat_base_url`（示例：`ws://127.0.0.1:3001/oqqwall/ws/456787654`）。
 
@@ -198,8 +207,17 @@ Rust 版落地建议：
     "force_chromium_no_sandbox": false,
     "at_unprived_sender": true,
     "friend_request_window_sec": 300,
-    "use_web_review": true,
-    "web_review_port": 10923,
+    "web_api": {
+      "enabled": true,
+      "port": 10923,
+      "root_token": "REDACTED"
+    },
+    "webview": {
+      "enabled": true,
+      "host": "127.0.0.1",
+      "port": 10924,
+      "session_ttl_sec": 43200
+    },
     "process_waittime_sec": 20
   },
   "groups": {
@@ -208,20 +226,18 @@ Rust 版落地建议：
       "napcat_base_url": "0.0.0.0:3001/oqqwall/ws",
       "napcat_access_token": "REDACTED",
       "accounts": ["3995477265"],
-      "max_post_stack": 3,
+      "max_post_stack": 1,
       "max_image_number_one_post": 9,
-      "individual_image_in_posts": false,
       "send_schedule": ["15:05", "23:55"],
-      "watermark_text": "",
       "friend_add_message": "您的好友申请已通过，请阅读校园墙空间置顶后再投稿（系统自动发送请勿回复）",
-      "quick_replies": {
-        "格式错误": "您的投稿格式有误，请重新发送"
-      },
-      "admins": [
-        { "username": "3391146750", "password": "admin" }
+      "webview_admins": [
+        { "username": "3391146750", "password": "sha256:REDACTED", "role": "group_admin" }
       ]
     }
-  }
+  },
+  "webview_global_admins": [
+    { "username": "root", "password": "sha256:REDACTED", "role": "global_admin" }
+  ]
 }
 ```
 

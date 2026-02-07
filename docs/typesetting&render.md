@@ -651,7 +651,7 @@ fn render_svg(doc: &RenderDoc, theme: &ThemeTokens, opt: &RenderOptions) -> Vec<
 * [ ] json card：contact/miniapp/news/通用 四类布局正确
 * [ ] QR：卡片有 url 则显示 QR，无则不显示
 * [ ] forward：标题+左竖线+缩进，支持嵌套
-* [ ] watermark：按配置平铺旋转，且确定性
+* [x] watermark：按配置平铺旋转，且确定性
 * [ ] 超长稿件分页（可配置）
 
 ---

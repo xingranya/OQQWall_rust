@@ -69,6 +69,7 @@ pub struct RendererRuntimeConfig {
     pub max_height_px: u32,
     pub napcat_by_group: HashMap<String, NapCatConfig>,
     pub default_napcat: Option<NapCatConfig>,
+    pub watermark_text_by_group: HashMap<String, String>,
 }
 
 impl Default for RendererRuntimeConfig {
@@ -82,6 +83,7 @@ impl Default for RendererRuntimeConfig {
             max_height_px: 2304,
             napcat_by_group: HashMap::new(),
             default_napcat: None,
+            watermark_text_by_group: HashMap::new(),
         }
     }
 }
@@ -1707,6 +1709,23 @@ fn render_png(
         }
     }
 
+    if let Some(watermark_text) = config
+        .watermark_text_by_group
+        .get(&header.group_id)
+        .map(|text| text.trim())
+        .filter(|text| !text.is_empty())
+    {
+        draw_watermark_layer(
+            canvas,
+            &font_collection,
+            &mut emoji_cache,
+            header,
+            config.canvas_width_px,
+            background_height,
+            watermark_text,
+        );
+    }
+
     let image = surface.image_snapshot();
     let data = image
         .encode(None, EncodedImageFormat::PNG, None)
@@ -1719,6 +1738,92 @@ fn color_from_hex(hex: u32) -> Color4f {
     let g = ((hex >> 8) & 0xFF) as f32 / 255.0;
     let b = (hex & 0xFF) as f32 / 255.0;
     Color4f::new(r, g, b, 1.0)
+}
+
+fn draw_watermark_layer(
+    canvas: &Canvas,
+    font_collection: &FontCollection,
+    emoji_cache: &mut EmojiRenderCache,
+    header: &HeaderInfo,
+    width: u32,
+    height: u32,
+    text: &str,
+) {
+    let opacity = 0.12f32;
+    let angle = -24f32;
+    let font_size = 40u32;
+    let font_weight = 400u32;
+    let tile = 480f32;
+    let jitter = 10f32;
+    let color = Color4f::new(0.0, 0.0, 0.0, opacity);
+
+    let mut rng = DeterministicRng::new(watermark_seed(header, text));
+    let cols = ((width as f32) / tile).ceil().max(1.0) as i32 + 1;
+    let rows = ((height as f32) / tile).ceil().max(1.0) as i32 + 1;
+    let first_cx = width as f32 * 0.5 - ((cols - 1) as f32 * tile) * 0.5;
+    let first_cy = height as f32 * 0.5 - ((rows - 1) as f32 * tile) * 0.5;
+
+    for row in 0..rows {
+        for col in 0..cols {
+            let jx = rng.jitter(jitter);
+            let jy = rng.jitter(jitter);
+            let x = first_cx + col as f32 * tile + jx;
+            let y = first_cy + row as f32 * tile + jy;
+
+            canvas.save();
+            canvas.translate((x, y));
+            canvas.rotate(angle, None);
+            draw_text_line(
+                canvas,
+                font_collection,
+                emoji_cache,
+                text,
+                0.0,
+                font_size as f32,
+                font_size,
+                font_weight,
+                color,
+            );
+            canvas.restore();
+        }
+    }
+}
+
+fn watermark_seed(header: &HeaderInfo, watermark_text: &str) -> u64 {
+    let mut out: u64 = 0xcbf29ce484222325;
+    for byte in header.post_id_hex.as_bytes() {
+        out ^= u64::from(*byte);
+        out = out.wrapping_mul(0x100000001b3);
+    }
+    out ^= 0xff;
+    for byte in watermark_text.as_bytes() {
+        out ^= u64::from(*byte);
+        out = out.wrapping_mul(0x100000001b3);
+    }
+    out
+}
+
+struct DeterministicRng {
+    state: u64,
+}
+
+impl DeterministicRng {
+    fn new(seed: u64) -> Self {
+        let state = if seed == 0 { 0x9e3779b97f4a7c15 } else { seed };
+        Self { state }
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 7;
+        self.state ^= self.state << 17;
+        (self.state >> 16) as u32
+    }
+
+    fn jitter(&mut self, bound: f32) -> f32 {
+        let unit = self.next_u32() as f32 / u32::MAX as f32;
+        unit * (bound * 2.0) - bound
+    }
 }
 
 struct LineMetricsSnapshot {

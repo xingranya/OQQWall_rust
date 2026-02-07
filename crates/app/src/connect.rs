@@ -4,6 +4,7 @@ use oqqwall_rust_drivers::napcat::{NapCatRuntimeConfig, spawn_napcat_ws};
 use oqqwall_rust_drivers::qzone::{QzoneRuntimeConfig, spawn_qzone_sender};
 use oqqwall_rust_drivers::renderer::{RendererRuntimeConfig, spawn_renderer};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::config::AppConfig;
 use crate::engine::EngineHandle;
@@ -47,6 +48,7 @@ pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) {
             friend_request_window_sec: group.friend_request_window_sec,
             friend_add_message: group.friend_add_message.clone(),
             max_queue: core_config.max_queue(&group.group_id),
+            quick_replies: Arc::new(Mutex::new(group.quick_replies.clone())),
         };
         let _ws_log = base_url_for_log(&runtime.napcat.base_url);
         debug_log!(
@@ -85,6 +87,8 @@ pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) {
     }
     let mut max_queue_by_group = HashMap::new();
     let mut max_images_per_post_by_group = HashMap::new();
+    let mut individual_images_by_group = HashMap::new();
+    let mut watermark_text_by_group = HashMap::new();
     for group in &config.groups {
         max_queue_by_group.insert(
             group.group_id.clone(),
@@ -94,11 +98,16 @@ pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) {
             group.group_id.clone(),
             core_config.max_images_per_post(&group.group_id),
         );
+        individual_images_by_group.insert(group.group_id.clone(), group.individual_image_in_posts);
+        if let Some(text) = group.watermark_text.clone() {
+            watermark_text_by_group.insert(group.group_id.clone(), text);
+        }
     }
     debug_log!("spawn renderer");
     let renderer_config = RendererRuntimeConfig {
         napcat_by_group: napcat_by_group.clone(),
         default_napcat: config.fallback_napcat.clone(),
+        watermark_text_by_group,
         ..RendererRuntimeConfig::default()
     };
     spawn_renderer(handle.cmd_tx.clone(), handle.subscribe(), renderer_config);
@@ -109,8 +118,10 @@ pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) {
         at_unprived_sender: config.at_unprived_sender,
         max_queue_by_group,
         max_images_per_post_by_group,
+        individual_images_by_group,
         default_max_queue: core_config.default_max_queue,
         default_max_images_per_post: core_config.default_max_images_per_post,
+        default_individual_images: true,
         #[cfg(debug_assertions)]
         use_virt_qzone: config.dev_config.use_virt_qzone,
     };
