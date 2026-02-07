@@ -9,14 +9,13 @@
   },
   "groups": {
     "default": {
-      "individual_image_in_posts": true,
-      "mainqqid": "3995477265",
+      "accounts": [
+        "3995477265",
+        "1050373508"
+      ],
       "mangroupid": "993802974",
       "max_image_number_one_post": 30,
       "max_post_stack": 1,
-      "minorqqid": [
-        "1050373508"
-      ],
       "napcat_access_token": "IH5PMytdMEQeDqO5maeAoDGW",
       "napcat_base_url": "0.0.0.0:3001/oqqwall/ws"
     }

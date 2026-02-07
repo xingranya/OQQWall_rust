@@ -8,7 +8,7 @@
 
 ## 0. 术语与组件
 
-- **OQQWall_RUST**：主程序（单二进制），包含 engine、drivers、web review（admin web，可选）。
+- **OQQWall_RUST**：主程序（单二进制），包含 engine、drivers、Web API 与 WebView（admin web，可选）。
 - **NapCat/OneBot**：QQ 接入层（可被 OQQWall_RUST 管理为子进程或外部自行运行）。
 - **Journal**：事件日志（append-only）。
 - **Snapshot**：快照（周期生成，用于缩短回放时间）。
@@ -148,12 +148,13 @@ sudo systemctl stop OQQWall_RUST
 
 ### 4.1 查看当前队列/状态（推荐途径）
 
-* 若启用 web review（`common.use_web_review=true`）：
+* 若启用 WebView（`common.webview.enabled=true`）：
 
-  * 打开 `http://<host>:<web_review_port>/` 查看：
+  * 打开 `http://<host>:<common.webview.port>/` 查看：
 
     * 待审核 / 待发送 / 发送中 / 失败 / 人工介入
     * 预览 PNG 图
+  * 账号权限与登录细节见 `docs/webview.md`
 * 若仅群内：
 
   * 使用全局指令（参见 `docs/command.md`）
@@ -406,7 +407,7 @@ set -as terminal-features ',tmux-256color:clipboard'
 ## 10. 安全建议
 
 * `napcat_access_token` 建议用环境变量提供，避免落盘（`OQQWALL_NAPCAT_TOKEN`）
-* web review（admin web）只绑定内网（或加 basic auth）
+* WebView（admin web）只绑定内网（或加反向代理鉴权）
 * 日志中避免打印 token、cookie、完整私密内容（做脱敏）
 
 ---

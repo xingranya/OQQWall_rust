@@ -1,18 +1,19 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fs;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use rand::RngCore;
-use oqqwall_rust_core::{
-    Command, GlobalAction, GlobalActionCommand, Id128, ReviewAction, ReviewActionCommand,
-    StateView,
-};
 use oqqwall_rust_core::state::PostStage;
+use oqqwall_rust_core::{
+    Command, GlobalAction, GlobalActionCommand, Id128, ReviewAction, ReviewActionCommand, StateView,
+};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
@@ -205,12 +206,46 @@ struct ReviewDecisionRequest {
     comment: Option<String>,
     #[serde(default)]
     delay_ms: Option<i64>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    quick_reply_key: Option<String>,
+    #[serde(default)]
+    target_review_code: Option<u32>,
 }
 
 #[derive(Serialize)]
 struct ReviewDecisionResponse {
     review_id: String,
     status: &'static str,
+}
+
+#[derive(Deserialize)]
+struct BatchReviewDecisionRequest {
+    review_ids: Vec<String>,
+    action: String,
+    #[serde(default)]
+    comment: Option<String>,
+    #[serde(default)]
+    delay_ms: Option<i64>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    quick_reply_key: Option<String>,
+    #[serde(default)]
+    target_review_code: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct BatchReviewDecisionResponse {
+    accepted: usize,
+    failed: Vec<ReviewFailure>,
+}
+
+#[derive(Serialize)]
+struct ReviewFailure {
+    review_id: String,
+    reason: String,
 }
 
 #[derive(Deserialize)]
@@ -292,7 +327,9 @@ pub fn spawn_web_api(handle: &EngineHandle, config: &AppConfig) {
         .route("/v1/auth/tokens", post(create_token))
         .route("/v1/posts", get(list_posts))
         .route("/v1/posts/:post_id", get(get_post))
+        .route("/v1/blobs/:blob_id", get(get_blob))
         .route("/v1/reviews/:review_id/decision", post(decide_review))
+        .route("/v1/reviews/batch", post(decide_review_batch))
         .route("/v1/blacklist", get(list_blacklist).post(create_blacklist))
         .route(
             "/v1/blacklist/:group_id/:sender_id",
@@ -521,9 +558,17 @@ async fn list_posts(
     let mut items = guard
         .posts
         .values()
-        .filter(|meta| stage_filter.map(|stage| meta.stage == stage).unwrap_or(true))
+        .filter(|meta| {
+            stage_filter
+                .map(|stage| meta.stage == stage)
+                .unwrap_or(true)
+        })
         .collect::<Vec<_>>();
-    items.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms).then_with(|| b.post_id.cmp(&a.post_id)));
+    items.sort_by(|a, b| {
+        b.created_at_ms
+            .cmp(&a.created_at_ms)
+            .then_with(|| b.post_id.cmp(&a.post_id))
+    });
 
     let cursor = query.cursor.unwrap_or(0);
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
@@ -684,6 +729,91 @@ async fn get_post(
         .into_response()
 }
 
+async fn get_blob(
+    State(state): State<ApiState>,
+    Path(blob_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let request_id = request_id(&headers);
+    if let Err(resp) = authenticate(&state, &headers, Some("review.read"), &request_id) {
+        return resp;
+    }
+
+    let Some(blob_id) = parse_id128(&blob_id) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "invalid blob_id",
+            request_id,
+        );
+    };
+
+    let path = {
+        let guard = match state.state.read() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL",
+                    "state unavailable",
+                    request_id,
+                );
+            }
+        };
+        let Some(meta) = guard.blobs.get(&blob_id) else {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "NOT_FOUND",
+                "blob not found",
+                request_id,
+            );
+        };
+        let Some(path) = meta.persisted_path.clone() else {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "NOT_FOUND",
+                "blob has no persisted path",
+                request_id,
+            );
+        };
+        path
+    };
+
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "NOT_FOUND",
+                "blob file missing",
+                request_id,
+            );
+        }
+    };
+
+    let mime = match path.rsplit('.').next().map(|ext| ext.to_ascii_lowercase()) {
+        Some(ext) if ext == "png" => "image/png",
+        Some(ext) if ext == "jpg" || ext == "jpeg" => "image/jpeg",
+        Some(ext) if ext == "gif" => "image/gif",
+        Some(ext) if ext == "webp" => "image/webp",
+        Some(ext) if ext == "mp4" => "video/mp4",
+        Some(ext) if ext == "mp3" => "audio/mpeg",
+        Some(ext) if ext == "wav" => "audio/wav",
+        _ => "application/octet-stream",
+    };
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_str(mime)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
+    response_headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=60"),
+    );
+    (StatusCode::OK, response_headers, bytes).into_response()
+}
+
 async fn decide_review(
     State(state): State<ApiState>,
     Path(review_id): Path<String>,
@@ -735,24 +865,10 @@ async fn decide_review(
         auth_guard.idempotency_seen.insert(dedup_key);
     }
 
-    let action = match req.action.as_str() {
-        "approve" => ReviewAction::Approve,
-        "reject" => ReviewAction::Reject,
-        "defer" => ReviewAction::Defer {
-            delay_ms: req.delay_ms.unwrap_or(0),
-        },
-        "skip" => ReviewAction::Skip,
-        "blacklist" => ReviewAction::Blacklist {
-            reason: req.comment.clone(),
-        },
-        "immediate" => ReviewAction::Immediate,
-        _ => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "BAD_REQUEST",
-                "unsupported action",
-                request_id,
-            );
+    let action = match parse_review_action(&req) {
+        Ok(action) => action,
+        Err(reason) => {
+            return error_response(StatusCode::BAD_REQUEST, "BAD_REQUEST", reason, request_id);
         }
     };
 
@@ -781,6 +897,67 @@ async fn decide_review(
             review_id: id_to_string(review_id),
             status: "applied",
         }),
+    )
+        .into_response()
+}
+
+async fn decide_review_batch(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<BatchReviewDecisionRequest>,
+) -> impl IntoResponse {
+    let request_id = request_id(&headers);
+    let auth = match authenticate(&state, &headers, Some("review.write"), &request_id) {
+        Ok(auth) => auth,
+        Err(resp) => return resp,
+    };
+    let action_template = ReviewDecisionRequest {
+        action: req.action,
+        comment: req.comment,
+        delay_ms: req.delay_ms,
+        text: req.text,
+        quick_reply_key: req.quick_reply_key,
+        target_review_code: req.target_review_code,
+    };
+    let action = match parse_review_action(&action_template) {
+        Ok(action) => action,
+        Err(reason) => {
+            return error_response(StatusCode::BAD_REQUEST, "BAD_REQUEST", reason, request_id);
+        }
+    };
+
+    let mut accepted = 0usize;
+    let mut failed = Vec::new();
+    for raw_review_id in req.review_ids {
+        let Some(review_id) = parse_id128(&raw_review_id) else {
+            failed.push(ReviewFailure {
+                review_id: raw_review_id,
+                reason: "invalid review_id".to_string(),
+            });
+            continue;
+        };
+        let cmd = Command::ReviewAction(ReviewActionCommand {
+            review_id: Some(review_id),
+            review_code: None,
+            audit_msg_id: None,
+            action: action.clone(),
+            operator_id: format!("api:{}", auth.token_id),
+            now_ms: now_ms(),
+            tz_offset_minutes: state.tz_offset_minutes,
+        });
+        if state.cmd_tx.send(cmd).await.is_err() {
+            failed.push(ReviewFailure {
+                review_id: id_to_string(review_id),
+                reason: "engine command channel closed".to_string(),
+            });
+            continue;
+        }
+        accepted = accepted.saturating_add(1);
+    }
+
+    (
+        StatusCode::OK,
+        Json(BatchReviewDecisionResponse { accepted, failed }),
     )
         .into_response()
 }
@@ -825,7 +1002,11 @@ async fn list_blacklist(
             });
         }
     }
-    rows.sort_by(|a, b| a.group_id.cmp(&b.group_id).then_with(|| a.sender_id.cmp(&b.sender_id)));
+    rows.sort_by(|a, b| {
+        a.group_id
+            .cmp(&b.group_id)
+            .then_with(|| a.sender_id.cmp(&b.sender_id))
+    });
 
     let cursor = query.cursor.unwrap_or(0);
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
@@ -1015,11 +1196,7 @@ async fn send_posts(
         accepted = accepted.saturating_add(1);
     }
 
-    (
-        StatusCode::OK,
-        Json(SendPostsResponse { accepted, failed }),
-    )
-        .into_response()
+    (StatusCode::OK, Json(SendPostsResponse { accepted, failed })).into_response()
 }
 
 fn authenticate(
@@ -1050,9 +1227,7 @@ fn authenticate(
     };
 
     let now = now_sec();
-    guard
-        .sessions
-        .retain(|_, session| session.expires_at > now);
+    guard.sessions.retain(|_, session| session.expires_at > now);
 
     let Some(session) = guard.sessions.get(&token).cloned() else {
         return Err(error_response(
@@ -1117,6 +1292,74 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
 
 fn parse_id128(value: &str) -> Option<Id128> {
     value.parse::<u128>().ok().map(Id128)
+}
+
+fn parse_review_action(req: &ReviewDecisionRequest) -> Result<ReviewAction, &'static str> {
+    match req.action.as_str() {
+        "approve" => Ok(ReviewAction::Approve),
+        "reject" => Ok(ReviewAction::Reject),
+        "delete" => Ok(ReviewAction::Delete),
+        "defer" => Ok(ReviewAction::Defer {
+            delay_ms: req.delay_ms.unwrap_or(0),
+        }),
+        "skip" => Ok(ReviewAction::Skip),
+        "immediate" => Ok(ReviewAction::Immediate),
+        "refresh" => Ok(ReviewAction::Refresh),
+        "rerender" => Ok(ReviewAction::Rerender),
+        "select_all" => Ok(ReviewAction::SelectAllMessages),
+        "toggle_anonymous" => Ok(ReviewAction::ToggleAnonymous),
+        "expand_audit" => Ok(ReviewAction::ExpandAudit),
+        "show" => Ok(ReviewAction::Show),
+        "comment" => {
+            let text = req
+                .text
+                .as_deref()
+                .or(req.comment.as_deref())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .ok_or("comment requires text")?;
+            Ok(ReviewAction::Comment {
+                text: text.to_string(),
+            })
+        }
+        "reply" => {
+            let text = req
+                .text
+                .as_deref()
+                .or(req.comment.as_deref())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .ok_or("reply requires text")?;
+            Ok(ReviewAction::Reply {
+                text: text.to_string(),
+            })
+        }
+        "blacklist" => Ok(ReviewAction::Blacklist {
+            reason: req
+                .comment
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+        }),
+        "quick_reply" => {
+            let key = req
+                .quick_reply_key
+                .as_ref()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .ok_or("quick_reply requires quick_reply_key")?;
+            Ok(ReviewAction::QuickReply {
+                key: key.to_string(),
+            })
+        }
+        "merge" => {
+            let code = req
+                .target_review_code
+                .ok_or("merge requires target_review_code")?;
+            Ok(ReviewAction::Merge { review_code: code })
+        }
+        _ => Err("unsupported action"),
+    }
 }
 
 fn parse_stage(value: &str) -> Option<PostStage> {

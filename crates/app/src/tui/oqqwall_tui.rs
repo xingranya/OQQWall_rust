@@ -70,7 +70,7 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
             "--tui" => {}
             "--config" => {
                 let Some(value) = iter.next() else {
-                    eprintln!("missing value for --config");
+                    eprintln!("--config 缺少参数值");
                     print_usage();
                     return Ok(());
                 };
@@ -78,7 +78,7 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
             }
             "--data-dir" => {
                 let Some(value) = iter.next() else {
-                    eprintln!("missing value for --data-dir");
+                    eprintln!("--data-dir 缺少参数值");
                     print_usage();
                     return Ok(());
                 };
@@ -89,7 +89,7 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
                 return Ok(());
             }
             other => {
-                eprintln!("unexpected argument: {other}");
+                eprintln!("未知参数: {other}");
                 print_usage();
                 return Ok(());
             }
@@ -99,7 +99,7 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
     let config = match ConfigEditor::load(config_path) {
         Ok(config) => config,
         Err(err) => {
-            eprintln!("tui: {err}");
+            eprintln!("TUI 启动失败: {err}");
             return Ok(());
         }
     };
@@ -117,19 +117,19 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
     restore_terminal(&mut terminal)?;
 
     if let Err(err) = result {
-        eprintln!("oqqwall_tui: {err}");
+        eprintln!("TUI 运行异常: {err}");
     }
     Ok(())
 }
 
 fn print_usage() {
-    println!("Usage: OQQWall_RUST --tui [--config <path>] [--data-dir <path>]");
-    println!("Keys: 1/2 switch tabs, q quit");
+    println!("用法: OQQWall_RUST --tui [--config <路径>] [--data-dir <路径>]");
+    println!("全局按键: 1/2 切页, q 退出");
     println!(
-        "Config: arrows move, Tab focus, enter/e edit, space toggle, a add key, g add group, x delete group, s save, r reload"
+        "配置页: 方向键移动, Tab 切焦点, Enter/e 编辑, 空格切布尔, a 新增字段, g 新增组, x 删除组, s 保存, r 重载"
     );
-    println!("Lists: enter/e edit, a add, d delete, Tab switch col, Esc back");
-    println!("Journal: r reload, t toggle view, u users, a all, arrows nav, q quit");
+    println!("列表编辑: Enter/e 编辑, a 新增, d 删除, Tab 切列, Esc 返回");
+    println!("日志页: r 重载, t 切视图, u 用户视图, a 全部视图, 方向键导航, q 退出");
 }
 
 fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
@@ -247,9 +247,9 @@ fn ui(f: &mut Frame, app: &mut App) {
 }
 
 fn tabs_line(active: MainTab, dirty: bool) -> (Line<'static>, TabBounds, TabBounds) {
-    let active_style = Style::default().add_modifier(Modifier::BOLD);
+    let active_style = Style::default();
     let inactive_style = Style::default().add_modifier(Modifier::DIM);
-    let config_label = if dirty { "Config*" } else { "Config" };
+    let config_label = if dirty { "配置*" } else { "配置" };
 
     let mut spans = Vec::new();
     let mut col: u16 = 0;
@@ -269,7 +269,7 @@ fn tabs_line(active: MainTab, dirty: bool) -> (Line<'static>, TabBounds, TabBoun
     ));
     spans.push(Span::raw("  "));
     col = col.saturating_add(2);
-    let journal_text = "2 Journal";
+    let journal_text = "2 日志";
     let journal_width = UnicodeWidthStr::width(journal_text) as u16;
     let journal_start = col;
     let journal_end = journal_start.saturating_add(journal_width);
@@ -281,7 +281,7 @@ fn tabs_line(active: MainTab, dirty: bool) -> (Line<'static>, TabBounds, TabBoun
             inactive_style
         },
     ));
-    spans.push(Span::raw("  q quit"));
+    spans.push(Span::raw("  q 退出"));
 
     (
         Line::from(spans),

@@ -627,7 +627,7 @@ pub fn run_cli() -> io::Result<()> {
         if data_dir.is_none() {
             data_dir = Some(arg);
         } else {
-            eprintln!("unexpected argument: {arg}");
+            eprintln!("未知参数: {arg}");
             print_usage();
             return Ok(());
         }
@@ -645,17 +645,17 @@ pub fn run_cli() -> io::Result<()> {
     restore_terminal(&mut terminal)?;
 
     if let Err(err) = result {
-        eprintln!("journal_tui: {err}");
+        eprintln!("日志 TUI 运行异常: {err}");
     }
     Ok(())
 }
 
 fn print_usage() {
-    println!("Usage: journal_tui [data_dir]");
-    println!("Keys: q/esc quit, r reload, t toggle view, u users, a all");
-    println!("      arrows/j/k nav, PgUp/PgDn page, g/G or Home/End jump");
-    println!("      Tab or h/l focus (user view), Ctrl+u/d scroll details");
-    println!("Mouse: click to select/focus, drag in details to copy, wheel to scroll");
+    println!("用法: journal_tui [data_dir]");
+    println!("按键: q/esc 退出, r 重载, t 切换视图, u 用户视图, a 全部视图");
+    println!("      方向键/j/k 导航, PgUp/PgDn 翻页, g/G 或 Home/End 跳转首尾");
+    println!("      Tab 或 h/l 切焦点（用户视图）, Ctrl+u/d 滚动详情");
+    println!("鼠标: 点击选择/切焦点, 在详情区域拖拽复制, 滚轮滚动");
 }
 
 fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
@@ -1086,7 +1086,7 @@ fn ui(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn tabs_line(view: ViewMode) -> (Line<'static>, TabBounds, TabBounds) {
-    let active_style = Style::default().add_modifier(Modifier::BOLD);
+    let active_style = Style::default();
     let inactive_style = Style::default().add_modifier(Modifier::DIM);
     let mut spans = Vec::new();
     let mut x: u16 = 0;
@@ -1101,8 +1101,8 @@ fn tabs_line(view: ViewMode) -> (Line<'static>, TabBounds, TabBounds) {
     } else {
         inactive_style
     };
-    spans.push(Span::styled("All", all_style));
-    x = x.saturating_add("All".len() as u16);
+    spans.push(Span::styled("全部", all_style));
+    x = x.saturating_add("全部".len() as u16);
     let all_end = x;
 
     let sep = " | ";
@@ -1115,8 +1115,8 @@ fn tabs_line(view: ViewMode) -> (Line<'static>, TabBounds, TabBounds) {
     } else {
         inactive_style
     };
-    spans.push(Span::styled("Users", users_style));
-    x = x.saturating_add("Users".len() as u16);
+    spans.push(Span::styled("用户", users_style));
+    x = x.saturating_add("用户".len() as u16);
     let users_end = x;
 
     (
@@ -1138,7 +1138,7 @@ fn status_text(app: &App) -> String {
             let total = app.events.len();
             let selected = app.selected.map(|idx| idx + 1).unwrap_or(0);
             format!(
-                "view=all data={} events={} selected={}/{}",
+                "视图=全部 数据目录={} 事件={} 选中={}/{}",
                 app.data_dir, total, selected, total
             )
         }
@@ -1152,11 +1152,11 @@ fn status_text(app: &App) -> String {
             let event_total = app.selected_user_event_len();
             let event_selected = app.user_event_selected.map(|idx| idx + 1).unwrap_or(0);
             let focus = match app.user_focus {
-                UserFocus::Users => "users",
-                UserFocus::Events => "events",
+                UserFocus::Users => "用户列表",
+                UserFocus::Events => "用户事件",
             };
             format!(
-                "view=users data={} users={}/{} user={} events={}/{} focus={}",
+                "视图=用户 数据目录={} 用户={}/{} 当前用户={} 事件={}/{} 焦点={}",
                 app.data_dir,
                 selected_user,
                 total_users,
@@ -1169,13 +1169,13 @@ fn status_text(app: &App) -> String {
     };
 
     if let Some(err) = &app.load_error {
-        line.push_str(" | error=");
+        line.push_str(" | 错误=");
         line.push_str(err);
     }
     if let Some(corruption) = &app.corruption {
         let _ = write!(
             line,
-            " | corruption seg={} off={} reason={}",
+            " | 日志损坏 seg={} off={} 原因={}",
             corruption.segment, corruption.offset, corruption.reason
         );
     }
@@ -1183,13 +1183,13 @@ fn status_text(app: &App) -> String {
 }
 
 fn help_text(_app: &App) -> String {
-    "q/esc quit | r reload | t toggle view | u users | a all | Tab/h/l focus | arrows/j/k nav | PgUp/PgDn | g/G Home/End | Ctrl+u/d detail | mouse click/drag(copy)/scroll".to_string()
+    "q/esc 退出 | r 重载 | t 切视图 | u 用户视图 | a 全部视图 | Tab/h/l 切焦点 | 方向键/j/k 导航 | PgUp/PgDn 翻页 | g/G Home/End 跳转 | Ctrl+u/d 详情滚动 | 鼠标点击/拖拽复制/滚轮".to_string()
 }
 
 fn events_list_widget(app: &App) -> Paragraph<'_> {
     let mut lines = Vec::new();
     if app.events.is_empty() {
-        lines.push(Line::raw("No events loaded."));
+        lines.push(Line::raw("暂无事件数据。"));
     } else {
         let start = app.list_offset.min(app.events.len());
         let end = (start + app.list_height.max(1)).min(app.events.len());
@@ -1207,13 +1207,14 @@ fn events_list_widget(app: &App) -> Paragraph<'_> {
             lines.push(Line::styled(line_text, style));
         }
     }
-    Paragraph::new(Text::from(lines)).block(Block::default().borders(Borders::ALL).title("Events"))
+    Paragraph::new(Text::from(lines))
+        .block(Block::default().borders(Borders::ALL).title("事件列表"))
 }
 
 fn user_list_widget(app: &App) -> Paragraph<'_> {
     let mut lines = Vec::new();
     if app.users.is_empty() {
-        lines.push(Line::raw("No users loaded."));
+        lines.push(Line::raw("暂无用户数据。"));
     } else {
         let start = app.user_list_offset.min(app.users.len());
         let end = (start + app.user_list_height.max(1)).min(app.users.len());
@@ -1233,8 +1234,8 @@ fn user_list_widget(app: &App) -> Paragraph<'_> {
     }
 
     let title = match app.user_focus {
-        UserFocus::Users => "Users*",
-        UserFocus::Events => "Users",
+        UserFocus::Users => "用户*",
+        UserFocus::Events => "用户",
     };
     Paragraph::new(Text::from(lines)).block(Block::default().borders(Borders::ALL).title(title))
 }
@@ -1242,13 +1243,13 @@ fn user_list_widget(app: &App) -> Paragraph<'_> {
 fn user_events_widget(app: &App) -> Paragraph<'_> {
     let mut lines = Vec::new();
     let Some(user) = app.selected_user_entry() else {
-        lines.push(Line::raw("No user selected."));
+        lines.push(Line::raw("未选中用户。"));
         return Paragraph::new(Text::from(lines))
-            .block(Block::default().borders(Borders::ALL).title("User Events"));
+            .block(Block::default().borders(Borders::ALL).title("用户事件"));
     };
 
     if user.events.is_empty() {
-        lines.push(Line::raw("No user events."));
+        lines.push(Line::raw("该用户暂无事件。"));
     } else {
         let start = app.user_event_offset.min(user.events.len());
         let end = (start + app.user_event_height.max(1)).min(user.events.len());
@@ -1268,8 +1269,8 @@ fn user_events_widget(app: &App) -> Paragraph<'_> {
     }
 
     let title = match app.user_focus {
-        UserFocus::Events => "User Events*",
-        UserFocus::Users => "User Events",
+        UserFocus::Events => "用户事件*",
+        UserFocus::Users => "用户事件",
     };
     Paragraph::new(Text::from(lines)).block(Block::default().borders(Borders::ALL).title(title))
 }
@@ -1277,8 +1278,8 @@ fn user_events_widget(app: &App) -> Paragraph<'_> {
 fn detail_widget(app: &mut App) -> Paragraph<'_> {
     app.ensure_detail_wrapped();
     if app.detail_wrapped.is_empty() {
-        return Paragraph::new("No event selected.")
-            .block(Block::default().borders(Borders::ALL).title("Details"));
+        return Paragraph::new("未选中事件。")
+            .block(Block::default().borders(Borders::ALL).title("事件详情"));
     }
     let selection = app.detail_selection_range();
     let highlight = Style::default().add_modifier(Modifier::REVERSED);
@@ -1295,13 +1296,12 @@ fn detail_widget(app: &mut App) -> Paragraph<'_> {
         lines.push(Line::styled(line.clone(), style));
     }
     Paragraph::new(Text::from(lines))
-        .block(Block::default().borders(Borders::ALL).title("Details"))
+        .block(Block::default().borders(Borders::ALL).title("事件详情"))
         .scroll((app.detail_scroll, 0))
 }
 
 fn load_events(data_dir: &str) -> Result<LoadResult, String> {
-    let journal =
-        LocalJournal::open(data_dir).map_err(|err| format!("journal open failed: {err}"))?;
+    let journal = LocalJournal::open(data_dir).map_err(|err| format!("打开日志失败: {err}"))?;
     let mut events = Vec::new();
     let mut users: HashMap<String, UserEntry> = HashMap::new();
     let mut ingress_user: HashMap<Id128, String> = HashMap::new();
@@ -1324,7 +1324,7 @@ fn load_events(data_dir: &str) -> Result<LoadResult, String> {
                     user_id,
                     sender_name,
                     message,
-                    "accepted",
+                    "已接收",
                     &mut users,
                     &mut ingress_user,
                 );
@@ -1342,7 +1342,7 @@ fn load_events(data_dir: &str) -> Result<LoadResult, String> {
                     user_id,
                     sender_name,
                     message,
-                    "synced",
+                    "已同步",
                     &mut users,
                     &mut ingress_user,
                 );
@@ -1391,7 +1391,7 @@ fn load_events(data_dir: &str) -> Result<LoadResult, String> {
                 corruption: outcome.corruption,
             })
         }
-        Err(err) => Err(format!("journal replay failed: {err}")),
+        Err(err) => Err(format!("日志回放失败: {err}")),
     }
 }
 
@@ -1439,7 +1439,7 @@ fn summarize_user_message(ts_ms: i64, label: &str, message: &IngressMessage) -> 
     let mut summary = format!("{} {}: {}", ts_ms, label, preview);
     let attachments = message.attachments.len();
     if attachments > 0 {
-        let _ = write!(summary, " att={}", attachments);
+        let _ = write!(summary, " 附件={}", attachments);
     }
     summary
 }
@@ -1447,14 +1447,14 @@ fn summarize_user_message(ts_ms: i64, label: &str, message: &IngressMessage) -> 
 fn summarize_user_draft(ts_ms: i64, draft: &Draft) -> String {
     let text = draft_preview_text(draft);
     let preview = if text.is_empty() {
-        "no text".to_string()
+        "无文本".to_string()
     } else {
         compact_text(&text, 72)
     };
-    let mut summary = format!("{} draft: {}", ts_ms, preview);
+    let mut summary = format!("{} 草稿: {}", ts_ms, preview);
     let attachments = draft_attachment_count(draft);
     if attachments > 0 {
-        let _ = write!(summary, " att={}", attachments);
+        let _ = write!(summary, " 附件={}", attachments);
     }
     summary
 }
@@ -1462,7 +1462,7 @@ fn summarize_user_draft(ts_ms: i64, draft: &Draft) -> String {
 fn message_preview(message: &IngressMessage) -> String {
     let preview = compact_text(&message.text, 72);
     if preview.is_empty() {
-        "no text".to_string()
+        "无文本".to_string()
     } else {
         preview
     }

@@ -73,8 +73,12 @@ pub struct GlobalActionCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GlobalAction {
     Help,
-    Recall { review_code: ReviewCode },
-    Info { review_code: ReviewCode },
+    Recall {
+        review_code: ReviewCode,
+    },
+    Info {
+        review_code: ReviewCode,
+    },
     ManualRelogin,
     AutoRelogin,
     PendingList,
@@ -83,12 +87,24 @@ pub enum GlobalAction {
     SendQueueFlush,
     SendInFlightClear,
     BlacklistList,
-    BlacklistAdd { sender_id: String, reason: Option<String> },
-    BlacklistRemove { sender_id: String },
-    SetExternalNumber { value: ExternalCode },
+    BlacklistAdd {
+        sender_id: String,
+        reason: Option<String>,
+    },
+    BlacklistRemove {
+        sender_id: String,
+    },
+    SetExternalNumber {
+        value: ExternalCode,
+    },
     QuickReplyList,
-    QuickReplyAdd { key: String, text: String },
-    QuickReplyDelete { key: String },
+    QuickReplyAdd {
+        key: String,
+        text: String,
+    },
+    QuickReplyDelete {
+        key: String,
+    },
     SelfCheck,
     SystemRepair,
 }

@@ -4,6 +4,7 @@ mod engine;
 mod oobe;
 mod status;
 mod web_api;
+mod webview;
 
 #[cfg(debug_assertions)]
 macro_rules! debug_log {
@@ -66,10 +67,14 @@ async fn main() {
     let _status = status::spawn_status_logger(&handle);
     debug_log!("status logger spawned");
     web_api::spawn_web_api(&handle, &app_config);
+    webview::spawn_webview(&handle, &app_config);
     debug_log!(
-        "web api init: enabled={} port={}",
+        "web services init: api_enabled={} api_port={} webview_enabled={} webview_host={} webview_port={}",
         app_config.web_api_enabled,
-        app_config.web_api_port
+        app_config.web_api_port,
+        app_config.webview_enabled,
+        app_config.webview_host,
+        app_config.webview_port
     );
     spawn_napcat_drivers(&handle, &app_config);
     debug_log!("drivers spawned");

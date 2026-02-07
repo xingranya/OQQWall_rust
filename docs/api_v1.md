@@ -5,12 +5,17 @@
 ## 1. 启用与配置
 
 启用条件：
-- `common.use_web_review = true`
-- `common.api_token`（或环境变量 `OQQWALL_API_TOKEN`）存在且长度 >= 32
+- `common.web_api.enabled = true`
+- `common.web_api.root_token`（或环境变量 `OQQWALL_API_TOKEN`）存在且长度 >= 32
 
 监听地址：
-- `0.0.0.0:${common.web_review_port}`
+- `0.0.0.0:${common.web_api.port}`
 - 默认端口：`10923`
+
+兼容读取（启动时自动迁移）：
+- `common.use_web_review` -> `common.web_api.enabled`
+- `common.web_review_port` -> `common.web_api.port`
+- `common.api_token` -> `common.web_api.root_token`
 
 ## 2. 鉴权模型
 
@@ -197,15 +202,21 @@
 请求：
 ```json
 {
-  "action": "approve|reject|defer|skip|blacklist|immediate",
+  "action": "approve|reject|delete|defer|skip|immediate|refresh|rerender|select_all|toggle_anonymous|expand_audit|show|comment|reply|blacklist|quick_reply|merge",
   "comment": "可选",
-  "delay_ms": 60000
+  "delay_ms": 60000,
+  "text": "可选（comment/reply）",
+  "quick_reply_key": "可选（quick_reply）",
+  "target_review_code": 1234
 }
 ```
 
 说明：
 - `blacklist` 时 `comment` 作为拉黑理由。
 - `defer` 时可传 `delay_ms`。
+- `comment/reply` 需要 `text`（兼容读取 `comment`）。
+- `quick_reply` 需要 `quick_reply_key`。
+- `merge` 需要 `target_review_code`。
 - 支持幂等请求头：`Idempotency-Key: <key>`。
 
 响应：
@@ -216,7 +227,37 @@
 }
 ```
 
-### 4.8 黑名单列表
+### 4.8 批量审核决策
+
+`POST /v1/reviews/batch`
+
+权限：`review.write`
+
+请求：
+```json
+{
+  "review_ids": ["456", "789"],
+  "action": "approve"
+}
+```
+
+响应：
+```json
+{
+  "accepted": 2,
+  "failed": []
+}
+```
+
+### 4.9 Blob 读取
+
+`GET /v1/blobs/{blob_id}`
+
+权限：`review.read`
+
+响应：二进制流（`Content-Type` 按文件扩展名推断）。
+
+### 4.10 黑名单列表
 
 `GET /v1/blacklist?group_id=10001&cursor=0&limit=50`
 
@@ -236,7 +277,7 @@
 }
 ```
 
-### 4.9 新增黑名单
+### 4.11 新增黑名单
 
 `POST /v1/blacklist`
 
@@ -253,7 +294,7 @@
 
 响应：`204 No Content`
 
-### 4.10 删除黑名单
+### 4.12 删除黑名单
 
 `DELETE /v1/blacklist/{group_id}/{sender_id}`
 
@@ -261,7 +302,7 @@
 
 响应：`204 No Content`
 
-### 4.11 触发发件
+### 4.13 触发发件
 
 `POST /v1/posts/send`
 
