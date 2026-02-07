@@ -106,6 +106,10 @@ pub fn spawn_media_fetcher(
                     let mut guard = state.lock().await;
                     guard.ingress_messages.remove(&ingress_id);
                 }
+                Event::Ingress(IngressEvent::MessageRecalled { ingress_id, .. }) => {
+                    let mut guard = state.lock().await;
+                    guard.ingress_messages.remove(&ingress_id);
+                }
                 Event::Media(MediaEvent::MediaFetchRequested {
                     ingress_id,
                     attachment_index,

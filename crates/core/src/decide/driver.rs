@@ -1,10 +1,13 @@
 use crate::config::CoreConfig;
+use crate::decide::builder::build_draft_from_messages;
 use crate::event::{
-    Event, ManualEvent, RenderEvent, ReviewDecision, ReviewEvent, ScheduleEvent, SendEvent,
-    SendPriority,
+    DraftEvent, Event, IngressEvent, ManualEvent, RenderEvent, ReviewDecision, ReviewEvent,
+    ScheduleEvent, SendEvent, SendPriority,
 };
 use crate::ids::{PostId, ReviewCode, ReviewId, derive_review_id};
+use crate::safety::detect_safe;
 use crate::state::StateView;
+use crate::{anonymous::detect_anonymous, state::PostMeta};
 
 pub fn decide_driver_event(state: &StateView, event: &Event, config: &CoreConfig) -> Vec<Event> {
     // Driver events come from IO drivers. They must flow into the event stream
@@ -96,6 +99,10 @@ pub fn decide_driver_event(state: &StateView, event: &Event, config: &CoreConfig
             let decided_at_ms = state.last_ts_ms.unwrap_or(0);
             return_to_pending(state, *post_id, decided_at_ms)
         }
+        Event::Ingress(IngressEvent::MessageRecalled {
+            ingress_id,
+            recalled_at_ms,
+        }) => derive_recall_events(state, *ingress_id, *recalled_at_ms),
         _ => Vec::new(),
     };
 
@@ -138,4 +145,93 @@ fn resolve_review_meta(state: &StateView, post_id: PostId) -> Option<(ReviewId, 
         })?;
     let review = state.reviews.get(&review_id)?;
     Some((review_id, review.review_code))
+}
+
+fn derive_recall_events(
+    state: &StateView,
+    ingress_id: crate::ids::IngressId,
+    now_ms: i64,
+) -> Vec<Event> {
+    let affected_posts = state
+        .post_ingress
+        .iter()
+        .filter_map(|(post_id, ingress_ids)| ingress_ids.contains(&ingress_id).then_some(*post_id))
+        .collect::<Vec<_>>();
+    if affected_posts.is_empty() {
+        return Vec::new();
+    }
+
+    let mut events = Vec::new();
+    for post_id in affected_posts {
+        let Some(post_meta) = state.posts.get(&post_id) else {
+            continue;
+        };
+        let Some(source_ingress) = state.post_ingress.get(&post_id) else {
+            continue;
+        };
+        let remaining_ingress = source_ingress
+            .iter()
+            .copied()
+            .filter(|id| *id != ingress_id)
+            .collect::<Vec<_>>();
+        if remaining_ingress.is_empty() {
+            if let Some(review_id) = post_meta.review_id {
+                events.push(Event::Review(ReviewEvent::ReviewDecisionRecorded {
+                    review_id,
+                    decision: ReviewDecision::Deleted,
+                    decided_by: "system_recall".to_string(),
+                    decided_at_ms: now_ms,
+                }));
+            }
+            if state.send_plans.contains_key(&post_id) {
+                events.push(Event::Schedule(ScheduleEvent::SendPlanCanceled { post_id }));
+            }
+            continue;
+        }
+
+        let draft_event =
+            rebuild_draft_after_recall(state, post_meta, post_id, remaining_ingress, now_ms);
+        events.push(Event::Draft(draft_event));
+        if let Some(review_id) = post_meta.review_id {
+            events.push(Event::Review(ReviewEvent::ReviewRefreshRequested {
+                review_id,
+            }));
+        }
+        events.push(Event::Render(RenderEvent::RenderRequested {
+            post_id,
+            attempt: 1,
+            requested_at_ms: now_ms,
+        }));
+    }
+
+    events
+}
+
+fn rebuild_draft_after_recall(
+    state: &StateView,
+    post_meta: &PostMeta,
+    post_id: PostId,
+    ingress_ids: Vec<crate::ids::IngressId>,
+    now_ms: i64,
+) -> DraftEvent {
+    let mut messages = Vec::new();
+    for ingress_id in &ingress_ids {
+        if let Some(message) = state.ingress_messages.get(ingress_id) {
+            messages.push(message.clone());
+        }
+    }
+    let draft = build_draft_from_messages(&messages);
+    let is_anonymous = detect_anonymous(&messages);
+    let is_safe = detect_safe(&messages);
+
+    DraftEvent::PostDraftCreated {
+        post_id,
+        session_id: post_meta.session_id,
+        group_id: post_meta.group_id.clone(),
+        ingress_ids,
+        is_anonymous,
+        is_safe,
+        draft,
+        created_at_ms: now_ms,
+    }
 }

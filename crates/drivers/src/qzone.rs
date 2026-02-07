@@ -346,6 +346,14 @@ pub fn spawn_qzone_sender(
                     guard.ingress_messages.remove(&ingress_id);
                     guard.ingress_authors.remove(&ingress_id);
                 }
+                Event::Ingress(IngressEvent::MessageRecalled { ingress_id, .. }) => {
+                    let mut guard = state.lock().await;
+                    guard.ingress_messages.remove(&ingress_id);
+                    guard.ingress_authors.remove(&ingress_id);
+                    for ingress_ids in guard.post_ingress.values_mut() {
+                        ingress_ids.retain(|id| *id != ingress_id);
+                    }
+                }
                 Event::Media(MediaEvent::MediaFetchSucceeded {
                     ingress_id,
                     attachment_index,
@@ -440,6 +448,11 @@ pub fn spawn_qzone_sender(
                 | Event::Blob(BlobEvent::BlobGcRequested { blob_id }) => {
                     let mut guard = state.lock().await;
                     guard.blob_paths.remove(&blob_id);
+                }
+                Event::Render(RenderEvent::RenderRequested { post_id, .. }) => {
+                    let mut guard = state.lock().await;
+                    let entry = guard.render_blobs.entry(post_id).or_default();
+                    entry.png = None;
                 }
                 Event::Render(RenderEvent::PngReady { post_id, blob_id }) => {
                     let mut guard = state.lock().await;

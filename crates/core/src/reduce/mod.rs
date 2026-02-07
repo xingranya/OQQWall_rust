@@ -82,6 +82,14 @@ fn reduce_ingress(state: &mut StateView, event: &IngressEvent) {
         IngressEvent::MessageIgnored { ingress_id, .. } => {
             state.ingress_seen.insert(*ingress_id);
         }
+        IngressEvent::MessageRecalled { ingress_id, .. } => {
+            state.ingress_messages.remove(ingress_id);
+            state
+                .media_fetch
+                .retain(|key, _| key.ingress_id != *ingress_id);
+            remove_ingress_from_sessions(state, *ingress_id);
+            remove_ingress_from_posts(state, *ingress_id);
+        }
         IngressEvent::InputStatusUpdated {
             chat_id,
             user_id,
@@ -120,6 +128,28 @@ fn reduce_ingress(state: &mut StateView, event: &IngressEvent) {
 
 fn input_status_active(status: InputStatusKind) -> bool {
     matches!(status, InputStatusKind::Typing | InputStatusKind::Speaking)
+}
+
+fn remove_ingress_from_sessions(state: &mut StateView, ingress_id: crate::ids::IngressId) {
+    let mut empty_sessions = Vec::new();
+    for (session_id, ingress_ids) in &mut state.session_ingress {
+        ingress_ids.retain(|id| *id != ingress_id);
+        if ingress_ids.is_empty() {
+            empty_sessions.push(*session_id);
+        }
+    }
+    for session_id in empty_sessions {
+        state.session_ingress.remove(&session_id);
+        if let Some(meta) = state.sessions.remove(&session_id) {
+            state.session_by_key.remove(&meta.key);
+        }
+    }
+}
+
+fn remove_ingress_from_posts(state: &mut StateView, ingress_id: crate::ids::IngressId) {
+    for ingress_ids in state.post_ingress.values_mut() {
+        ingress_ids.retain(|id| *id != ingress_id);
+    }
 }
 
 fn reduce_session(state: &mut StateView, event: &SessionEvent) {
@@ -273,6 +303,7 @@ fn reduce_render(state: &mut StateView, event: &RenderEvent) {
                 last_attempt: 0,
                 retry_at_ms: None,
             });
+            meta.png_blob = None;
             meta.last_attempt = *attempt;
             meta.retry_at_ms = None;
             meta.last_error = None;

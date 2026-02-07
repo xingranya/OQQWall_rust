@@ -271,6 +271,9 @@ impl ImageMemoryCache {
             Event::Ingress(IngressEvent::MessageIgnored { ingress_id, .. }) => {
                 self.clear_for_ingress(*ingress_id);
             }
+            Event::Ingress(IngressEvent::MessageRecalled { ingress_id, .. }) => {
+                self.clear_for_ingress(*ingress_id);
+            }
             _ => {}
         }
     }

@@ -1002,6 +1002,15 @@ async fn build_action_from_event(
             guard.pending_summary.remove(&ingress_id);
             None
         }
+        Event::Ingress(IngressEvent::MessageRecalled { ingress_id, .. }) => {
+            let mut guard = state.lock().await;
+            guard.pending_summary.remove(&ingress_id);
+            guard.ingress_summary.remove(&ingress_id);
+            for ingress_ids in guard.post_ingress.values_mut() {
+                ingress_ids.retain(|id| *id != ingress_id);
+            }
+            None
+        }
         Event::Draft(DraftEvent::PostDraftCreated {
             post_id,
             ingress_ids,
@@ -1131,10 +1140,13 @@ async fn build_action_from_event(
         Event::Review(ReviewEvent::ReviewDecisionRecorded {
             review_id,
             decision,
+            decided_by,
             ..
         }) => {
-            let should_notify = matches!(decision, ReviewDecision::Rejected);
-            let submitter = {
+            let should_notify_reject = matches!(decision, ReviewDecision::Rejected);
+            let should_notify_recall_deleted =
+                matches!(decision, ReviewDecision::Deleted) && decided_by == "system_recall";
+            let (submitter, recall_group_msg) = {
                 let mut guard = state.lock().await;
                 match decision {
                     ReviewDecision::Approved
@@ -1147,13 +1159,35 @@ async fn build_action_from_event(
                         guard.processed_reviews.remove(&review_id);
                     }
                 }
-                if should_notify {
+                let submitter = if should_notify_reject {
                     resolve_review_submitter(&guard, review_id)
                 } else {
                     None
-                }
+                };
+                let recall_group_msg = if should_notify_recall_deleted {
+                    guard.review_info.get(&review_id).map(|info| {
+                        format!("发件者撤回了#{}的全部内容,已自动删除稿件", info.review_code)
+                    })
+                } else {
+                    None
+                };
+                (submitter, recall_group_msg)
             };
-            if !should_notify {
+            if let Some(text) = recall_group_msg {
+                let target_group_id = runtime
+                    .audit_group_id
+                    .as_deref()
+                    .unwrap_or(runtime.group_id.as_str());
+                let payload = serde_json::json!({
+                    "action": "send_group_msg",
+                    "params": {
+                        "group_id": json_id(target_group_id),
+                        "message": message_segments_from_text(&text)
+                    }
+                });
+                return Some(payload.to_string());
+            }
+            if !should_notify_reject {
                 return None;
             }
             let Some((group_id, user_id)) = submitter else {
@@ -2091,6 +2125,33 @@ fn friend_request_delay_sec() -> u64 {
 fn parse_notice_event(runtime: &NapCatRuntimeConfig, value: &Value) -> Option<Command> {
     let notice_type = value.get("notice_type").and_then(|v| v.as_str());
     let sub_type = value.get("sub_type").and_then(|v| v.as_str());
+    if matches!(notice_type, Some("friend_recall")) || matches!(sub_type, Some("friend_recall")) {
+        let user_id = value_opt_to_string(value.get("user_id")).or_else(|| {
+            value
+                .get("data")
+                .and_then(|data| value_opt_to_string(data.get("user_id")))
+        })?;
+        let message_id = value_opt_to_string(value.get("message_id")).or_else(|| {
+            value
+                .get("data")
+                .and_then(|data| value_opt_to_string(data.get("message_id")))
+        })?;
+        let profile_id =
+            value_opt_to_string(value.get("self_id")).unwrap_or_else(|| "napcat".to_string());
+        let ingress_id = derive_ingress_id(&[
+            profile_id.as_bytes(),
+            user_id.as_bytes(),
+            user_id.as_bytes(),
+            message_id.as_bytes(),
+        ]);
+        return Some(Command::DriverEvent(Event::Ingress(
+            IngressEvent::MessageRecalled {
+                ingress_id,
+                recalled_at_ms: inbound_timestamp_ms(value),
+            },
+        )));
+    }
+
     let is_input_status = (matches!(notice_type, Some("notify"))
         && matches!(sub_type, Some("input_status")))
         || matches!(notice_type, Some("input_status"))
@@ -3629,6 +3690,22 @@ mod tests {
         }
     }
 
+    fn test_runtime() -> NapCatRuntimeConfig {
+        NapCatRuntimeConfig {
+            napcat: NapCatConfig {
+                base_url: "127.0.0.1:3001/oqqwall/ws".to_string(),
+                access_token: None,
+            },
+            audit_group_id: Some("1".to_string()),
+            group_id: "group-a".to_string(),
+            accounts: vec!["100".to_string()],
+            tz_offset_minutes: 0,
+            friend_request_window_sec: 0,
+            friend_add_message: None,
+            max_queue: 1,
+        }
+    }
+
     fn clear_group_accounts_for_test(group_id: &str) {
         let mut guard = match group_accounts().lock() {
             Ok(guard) => guard,
@@ -3750,6 +3827,31 @@ mod tests {
     }
 
     #[test]
+    fn parse_friend_recall_notice_to_driver_event() {
+        let runtime = test_runtime();
+        let payload = serde_json::json!({
+            "post_type": "notice",
+            "notice_type": "friend_recall",
+            "self_id": "10001",
+            "user_id": "20002",
+            "message_id": "30003",
+            "time": 1730000000
+        });
+
+        let command = parse_notice_event(&runtime, &payload);
+        let expected_ingress = derive_ingress_id(&[b"10001", b"20002", b"20002", b"30003"]);
+        assert!(matches!(
+            command,
+            Some(Command::DriverEvent(Event::Ingress(
+                IngressEvent::MessageRecalled {
+                    ingress_id,
+                    recalled_at_ms,
+                }
+            ))) if ingress_id == expected_ingress && recalled_at_ms > 0
+        ));
+    }
+
+    #[test]
     fn account_status_text_formats_online_and_offline() {
         assert_eq!(account_status_text("10001", true), "账号10001已上线");
         assert_eq!(account_status_text("10001", false), "账号10001已离线");
@@ -3808,19 +3910,9 @@ mod tests {
     #[test]
     fn effective_primary_account_uses_accounts_order_with_online_fallback() {
         let _guard = lock_globals_for_test();
-        let runtime = NapCatRuntimeConfig {
-            napcat: NapCatConfig {
-                base_url: "127.0.0.1:3001/oqqwall/ws".to_string(),
-                access_token: None,
-            },
-            audit_group_id: Some("1".to_string()),
-            group_id: "g-test2".to_string(),
-            accounts: vec!["100".to_string(), "200".to_string()],
-            tz_offset_minutes: 0,
-            friend_request_window_sec: 0,
-            friend_add_message: None,
-            max_queue: 1,
-        };
+        let mut runtime = test_runtime();
+        runtime.group_id = "g-test2".to_string();
+        runtime.accounts = vec!["100".to_string(), "200".to_string()];
 
         register_ws_session("200", mock_session());
         assert_eq!(effective_primary_account(&runtime), Some("200".to_string()));

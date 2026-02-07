@@ -1611,6 +1611,17 @@ fn summary_parts(event: &Event) -> (&'static str, String) {
                 "Ingress.MessageIgnored",
                 format!("ingress={} reason={:?}", short_id(*ingress_id), reason),
             ),
+            IngressEvent::MessageRecalled {
+                ingress_id,
+                recalled_at_ms,
+            } => (
+                "Ingress.MessageRecalled",
+                format!(
+                    "ingress={} recalled_at={}",
+                    short_id(*ingress_id),
+                    recalled_at_ms
+                ),
+            ),
             IngressEvent::InputStatusUpdated {
                 group_id,
                 chat_id,

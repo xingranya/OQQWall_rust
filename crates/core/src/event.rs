@@ -82,6 +82,10 @@ pub enum IngressEvent {
         ingress_id: IngressId,
         reason: IngressIgnoreReason,
     },
+    MessageRecalled {
+        ingress_id: IngressId,
+        recalled_at_ms: TimestampMs,
+    },
     InputStatusUpdated {
         profile_id: String,
         chat_id: String,
