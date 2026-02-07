@@ -1997,6 +1997,35 @@ fn summary_parts(event: &Event) -> (&'static str, String) {
                     started_at_ms
                 ),
             ),
+            SendEvent::SendAccountSucceeded {
+                post_id,
+                account_id,
+                finished_at_ms,
+                remote_id,
+            } => (
+                "Send.AccountSucceeded",
+                format!(
+                    "post={} account={} finished_at={} remote={}",
+                    short_id(*post_id),
+                    account_id,
+                    finished_at_ms,
+                    remote_id.as_deref().unwrap_or("-")
+                ),
+            ),
+            SendEvent::SendAccountFailed {
+                post_id,
+                account_id,
+                attempt,
+                ..
+            } => (
+                "Send.AccountFailed",
+                format!(
+                    "post={} account={} attempt={}",
+                    short_id(*post_id),
+                    account_id,
+                    attempt
+                ),
+            ),
             SendEvent::SendSucceeded {
                 post_id,
                 account_id,

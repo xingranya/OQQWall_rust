@@ -640,6 +640,31 @@ fn reduce_send(state: &mut StateView, event: &SendEvent) {
                 });
             runtime.last_send_ms = Some(*started_at_ms);
         }
+        SendEvent::SendAccountSucceeded {
+            account_id,
+            finished_at_ms,
+            ..
+        } => {
+            let runtime = state
+                .accounts
+                .entry(account_id.clone())
+                .or_insert(AccountRuntime {
+                    enabled: true,
+                    cooldown_until_ms: None,
+                    last_send_ms: None,
+                });
+            runtime.last_send_ms = Some(*finished_at_ms);
+        }
+        SendEvent::SendAccountFailed { account_id, .. } => {
+            state
+                .accounts
+                .entry(account_id.clone())
+                .or_insert(AccountRuntime {
+                    enabled: true,
+                    cooldown_until_ms: None,
+                    last_send_ms: None,
+                });
+        }
         SendEvent::SendSucceeded {
             post_id,
             account_id,

@@ -72,8 +72,16 @@ pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) {
         MediaFetcherRuntimeConfig::default(),
     );
     let mut napcat_by_group = HashMap::new();
+    let mut accounts_by_group = HashMap::new();
     for group in &config.groups {
         napcat_by_group.insert(group.group_id.clone(), group.napcat.clone());
+        accounts_by_group.insert(
+            group.group_id.clone(),
+            core_config
+                .group_config(&group.group_id)
+                .map(|cfg| cfg.accounts.clone())
+                .unwrap_or_default(),
+        );
     }
     let mut max_queue_by_group = HashMap::new();
     let mut max_images_per_post_by_group = HashMap::new();
@@ -97,6 +105,7 @@ pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) {
     let runtime = QzoneRuntimeConfig {
         napcat_by_group,
         default_napcat: config.fallback_napcat.clone(),
+        accounts_by_group,
         at_unprived_sender: config.at_unprived_sender,
         max_queue_by_group,
         max_images_per_post_by_group,

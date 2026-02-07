@@ -56,6 +56,7 @@ const EMUQZONE_MAX_POSTS: usize = 50;
 pub struct QzoneRuntimeConfig {
     pub napcat_by_group: HashMap<String, NapCatConfig>,
     pub default_napcat: Option<NapCatConfig>,
+    pub accounts_by_group: HashMap<String, Vec<String>>,
     pub at_unprived_sender: bool,
     pub max_queue_by_group: HashMap<String, usize>,
     pub max_images_per_post_by_group: HashMap<String, usize>,
@@ -254,6 +255,7 @@ fn build_state_from_view(view: &StateView) -> QzoneState {
 }
 
 struct CookieCache {
+    account_id: String,
     cookies: HashMap<String, String>,
     fetched_at_ms: TimestampMs,
 }
@@ -550,250 +552,70 @@ pub fn spawn_qzone_sender(
                             continue;
                         }
                     };
-                    #[cfg(debug_assertions)]
-                    if runtime.use_virt_qzone {
-                        let Some(emu_state) = emu_state.as_ref() else {
-                            debug_log!("emuqzone send failed: missing emulator state");
-                            let err = QzoneError::unknown("missing emuqzone state");
-                            let retry_at =
-                                started_at_ms.saturating_add(retry_delay_ms(err.kind, 1));
-                            let event = SendEvent::SendFailed {
-                                post_id,
-                                account_id,
-                                attempt: 1,
-                                retry_at_ms: retry_at,
-                                error: format!("[{:?}] {}", err.kind, err.message),
-                            };
-                            let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
-                            continue;
-                        };
-                        let images = match collect_emuqzone_batch_images(&assets, &blob_paths) {
-                            Ok(images) => images,
-                            Err(err) => {
-                                debug_log!(
-                                    "emuqzone collect images failed: kind={:?} message={}",
-                                    err.kind,
-                                    err.message
-                                );
-                                let retry_at =
-                                    started_at_ms.saturating_add(retry_delay_ms(err.kind, 1));
-                                let event = SendEvent::SendFailed {
-                                    post_id,
-                                    account_id,
-                                    attempt: 1,
-                                    retry_at_ms: retry_at,
-                                    error: format!("[{:?}] {}", err.kind, err.message),
-                                };
-                                let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
-                                continue;
-                            }
-                        };
-                        if images.is_empty() {
-                            let err = QzoneError::unknown("empty images");
-                            let retry_at =
-                                started_at_ms.saturating_add(retry_delay_ms(err.kind, 1));
-                            let event = SendEvent::SendFailed {
-                                post_id,
-                                account_id,
-                                attempt: 1,
-                                retry_at_ms: retry_at,
-                                error: format!("[{:?}] {}", err.kind, err.message),
-                            };
-                            let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
-                            continue;
-                        }
-                        let attempt = {
-                            let mut guard = state.lock().await;
-                            let entry = guard.attempts.entry(post_id).or_insert(0);
-                            *entry += 1;
-                            *entry
-                        };
-                        debug_log!(
-                            "emuqzone publish attempt: post_id={} batch={} attempt={} images={} content_len={}",
-                            post_id.0,
-                            batch_posts.len(),
-                            attempt,
-                            images.len(),
-                            publish_text.len()
-                        );
-                        let chunk_size = if max_images_per_post > 0 {
-                            max_images_per_post
-                        } else {
-                            images.len().max(1)
-                        };
-                        for chunk in images.chunks(chunk_size) {
-                            append_emuqzone_post(emu_state, publish_text.clone(), chunk.to_vec());
-                        }
-                        debug_log!("emuqzone publish success: post_id={}", post_id.0);
-                        let mut guard = state.lock().await;
-                        guard.attempts.remove(&post_id);
-                        for other_post_id in batch_posts.iter().copied().filter(|id| *id != post_id)
-                        {
-                            let event = ScheduleEvent::SendPlanCanceled {
-                                post_id: other_post_id,
-                            };
-                            let _ = cmd_tx
-                                .send(Command::DriverEvent(Event::Schedule(event)))
-                                .await;
-                        }
-                        for batch_post_id in batch_posts {
-                            let event = SendEvent::SendSucceeded {
-                                post_id: batch_post_id,
-                                account_id: account_id.clone(),
-                                finished_at_ms: started_at_ms,
-                                remote_id: None,
-                            };
-                            let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
-                        }
-                        continue;
-                    }
-                    let napcat = runtime
-                        .napcat_by_group
-                        .get(&group_id)
-                        .or_else(|| runtime.default_napcat.as_ref());
-                    let Some(_napcat) = napcat else {
-                        debug_log!(
-                            "qzone send failed: missing napcat config for group_id={}",
-                            group_id
-                        );
-                        let event = SendEvent::SendFailed {
-                            post_id,
-                            account_id,
-                            attempt: 1,
-                            retry_at_ms: started_at_ms.saturating_add(30_000),
-                            error: "missing napcat config for group".to_string(),
-                        };
-                        let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
-                        continue;
-                    };
-                    let cookies = match get_cookies(&state, &account_id).await {
-                        Ok(cookies) => cookies,
-                        Err(err) => {
-                            debug_log!(
-                                "qzone get cookies failed: kind={:?} message={}",
-                                err.kind,
-                                err.message
-                            );
-                            let retry_at =
-                                started_at_ms.saturating_add(retry_delay_ms(err.kind, 1));
-                            refresh_cookie_cache(&state, &account_id).await;
-                            let event = SendEvent::SendFailed {
-                                post_id,
-                                account_id,
-                                attempt: 1,
-                                retry_at_ms: retry_at,
-                                error: format!("[{:?}] {}", err.kind, err.message),
-                            };
-                            let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
-                            continue;
-                        }
-                    };
-                    let client = match QzoneClient::from_cookie_map(cookies) {
-                        Ok(client) => client,
-                        Err(err) => {
-                            debug_log!(
-                                "qzone client init failed: kind={:?} message={}",
-                                err.kind,
-                                err.message
-                            );
-                            let retry_at =
-                                started_at_ms.saturating_add(retry_delay_ms(err.kind, 1));
-                            refresh_cookie_cache(&state, &account_id).await;
-                            let event = SendEvent::SendFailed {
-                                post_id,
-                                account_id,
-                                attempt: 1,
-                                retry_at_ms: retry_at,
-                                error: format!("[{:?}] {}", err.kind, err.message),
-                            };
-                            let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
-                            continue;
-                        }
-                    };
-                    let images = match collect_batch_images(&assets, &blob_paths).await {
-                        Ok(images) => images,
-                        Err(err) => {
-                            debug_log!(
-                                "qzone collect images failed: kind={:?} message={}",
-                                err.kind,
-                                err.message
-                            );
-                            let retry_at =
-                                started_at_ms.saturating_add(retry_delay_ms(err.kind, 1));
-                            refresh_cookie_cache(&state, &account_id).await;
-                            let event = SendEvent::SendFailed {
-                                post_id,
-                                account_id,
-                                attempt: 1,
-                                retry_at_ms: retry_at,
-                                error: format!("[{:?}] {}", err.kind, err.message),
-                            };
-                            let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
-                            continue;
-                        }
-                    };
-                    if images.is_empty() {
-                        let err = QzoneError::unknown("empty images");
-                        let retry_at = started_at_ms.saturating_add(retry_delay_ms(err.kind, 1));
-                        let event = SendEvent::SendFailed {
-                            post_id,
-                            account_id,
-                            attempt: 1,
-                            retry_at_ms: retry_at,
-                            error: format!("[{:?}] {}", err.kind, err.message),
-                        };
-                        let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
-                        continue;
-                    }
                     let attempt = {
                         let mut guard = state.lock().await;
                         let entry = guard.attempts.entry(post_id).or_insert(0);
                         *entry += 1;
                         *entry
                     };
-                    debug_log!(
-                        "qzone publish attempt: post_id={} batch={} attempt={} images={} content_len={}",
-                        post_id.0,
-                        batch_posts.len(),
-                        attempt,
-                        images.len(),
-                        publish_text.len()
-                    );
-
-                    let chunk_size = if max_images_per_post > 0 {
-                        max_images_per_post
-                    } else {
-                        images.len().max(1)
-                    };
+                    let target_accounts =
+                        select_send_accounts(runtime.accounts_by_group.get(&group_id), &account_id);
+                    let mut final_account_id = account_id.clone();
                     let mut first_tid: Option<String> = None;
-                    let mut publish_error: Option<QzoneError> = None;
-                    for chunk in images.chunks(chunk_size) {
-                        match client.publish_emotion(&publish_text, chunk).await {
-                            Ok(tid) => {
+                    let mut failed: Option<(String, QzoneError)> = None;
+                    for target_account in target_accounts {
+                        match publish_batch_for_account(
+                            &state,
+                            &runtime,
+                            &group_id,
+                            &target_account,
+                            max_images_per_post,
+                            attempt,
+                            &assets,
+                            &blob_paths,
+                            &publish_text,
+                            #[cfg(debug_assertions)]
+                            emu_state.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(remote_id) => {
+                                final_account_id = target_account.clone();
                                 if first_tid.is_none() {
-                                    first_tid = Some(tid);
+                                    first_tid = remote_id.clone();
                                 }
+                                let account_event = SendEvent::SendAccountSucceeded {
+                                    post_id,
+                                    account_id: target_account,
+                                    finished_at_ms: started_at_ms,
+                                    remote_id,
+                                };
+                                let _ = cmd_tx
+                                    .send(Command::DriverEvent(Event::Send(account_event)))
+                                    .await;
                             }
                             Err(err) => {
-                                publish_error = Some(err);
+                                let failed_account_id = target_account.clone();
+                                let account_event = SendEvent::SendAccountFailed {
+                                    post_id,
+                                    account_id: target_account,
+                                    attempt,
+                                    error: format!("[{:?}] {}", err.kind, err.message),
+                                };
+                                let _ = cmd_tx
+                                    .send(Command::DriverEvent(Event::Send(account_event)))
+                                    .await;
+                                failed = Some((failed_account_id, err));
                                 break;
                             }
                         }
                     }
-                    if let Some(err) = publish_error {
-                        debug_log!(
-                            "qzone publish failed: post_id={} attempt={} kind={:?} message={}",
-                            post_id.0,
-                            attempt,
-                            err.kind,
-                            err.message
-                        );
+                    if let Some((failed_account_id, err)) = failed {
                         let retry_at =
                             started_at_ms.saturating_add(retry_delay_ms(err.kind, attempt));
-                        refresh_cookie_cache(&state, &account_id).await;
                         let event = SendEvent::SendFailed {
                             post_id,
-                            account_id,
+                            account_id: failed_account_id,
                             attempt,
                             retry_at_ms: retry_at,
                             error: format!("[{:?}] {}", err.kind, err.message),
@@ -802,12 +624,7 @@ pub fn spawn_qzone_sender(
                         continue;
                     }
 
-                    let _chunk_count = (images.len() + chunk_size - 1) / chunk_size;
-                    debug_log!(
-                        "qzone publish success: post_id={} chunks={}",
-                        post_id.0,
-                        _chunk_count
-                    );
+                    debug_log!("qzone publish success: post_id={} accounts=all", post_id.0);
                     let mut guard = state.lock().await;
                     guard.attempts.remove(&post_id);
                     drop(guard);
@@ -827,7 +644,7 @@ pub fn spawn_qzone_sender(
                         };
                         let event = SendEvent::SendSucceeded {
                             post_id: batch_post_id,
-                            account_id: account_id.clone(),
+                            account_id: final_account_id.clone(),
                             finished_at_ms: started_at_ms,
                             remote_id,
                         };
@@ -838,6 +655,129 @@ pub fn spawn_qzone_sender(
             }
         }
     })
+}
+
+fn select_send_accounts(accounts: Option<&Vec<String>>, fallback_account: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(accounts) = accounts {
+        for account_id in accounts {
+            let trimmed = account_id.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if seen.insert(trimmed.to_string()) {
+                out.push(trimmed.to_string());
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(fallback_account.to_string());
+    }
+    out
+}
+
+async fn publish_batch_for_account(
+    state: &Arc<Mutex<QzoneState>>,
+    runtime: &QzoneRuntimeConfig,
+    group_id: &str,
+    account_id: &str,
+    max_images_per_post: usize,
+    _attempt: u32,
+    assets: &[PostAssets],
+    blob_paths: &HashMap<BlobId, String>,
+    publish_text: &str,
+    #[cfg(debug_assertions)] emu_state: Option<&Arc<std::sync::Mutex<EmuQzoneState>>>,
+) -> Result<Option<String>, QzoneError> {
+    #[cfg(debug_assertions)]
+    if runtime.use_virt_qzone {
+        let Some(emu_state) = emu_state else {
+            return Err(QzoneError::unknown("missing emuqzone state"));
+        };
+        let images = collect_emuqzone_batch_images(assets, blob_paths)?;
+        if images.is_empty() {
+            return Err(QzoneError::unknown("empty images"));
+        }
+        let chunk_size = if max_images_per_post > 0 {
+            max_images_per_post
+        } else {
+            images.len().max(1)
+        };
+        debug_log!(
+            "emuqzone publish attempt: account={} attempt={} images={} content_len={}",
+            account_id,
+            _attempt,
+            images.len(),
+            publish_text.len()
+        );
+        for chunk in images.chunks(chunk_size) {
+            append_emuqzone_post(emu_state, publish_text.to_string(), chunk.to_vec());
+        }
+        return Ok(None);
+    }
+
+    let napcat = runtime
+        .napcat_by_group
+        .get(group_id)
+        .or_else(|| runtime.default_napcat.as_ref());
+    if napcat.is_none() {
+        return Err(QzoneError::unknown(format!(
+            "missing napcat config for group_id={}",
+            group_id
+        )));
+    }
+
+    let cookies = match get_cookies(state, account_id).await {
+        Ok(cookies) => cookies,
+        Err(err) => {
+            refresh_cookie_cache(state, account_id).await;
+            return Err(err);
+        }
+    };
+    let client = match QzoneClient::from_cookie_map(cookies) {
+        Ok(client) => client,
+        Err(err) => {
+            refresh_cookie_cache(state, account_id).await;
+            return Err(err);
+        }
+    };
+    let images = match collect_batch_images(assets, blob_paths).await {
+        Ok(images) => images,
+        Err(err) => {
+            refresh_cookie_cache(state, account_id).await;
+            return Err(err);
+        }
+    };
+    if images.is_empty() {
+        return Err(QzoneError::unknown("empty images"));
+    }
+    debug_log!(
+        "qzone publish attempt: account={} attempt={} images={} content_len={}",
+        account_id,
+        _attempt,
+        images.len(),
+        publish_text.len()
+    );
+    let chunk_size = if max_images_per_post > 0 {
+        max_images_per_post
+    } else {
+        images.len().max(1)
+    };
+    let mut first_tid: Option<String> = None;
+    for chunk in images.chunks(chunk_size) {
+        match client.publish_emotion(publish_text, chunk).await {
+            Ok(tid) => {
+                if first_tid.is_none() {
+                    first_tid = Some(tid);
+                }
+            }
+            Err(err) => {
+                refresh_cookie_cache(state, account_id).await;
+                return Err(err);
+            }
+        }
+    }
+    Ok(first_tid)
 }
 
 #[derive(Clone)]
@@ -1798,7 +1738,7 @@ async fn get_cookies(
 ) -> Result<HashMap<String, String>, QzoneError> {
     let now = now_ms();
     if let Some(cache) = state.lock().await.cookie_cache.as_ref() {
-        if now.saturating_sub(cache.fetched_at_ms) < 300_000 {
+        if cache.account_id == account_id && now.saturating_sub(cache.fetched_at_ms) < 300_000 {
             debug_log!(
                 "qzone cookies cache hit: age_ms={}",
                 now.saturating_sub(cache.fetched_at_ms)
@@ -1813,6 +1753,7 @@ async fn get_cookies(
         .map_err(QzoneError::network)?;
     let mut guard = state.lock().await;
     guard.cookie_cache = Some(CookieCache {
+        account_id: account_id.to_string(),
         cookies: cookies.clone(),
         fetched_at_ms: now,
     });
@@ -1828,6 +1769,7 @@ async fn refresh_cookie_cache(state: &Arc<Mutex<QzoneState>>, account_id: &str) 
             let now = now_ms();
             let mut guard = state.lock().await;
             guard.cookie_cache = Some(CookieCache {
+                account_id: account_id.to_string(),
                 cookies,
                 fetched_at_ms: now,
             });

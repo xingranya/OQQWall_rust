@@ -96,6 +96,8 @@ struct SendPlanInfo {
 struct SendingInfo {
     group_id: String,
     started_at_ms: i64,
+    batch_leader: PostId,
+    batch_label: String,
 }
 
 #[derive(Debug, Clone)]
@@ -319,11 +321,14 @@ fn build_state_from_view(view: &StateView) -> NapCatState {
         );
     }
     for (post_id, meta) in &view.sending {
+        let label = post_label(&state, *post_id);
         state.sending.insert(
             *post_id,
             SendingInfo {
                 group_id: meta.group_id.clone(),
                 started_at_ms: meta.started_at_ms,
+                batch_leader: *post_id,
+                batch_label: label,
             },
         );
     }
@@ -1359,18 +1364,34 @@ async fn build_action_from_event(
             ..
         }) => {
             let stacking_enabled = runtime.max_queue > 1;
-            let (label_plain, should_notify, audit_group_id) = {
+            let (batch_label, should_notify, audit_group_id) = {
                 let mut guard = state.lock().await;
-                guard.send_plans.remove(&post_id);
-                guard.sending.insert(
+                let leader_priority = guard
+                    .send_plans
+                    .remove(&post_id)
+                    .map(|plan| plan.priority)
+                    .unwrap_or(SendPriority::Normal);
+                let batch_posts = collect_batch_post_ids_for_notify(
+                    &guard,
+                    &group_id,
                     post_id,
-                    SendingInfo {
-                        group_id: group_id.clone(),
-                        started_at_ms,
-                    },
+                    leader_priority,
+                    runtime.max_queue,
                 );
+                let batch_label = post_batch_label(&guard, &batch_posts);
+                for batch_post_id in batch_posts {
+                    guard.sending.insert(
+                        batch_post_id,
+                        SendingInfo {
+                            group_id: group_id.clone(),
+                            started_at_ms,
+                            batch_leader: post_id,
+                            batch_label: batch_label.clone(),
+                        },
+                    );
+                }
                 (
-                    post_label_plain(&guard, post_id),
+                    batch_label,
                     group_id == runtime.group_id,
                     runtime.audit_group_id.clone(),
                 )
@@ -1381,7 +1402,7 @@ async fn build_action_from_event(
             let Some(audit_group_id) = audit_group_id else {
                 return None;
             };
-            let text = format!("{}正在发送中", label_plain);
+            let text = format!("{}正在发送中", batch_label);
             let payload = serde_json::json!({
                 "action": "send_group_msg",
                 "params": {
@@ -1391,27 +1412,26 @@ async fn build_action_from_event(
             });
             Some(payload.to_string())
         }
-        Event::Send(SendEvent::SendSucceeded {
-            post_id,
-            account_id,
-            ..
-        }) => {
-            let (group_id, audit_group_id, send_code, submitter_id) = {
+        Event::Send(SendEvent::SendSucceeded { post_id, .. }) => {
+            let (group_id, send_code, submitter_id, _batch_label, _notify_group) = {
                 let mut guard = state.lock().await;
-                let group_id = guard
-                    .sending
-                    .remove(&post_id)
-                    .map(|info| info.group_id)
+                let sending_info = guard.sending.remove(&post_id);
+                let group_id = sending_info
+                    .as_ref()
+                    .map(|info| info.group_id.clone())
                     .or_else(|| guard.post_group.get(&post_id).cloned())
                     .unwrap_or_else(|| runtime.group_id.clone());
+                let batch_label = sending_info
+                    .as_ref()
+                    .map(|info| info.batch_label.clone())
+                    .unwrap_or_else(|| post_label(&guard, post_id));
+                let notify_group = sending_info
+                    .as_ref()
+                    .map(|info| info.batch_leader == post_id)
+                    .unwrap_or(true);
                 let send_code = post_code_text(&guard, post_id);
                 let submitter_id = resolve_post_submitter(&guard, post_id);
-                (
-                    group_id,
-                    runtime.audit_group_id.clone(),
-                    send_code,
-                    submitter_id,
-                )
+                (group_id, send_code, submitter_id, batch_label, notify_group)
             };
             if group_id.is_empty() || group_id != runtime.group_id {
                 return None;
@@ -1427,14 +1447,76 @@ async fn build_action_from_event(
                 });
                 let _ = out_tx.send(payload.to_string()).await;
             }
-            let Some(audit_group_id) = audit_group_id else {
+            None
+        }
+        Event::Send(SendEvent::SendAccountSucceeded {
+            post_id,
+            account_id,
+            ..
+        }) => {
+            let (group_id, batch_label) = {
+                let guard = state.lock().await;
+                let group_id = guard
+                    .sending
+                    .get(&post_id)
+                    .map(|info| info.group_id.clone())
+                    .or_else(|| guard.post_group.get(&post_id).cloned())
+                    .unwrap_or_else(|| runtime.group_id.clone());
+                let batch_label = guard
+                    .sending
+                    .get(&post_id)
+                    .map(|info| info.batch_label.clone())
+                    .unwrap_or_else(|| post_label(&guard, post_id));
+                (group_id, batch_label)
+            };
+            if group_id.is_empty() || group_id != runtime.group_id {
+                return None;
+            }
+            let Some(audit_group_id) = runtime.audit_group_id.as_ref() else {
                 return None;
             };
-            let text = format!("{}已发送", account_id);
+            let text = format!("{} {}已发送", batch_label, account_id);
             let payload = serde_json::json!({
                 "action": "send_group_msg",
                 "params": {
-                    "group_id": json_id(&audit_group_id),
+                    "group_id": json_id(audit_group_id),
+                    "message": message_segments_from_text(&text)
+                }
+            });
+            Some(payload.to_string())
+        }
+        Event::Send(SendEvent::SendAccountFailed {
+            post_id,
+            account_id,
+            error,
+            ..
+        }) => {
+            let (group_id, batch_label) = {
+                let guard = state.lock().await;
+                let group_id = guard
+                    .sending
+                    .get(&post_id)
+                    .map(|info| info.group_id.clone())
+                    .or_else(|| guard.post_group.get(&post_id).cloned())
+                    .unwrap_or_else(|| runtime.group_id.clone());
+                let batch_label = guard
+                    .sending
+                    .get(&post_id)
+                    .map(|info| info.batch_label.clone())
+                    .unwrap_or_else(|| post_label(&guard, post_id));
+                (group_id, batch_label)
+            };
+            if group_id.is_empty() || group_id != runtime.group_id {
+                return None;
+            }
+            let Some(audit_group_id) = runtime.audit_group_id.as_ref() else {
+                return None;
+            };
+            let text = format!("{} {}发送失败：{}", batch_label, account_id, error);
+            let payload = serde_json::json!({
+                "action": "send_group_msg",
+                "params": {
+                    "group_id": json_id(audit_group_id),
                     "message": message_segments_from_text(&text)
                 }
             });
@@ -1449,10 +1531,26 @@ async fn build_action_from_event(
         }) => {
             let (group_id, label) = {
                 let mut guard = state.lock().await;
-                let group_id = guard
-                    .sending
-                    .remove(&post_id)
-                    .map(|info| info.group_id)
+                let sending_info = guard.sending.remove(&post_id);
+                if let Some(ref info) = sending_info {
+                    let extra_ids = guard
+                        .sending
+                        .iter()
+                        .filter_map(|(id, item)| {
+                            if item.batch_leader == info.batch_leader {
+                                Some(*id)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    for id in extra_ids {
+                        guard.sending.remove(&id);
+                    }
+                }
+                let group_id = sending_info
+                    .as_ref()
+                    .map(|info| info.group_id.clone())
                     .or_else(|| guard.post_group.get(&post_id).cloned())
                     .unwrap_or_default();
                 let label = post_label(&guard, post_id);
@@ -1483,10 +1581,26 @@ async fn build_action_from_event(
         Event::Send(SendEvent::SendGaveUp { post_id, reason }) => {
             let (group_id, label) = {
                 let mut guard = state.lock().await;
-                let group_id = guard
-                    .sending
-                    .remove(&post_id)
-                    .map(|info| info.group_id)
+                let sending_info = guard.sending.remove(&post_id);
+                if let Some(ref info) = sending_info {
+                    let extra_ids = guard
+                        .sending
+                        .iter()
+                        .filter_map(|(id, item)| {
+                            if item.batch_leader == info.batch_leader {
+                                Some(*id)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    for id in extra_ids {
+                        guard.sending.remove(&id);
+                    }
+                }
+                let group_id = sending_info
+                    .as_ref()
+                    .map(|info| info.group_id.clone())
                     .or_else(|| guard.post_group.get(&post_id).cloned())
                     .unwrap_or_default();
                 let label = post_label(&guard, post_id);
@@ -3093,6 +3207,44 @@ fn build_blacklist_list_text(state: &NapCatState, group_id: &str) -> String {
     lines.join("\n")
 }
 
+fn collect_batch_post_ids_for_notify(
+    state: &NapCatState,
+    group_id: &str,
+    leader: PostId,
+    leader_priority: SendPriority,
+    max_queue: usize,
+) -> Vec<PostId> {
+    if max_queue <= 1 || leader_priority != SendPriority::Normal {
+        return vec![leader];
+    }
+    let mut queued = state
+        .send_plans
+        .iter()
+        .filter(|(_, plan)| plan.group_id == group_id && plan.priority == leader_priority)
+        .map(|(post_id, plan)| (plan.seq, *post_id))
+        .collect::<Vec<_>>();
+    queued.sort_by_key(|(seq, post_id)| (*seq, post_id.0));
+    let mut out = Vec::with_capacity(queued.len().saturating_add(1));
+    out.push(leader);
+    for (_, post_id) in queued {
+        if post_id != leader {
+            out.push(post_id);
+        }
+    }
+    out
+}
+
+fn post_batch_label(state: &NapCatState, post_ids: &[PostId]) -> String {
+    if post_ids.is_empty() {
+        return String::new();
+    }
+    post_ids
+        .iter()
+        .map(|post_id| post_label(state, *post_id))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn post_label(state: &NapCatState, post_id: PostId) -> String {
     let review_code = state.post_review_code.get(&post_id).copied();
     let external_code = state.post_external_code.get(&post_id).copied();
@@ -3943,5 +4095,47 @@ mod tests {
                 serde_json::json!({"type": "text", "data": {"text": "!"}}),
             ]
         );
+    }
+
+    #[test]
+    fn collect_batch_post_ids_for_notify_matches_seq_order() {
+        let leader = PostId::from_u128(1);
+        let second = PostId::from_u128(2);
+        let third = PostId::from_u128(3);
+        let mut state = NapCatState::default();
+        state.send_plans.insert(
+            second,
+            SendPlanInfo {
+                group_id: "g".to_string(),
+                not_before_ms: 0,
+                priority: SendPriority::Normal,
+                seq: 11,
+            },
+        );
+        state.send_plans.insert(
+            third,
+            SendPlanInfo {
+                group_id: "g".to_string(),
+                not_before_ms: 0,
+                priority: SendPriority::Normal,
+                seq: 12,
+            },
+        );
+        let batch = collect_batch_post_ids_for_notify(&state, "g", leader, SendPriority::Normal, 3);
+        assert_eq!(batch, vec![leader, second, third]);
+    }
+
+    #[test]
+    fn post_batch_label_joins_codes_without_spaces() {
+        let first = PostId::from_u128(10);
+        let second = PostId::from_u128(11);
+        let mut state = NapCatState::default();
+        state.post_external_code.insert(first, 1193);
+        state.post_review_code.insert(first, 102);
+        state.post_external_code.insert(second, 1094);
+        state.post_review_code.insert(second, 103);
+
+        let label = post_batch_label(&state, &[first, second]);
+        assert_eq!(label, "#1193/102,#1094/103");
     }
 }

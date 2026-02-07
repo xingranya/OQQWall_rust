@@ -326,6 +326,18 @@ pub enum SendEvent {
         account_id: AccountId,
         started_at_ms: TimestampMs,
     },
+    SendAccountSucceeded {
+        post_id: PostId,
+        account_id: AccountId,
+        finished_at_ms: TimestampMs,
+        remote_id: Option<RemotePostId>,
+    },
+    SendAccountFailed {
+        post_id: PostId,
+        account_id: AccountId,
+        attempt: u32,
+        error: String,
+    },
     SendSucceeded {
         post_id: PostId,
         account_id: AccountId,
