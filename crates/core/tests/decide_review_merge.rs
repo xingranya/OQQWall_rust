@@ -1,6 +1,4 @@
-use oqqwall_rust_core::event::{
-    DraftEvent, Event, IngressEvent, ReviewDecision, ReviewEvent,
-};
+use oqqwall_rust_core::event::{DraftEvent, Event, IngressEvent, ReviewDecision, ReviewEvent};
 use oqqwall_rust_core::{
     Command, CoreConfig, Draft, DraftBlock, EventEnvelope, Id128, IngressMessage, ReviewAction,
     ReviewActionCommand, StateView,

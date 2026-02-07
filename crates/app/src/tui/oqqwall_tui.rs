@@ -7,7 +7,9 @@ use crossterm::event::{
     KeyModifiers, MouseButton, MouseEvent,
 };
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Modifier, Style};
@@ -123,7 +125,9 @@ pub fn run_cli(args: &[String]) -> io::Result<()> {
 fn print_usage() {
     println!("Usage: OQQWall_RUST --tui [--config <path>] [--data-dir <path>]");
     println!("Keys: 1/2 switch tabs, q quit");
-    println!("Config: arrows move, Tab focus, enter/e edit, space toggle, a add key, g add group, x delete group, s save, r reload");
+    println!(
+        "Config: arrows move, Tab focus, enter/e edit, space toggle, a add key, g add group, x delete group, s save, r reload"
+    );
     println!("Lists: enter/e edit, a add, d delete, Tab switch col, Esc back");
     println!("Journal: r reload, t toggle view, u users, a all, arrows nav, q quit");
 }
@@ -140,7 +144,11 @@ fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -198,8 +206,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
 }
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent) {
-    if matches!(mouse.kind, crossterm::event::MouseEventKind::Down(MouseButton::Left))
-        && rect_contains(app.layout.bar, mouse.column, mouse.row)
+    if matches!(
+        mouse.kind,
+        crossterm::event::MouseEventKind::Down(MouseButton::Left)
+    ) && rect_contains(app.layout.bar, mouse.column, mouse.row)
     {
         if app.layout.config.contains(mouse.column) {
             app.tab = MainTab::Config;

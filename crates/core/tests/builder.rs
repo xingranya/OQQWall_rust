@@ -1,6 +1,6 @@
 use oqqwall_rust_core::{
-    build_draft_from_messages, DraftBlock, IngressAttachment, IngressMessage, MediaKind,
-    MediaReference,
+    DraftBlock, IngressAttachment, IngressMessage, MediaKind, MediaReference,
+    build_draft_from_messages,
 };
 
 #[test]

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::future::Future;
 use std::fs;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,19 +16,19 @@ use oqqwall_rust_core::event::{
     ReviewEvent, ScheduleEvent, SendEvent, SendPriority,
 };
 use oqqwall_rust_core::ids::{BlobId, ExternalCode, IngressId, PostId, ReviewCode, ReviewId};
-use oqqwall_rust_core::{derive_blob_id, derive_ingress_id, Command, IngressCommand, StateView};
+use oqqwall_rust_core::{Command, IngressCommand, StateView, derive_blob_id, derive_ingress_id};
 use oqqwall_rust_infra::{LocalJournal, SnapshotStore};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use serde_json::{json, Value};
+use base64::engine::general_purpose::STANDARD;
+use serde_json::{Value, json};
 
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::net::TcpListener;
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use tokio::net::TcpListener;
 use tokio_tungstenite::{
     accept_hdr_async,
     tungstenite::handshake::server::{ErrorResponse, Request, Response},
@@ -71,11 +71,11 @@ const MAX_FORWARD_DEPTH: u32 = 4;
 const FRIEND_APPROVE_DELAY_MAX_SEC: u64 = 240;
 const FRIEND_NOTIFY_DELAY_SEC: u64 = 30;
 const FRIEND_REQUEST_ID_MAX_LEN: usize = 20;
-const FRIEND_SUPPRESS_REMOVE_CHARS: &str = r#"　“”‘’《》〈〉【】。，：；？！（）、「」『』—［］＂＇"'`~!@#$%^&*()_+-={}[]|:;<>?,./"#;
+const FRIEND_SUPPRESS_REMOVE_CHARS: &str =
+    r#"　“”‘’《》〈〉【】。，：；？！（）、「」『』—［］＂＇"'`~!@#$%^&*()_+-={}[]|:;<>?,./"#;
 static STARTUP_NOTICE_SENT: OnceLock<std::sync::Mutex<HashSet<String>>> = OnceLock::new();
-static WS_SESSIONS: OnceLock<std::sync::Mutex<HashMap<String, NapCatWsSession>>> =
-    OnceLock::new();
-static GROUP_ACCOUNTS: OnceLock<std::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
+static WS_SESSIONS: OnceLock<std::sync::Mutex<HashMap<String, NapCatWsSession>>> = OnceLock::new();
+static GROUP_ACCOUNTS: OnceLock<std::sync::Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 struct ReviewInfo {
@@ -135,7 +135,10 @@ struct AuditMessage {
 
 #[derive(Debug)]
 enum PendingAction {
-    SendAuditMessage { review_id: ReviewId, attempt: u32 },
+    SendAuditMessage {
+        review_id: ReviewId,
+        attempt: u32,
+    },
     WsRequest {
         resp_tx: oneshot::Sender<Result<Value, String>>,
     },
@@ -195,20 +198,14 @@ fn load_state_view_cached() -> StateView {
             let journal = match LocalJournal::open(&data_dir) {
                 Ok(journal) => journal,
                 Err(_err) => {
-                    debug_log!(
-                        "napcat preload skipped: journal open failed: {}",
-                        _err
-                    );
+                    debug_log!("napcat preload skipped: journal open failed: {}", _err);
                     return StateView::default();
                 }
             };
             let snapshot = match SnapshotStore::open(&data_dir) {
                 Ok(snapshot) => snapshot,
                 Err(_err) => {
-                    debug_log!(
-                        "napcat preload skipped: snapshot open failed: {}",
-                        _err
-                    );
+                    debug_log!("napcat preload skipped: snapshot open failed: {}", _err);
                     return StateView::default();
                 }
             };
@@ -517,6 +514,7 @@ pub fn spawn_napcat_ws(
         let mut account_map: HashMap<String, RuntimeEntry> = HashMap::new();
         let mut fallback_entry: Option<RuntimeEntry> = None;
         for runtime in runtimes {
+            set_group_accounts(&runtime.group_id, runtime.accounts.clone());
             if runtime.accounts.is_empty() {
                 let entry = RuntimeEntry {
                     runtime: runtime.clone(),
@@ -590,35 +588,32 @@ pub fn spawn_napcat_ws(
                 let capture = Arc::clone(&account_capture);
                 let account_map_cb = Arc::clone(&account_map);
                 let fallback_entry_cb = fallback_entry.clone();
-                let accept_result = accept_hdr_async(stream, move |req: &Request, resp: Response| {
-                    let account = extract_account_from_path(req.uri().path(), &base_path);
-                    *capture.lock().unwrap() = account.clone();
-                    let Some(account) = account else {
-                        return reject_response(StatusCode::NOT_FOUND, "missing account");
-                    };
-                    let entry = account_map_cb
-                        .get(&account)
-                        .cloned()
-                        .or_else(|| fallback_entry_cb.clone());
-                    let Some(entry) = entry else {
-                        return reject_response(StatusCode::NOT_FOUND, "unknown account");
-                    };
-                    if let Some(expected) = entry.runtime.napcat.access_token.as_ref() {
-                        if request_token(req).as_deref() != Some(expected.as_str()) {
-                            return reject_response(StatusCode::UNAUTHORIZED, "invalid token");
+                let accept_result =
+                    accept_hdr_async(stream, move |req: &Request, resp: Response| {
+                        let account = extract_account_from_path(req.uri().path(), &base_path);
+                        *capture.lock().unwrap() = account.clone();
+                        let Some(account) = account else {
+                            return reject_response(StatusCode::NOT_FOUND, "missing account");
+                        };
+                        let entry = account_map_cb
+                            .get(&account)
+                            .cloned()
+                            .or_else(|| fallback_entry_cb.clone());
+                        let Some(entry) = entry else {
+                            return reject_response(StatusCode::NOT_FOUND, "unknown account");
+                        };
+                        if let Some(expected) = entry.runtime.napcat.access_token.as_ref() {
+                            if request_token(req).as_deref() != Some(expected.as_str()) {
+                                return reject_response(StatusCode::UNAUTHORIZED, "invalid token");
+                            }
                         }
-                    }
-                    Ok(resp)
-                })
-                .await;
+                        Ok(resp)
+                    })
+                    .await;
                 let mut ws_stream = match accept_result {
                     Ok(ws_stream) => ws_stream,
                     Err(_err) => {
-                        debug_log!(
-                            "napcat ws handshake failed: addr={} err={:?}",
-                            _addr,
-                            _err
-                        );
+                        debug_log!("napcat ws handshake failed: addr={} err={:?}", _addr, _err);
                         return;
                     }
                 };
@@ -660,8 +655,7 @@ pub fn spawn_napcat_ws(
                 }
                 println!(
                     "NapCat WS 已连接: account_id={} group_id={}",
-                    account,
-                    entry.runtime.group_id
+                    account, entry.runtime.group_id
                 );
                 run_napcat_session(
                     cmd_tx,
@@ -702,12 +696,14 @@ async fn run_napcat_session(
             state: Arc::clone(&state_ref),
         },
     );
-    register_group_account(&runtime.group_id, &account_id);
+    notify_account_online_change(&runtime, &account_id, true).await;
     let startup_group_id = runtime
         .audit_group_id
         .as_deref()
         .unwrap_or(&runtime.group_id);
-    if should_send_startup_notice(startup_group_id) {
+    if is_effective_primary_account(&runtime, &account_id)
+        && should_send_startup_notice(startup_group_id)
+    {
         send_group_text(&out_tx, startup_group_id, "系统已启动").await;
     }
 
@@ -728,6 +724,7 @@ async fn run_napcat_session(
     let runtime_read = runtime.clone();
     let state_read = Arc::clone(&state_ref);
     let out_tx_read = out_tx.clone();
+    let account_id_read = account_id.clone();
     let reader = tokio::spawn(async move {
         while let Some(msg) = ws_read.next().await {
             let msg = match msg {
@@ -754,16 +751,20 @@ async fn run_napcat_session(
             };
             if let Some(echo) = value.get("echo").and_then(|v| v.as_str()) {
                 if let Some(event) = handle_action_response(&state_read, echo, &value).await {
-                    debug_log!(
-                        "napcat ws action response: echo={} event={:?}",
-                        echo,
-                        event
-                    );
+                    debug_log!("napcat ws action response: echo={} event={:?}", echo, event);
                     let _ = cmd_tx_read.send(Command::DriverEvent(event)).await;
                 }
                 continue;
             }
-            if let Some(command) = parse_inbound_event(&runtime_read, &state_read, &out_tx_read, &value).await {
+            if let Some(command) = parse_inbound_event(
+                &runtime_read,
+                &state_read,
+                &out_tx_read,
+                &account_id_read,
+                &value,
+            )
+            .await
+            {
                 debug_log!("napcat ws inbound command: {:?}", command);
                 let _ = cmd_tx_read.send(command).await;
             }
@@ -774,6 +775,7 @@ async fn run_napcat_session(
     let state_bus = Arc::clone(&state_ref);
     let runtime_bus = runtime.clone();
     let out_tx_bus = out_tx.clone();
+    let account_id_bus = account_id.clone();
     let bus_task = tokio::spawn(async move {
         loop {
             let env = match bus_task_rx.recv().await {
@@ -782,7 +784,14 @@ async fn run_napcat_session(
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
             };
 
-            let action = build_action_from_event(&runtime_bus, &state_bus, &out_tx_bus, env.event).await;
+            let action = build_action_from_event(
+                &runtime_bus,
+                &state_bus,
+                &out_tx_bus,
+                &account_id_bus,
+                env.event,
+            )
+            .await;
             if let Some(action) = action {
                 debug_log!(
                     "napcat ws outbound action: group_id={} bytes={}",
@@ -799,7 +808,7 @@ async fn run_napcat_session(
 
     let _ = tokio::join!(writer, reader, bus_task);
     unregister_ws_session(&account_id);
-    unregister_group_account(&runtime.group_id, &account_id);
+    notify_account_online_change(&runtime, &account_id, false).await;
 }
 
 fn should_send_startup_notice(group_id: &str) -> bool {
@@ -815,7 +824,7 @@ fn ws_sessions() -> &'static std::sync::Mutex<HashMap<String, NapCatWsSession>> 
     WS_SESSIONS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-fn group_accounts() -> &'static std::sync::Mutex<HashMap<String, String>> {
+fn group_accounts() -> &'static std::sync::Mutex<HashMap<String, Vec<String>>> {
     GROUP_ACCOUNTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
@@ -843,22 +852,12 @@ fn lookup_ws_session(account_id: &str) -> Option<NapCatWsSession> {
     guard.get(account_id).cloned()
 }
 
-fn register_group_account(group_id: &str, account_id: &str) {
+fn set_group_accounts(group_id: &str, accounts: Vec<String>) {
     let mut guard = match group_accounts().lock() {
         Ok(guard) => guard,
         Err(err) => err.into_inner(),
     };
-    guard.insert(group_id.to_string(), account_id.to_string());
-}
-
-fn unregister_group_account(group_id: &str, account_id: &str) {
-    let mut guard = match group_accounts().lock() {
-        Ok(guard) => guard,
-        Err(err) => err.into_inner(),
-    };
-    if guard.get(group_id).map(|v| v == account_id).unwrap_or(false) {
-        guard.remove(group_id);
-    }
+    guard.insert(group_id.to_string(), accounts);
 }
 
 pub fn napcat_account_for_group(group_id: &str) -> Option<String> {
@@ -866,7 +865,55 @@ pub fn napcat_account_for_group(group_id: &str) -> Option<String> {
         Ok(guard) => guard,
         Err(err) => err.into_inner(),
     };
-    guard.get(group_id).cloned()
+    let Some(accounts) = guard.get(group_id) else {
+        return None;
+    };
+    for account_id in accounts {
+        if lookup_ws_session(account_id).is_some() {
+            return Some(account_id.clone());
+        }
+    }
+    None
+}
+
+fn effective_primary_account(runtime: &NapCatRuntimeConfig) -> Option<String> {
+    for account_id in &runtime.accounts {
+        if lookup_ws_session(account_id).is_some() {
+            return Some(account_id.clone());
+        }
+    }
+    None
+}
+
+fn is_effective_primary_account(runtime: &NapCatRuntimeConfig, account_id: &str) -> bool {
+    effective_primary_account(runtime).is_some_and(|value| value == account_id)
+}
+
+fn account_status_text(account_id: &str, online: bool) -> String {
+    if online {
+        format!("账号{}已上线", account_id)
+    } else {
+        format!("账号{}已离线", account_id)
+    }
+}
+
+async fn notify_account_online_change(
+    runtime: &NapCatRuntimeConfig,
+    changed_account_id: &str,
+    online: bool,
+) {
+    let Some(primary_account_id) = effective_primary_account(runtime) else {
+        return;
+    };
+    let Some(session) = lookup_ws_session(&primary_account_id) else {
+        return;
+    };
+    let target_group_id = runtime
+        .audit_group_id
+        .as_deref()
+        .unwrap_or(&runtime.group_id);
+    let text = account_status_text(changed_account_id, online);
+    send_group_text(&session.out_tx, target_group_id, &text).await;
 }
 
 pub async fn napcat_ws_request(
@@ -911,8 +958,12 @@ async fn build_action_from_event(
     runtime: &NapCatRuntimeConfig,
     state: &Arc<Mutex<NapCatState>>,
     out_tx: &mpsc::Sender<String>,
+    account_id: &str,
     event: Event,
 ) -> Option<String> {
+    if !is_effective_primary_account(runtime, account_id) {
+        return None;
+    }
     match event {
         Event::Ingress(IngressEvent::InputStatusUpdated { .. }) => None,
         Event::Ingress(IngressEvent::MessageAccepted {
@@ -970,11 +1021,7 @@ async fn build_action_from_event(
             review_code,
         }) => {
             let mut guard = state.lock().await;
-            let group_id = guard
-                .post_group
-                .get(&post_id)
-                .cloned()
-                .unwrap_or_default();
+            let group_id = guard.post_group.get(&post_id).cloned().unwrap_or_default();
             guard.review_info.insert(
                 review_id,
                 ReviewInfo {
@@ -1026,11 +1073,7 @@ async fn build_action_from_event(
                 review_code
             );
             let mut guard = state.lock().await;
-            let group_id = guard
-                .post_group
-                .get(&post_id)
-                .cloned()
-                .unwrap_or_default();
+            let group_id = guard.post_group.get(&post_id).cloned().unwrap_or_default();
             guard.review_info.insert(
                 review_id,
                 ReviewInfo {
@@ -1457,11 +1500,7 @@ async fn build_action_from_event(
                 guard.review_submitter.insert(review_id, user_id);
             }
             let preview = rendered_png_preview(info.post_id);
-            let is_safe = guard
-                .post_safe
-                .get(&info.post_id)
-                .copied()
-                .unwrap_or(true);
+            let is_safe = guard.post_safe.get(&info.post_id).copied().unwrap_or(true);
             let summary = build_audit_message(
                 info.review_code,
                 info.post_id,
@@ -1474,10 +1513,7 @@ async fn build_action_from_event(
             let echo = next_echo(&mut guard);
             guard.pending.insert(
                 echo.clone(),
-                PendingAction::SendAuditMessage {
-                    review_id,
-                    attempt,
-                },
+                PendingAction::SendAuditMessage { review_id, attempt },
             );
 
             let mut message = message_segments_from_text(&summary.text);
@@ -1534,8 +1570,7 @@ async fn handle_action_response(
                 if !msg.is_empty() {
                     error.push_str(&format!(" msg={}", msg));
                 }
-                let retry_at_ms =
-                    now_ms().saturating_add(review_retry_delay_ms(attempt));
+                let retry_at_ms = now_ms().saturating_add(review_retry_delay_ms(attempt));
                 return Some(Event::Review(ReviewEvent::ReviewPublishFailed {
                     review_id,
                     attempt,
@@ -1549,8 +1584,7 @@ async fn handle_action_response(
                 .and_then(|data| data.get("message_id"))
                 .and_then(value_to_string);
             let Some(message_id) = message_id else {
-                let retry_at_ms =
-                    now_ms().saturating_add(review_retry_delay_ms(attempt));
+                let retry_at_ms = now_ms().saturating_add(review_retry_delay_ms(attempt));
                 return Some(Event::Review(ReviewEvent::ReviewPublishFailed {
                     review_id,
                     attempt,
@@ -1615,6 +1649,7 @@ async fn parse_inbound_event(
     runtime: &NapCatRuntimeConfig,
     state: &Arc<Mutex<NapCatState>>,
     out_tx: &mpsc::Sender<String>,
+    account_id: &str,
     value: &Value,
 ) -> Option<Command> {
     let post_type = value.get("post_type").and_then(|v| v.as_str())?;
@@ -1636,8 +1671,7 @@ async fn parse_inbound_event(
         message_type
     );
     let user_id = value_opt_to_string(value.get("user_id"))?;
-    let self_id =
-        value_opt_to_string(value.get("self_id")).unwrap_or_else(|| "napcat".to_string());
+    let self_id = value_opt_to_string(value.get("self_id")).unwrap_or_else(|| "napcat".to_string());
     let message_id =
         value_opt_to_string(value.get("message_id")).unwrap_or_else(|| "0".to_string());
     let sender_name = extract_sender_name(value);
@@ -1654,6 +1688,10 @@ async fn parse_inbound_event(
     }
 
     if message_type == "group" {
+        if !is_effective_primary_account(runtime, account_id) {
+            return None;
+        }
+        let message_value = value.get("message");
         let mut forward_resolver = if message_has_forward(value.get("message")) {
             Some(ForwardResolver {
                 account_id: self_id.clone(),
@@ -1663,35 +1701,45 @@ async fn parse_inbound_event(
         } else {
             None
         };
-        let (extracted, reply_id) =
-            extract_message(value.get("message"), &mut forward_resolver).await;
+        let (extracted, reply_id) = extract_message(message_value, &mut forward_resolver).await;
         let ExtractedMessage {
             text,
             summary_text: _,
             attachments: _attachments,
         } = extracted;
-	        debug_log!(
-	            "napcat inbound content: text_len={} attachments={} reply_id_present={}",
-	            text.len(),
-	            _attachments.len(),
-	            reply_id.is_some()
-	        );
-	        let chat_group_id = value_opt_to_string(value.get("group_id"))?;
-	        let is_audit_group =
-	            runtime.audit_group_id.as_deref() == Some(chat_group_id.as_str());
-	        if runtime.audit_group_id.is_some() && !is_audit_group {
-	            return None;
-	        }
-	        if let Some(command) = parse_audit_command(&text, reply_id.is_some()) {
-	            if !is_admin_sender(value) {
-	                send_group_text(out_tx, &chat_group_id, "无权限执行指令").await;
-	                return None;
-	            }
-	            match command {
-	                AuditCommand::Global(GlobalAction::Help) => {
-	                    send_group_text(out_tx, &chat_group_id, "已收到指令").await;
-	                    send_group_text(out_tx, &chat_group_id, HELP_TEXT).await;
-	                    return None;
+        debug_log!(
+            "napcat inbound content: text_len={} attachments={} reply_id_present={}",
+            text.len(),
+            _attachments.len(),
+            reply_id.is_some()
+        );
+        let chat_group_id = value_opt_to_string(value.get("group_id"))?;
+        let is_audit_group = runtime.audit_group_id.as_deref() == Some(chat_group_id.as_str());
+        if runtime.audit_group_id.is_some() && !is_audit_group {
+            return None;
+        }
+        let mentions_self = message_mentions_self(message_value, &self_id);
+        let reply_bound = if let Some(reply_msg_id) = reply_id.as_ref() {
+            let guard = state.lock().await;
+            guard
+                .audit_msg_to_review
+                .contains_key(reply_msg_id.as_str())
+        } else {
+            false
+        };
+        if let Some(command) = parse_audit_command(&text, reply_id.is_some()) {
+            if !command_context_allowed(&command, mentions_self, reply_bound) {
+                return None;
+            }
+            if !is_admin_sender(value) {
+                send_group_text(out_tx, &chat_group_id, "无权限执行指令").await;
+                return None;
+            }
+            match command {
+                AuditCommand::Global(GlobalAction::Help) => {
+                    send_group_text(out_tx, &chat_group_id, "已收到指令").await;
+                    send_group_text(out_tx, &chat_group_id, HELP_TEXT).await;
+                    return None;
                 }
                 AuditCommand::Global(GlobalAction::PendingList) => {
                     let pending_text = {
@@ -1755,7 +1803,10 @@ async fn parse_inbound_event(
                         tz_offset_minutes: runtime.tz_offset_minutes,
                     }));
                 }
-                AuditCommand::Review { review_code, action } => {
+                AuditCommand::Review {
+                    review_code,
+                    action,
+                } => {
                     return parse_review_command(
                         runtime,
                         state,
@@ -1795,9 +1846,7 @@ async fn parse_inbound_event(
             summary_text,
             attachments,
         } = extract_message_lite(value.get("message"));
-        if raw_message
-            .map(|raw| raw.is_empty())
-            .unwrap_or(true)
+        if raw_message.map(|raw| raw.is_empty()).unwrap_or(true)
             && is_auto_reply_message(&summary_text)
         {
             debug_log!("napcat inbound ignored private system message");
@@ -1879,18 +1928,12 @@ async fn handle_friend_request(
         return;
     }
 
-    let window_ms = runtime
-        .friend_request_window_sec
-        .saturating_mul(1000) as i64;
+    let window_ms = runtime.friend_request_window_sec.saturating_mul(1000) as i64;
     if window_ms > 0 {
         let now_ms = now_ms();
         let mut guard = state.lock().await;
-        if !should_process_friend_request(
-            &mut guard.friend_req_cache,
-            &user_id,
-            now_ms,
-            window_ms,
-        ) {
+        if !should_process_friend_request(&mut guard.friend_req_cache, &user_id, now_ms, window_ms)
+        {
             debug_log!(
                 "napcat friend request ignored: duplicate user_id={} window_sec={}",
                 user_id,
@@ -1910,10 +1953,13 @@ async fn handle_friend_request(
     }
 
     let approve_delay_sec = friend_request_delay_sec();
-    let friend_add_message = runtime
-        .friend_add_message
-        .clone()
-        .and_then(|msg| if msg.trim().is_empty() { None } else { Some(msg) });
+    let friend_add_message = runtime.friend_add_message.clone().and_then(|msg| {
+        if msg.trim().is_empty() {
+            None
+        } else {
+            Some(msg)
+        }
+    });
     let out_tx = out_tx.clone();
     tokio::spawn(async move {
         if approve_delay_sec > 0 {
@@ -1948,9 +1994,7 @@ fn is_auto_reply_message(text: &str) -> bool {
 }
 
 fn is_digits(value: &str, max_len: usize) -> bool {
-    !value.is_empty()
-        && value.len() <= max_len
-        && value.chars().all(|ch| ch.is_ascii_digit())
+    !value.is_empty() && value.len() <= max_len && value.chars().all(|ch| ch.is_ascii_digit())
 }
 
 fn is_digits_unbounded(value: &str) -> bool {
@@ -2055,11 +2099,22 @@ fn parse_notice_event(runtime: &NapCatRuntimeConfig, value: &Value) -> Option<Co
         return None;
     }
 
-    let user_id = value_opt_to_string(value.get("user_id"))
-        .or_else(|| value.get("data").and_then(|data| value_opt_to_string(data.get("user_id"))))?;
+    let user_id = value_opt_to_string(value.get("user_id")).or_else(|| {
+        value
+            .get("data")
+            .and_then(|data| value_opt_to_string(data.get("user_id")))
+    })?;
     let status_raw = value_opt_to_u8(value.get("event_type"))
-        .or_else(|| value.get("status").and_then(|status| value_opt_to_u8(status.get("event_type"))))
-        .or_else(|| value.get("data").and_then(|data| value_opt_to_u8(data.get("event_type"))))?;
+        .or_else(|| {
+            value
+                .get("status")
+                .and_then(|status| value_opt_to_u8(status.get("event_type")))
+        })
+        .or_else(|| {
+            value
+                .get("data")
+                .and_then(|data| value_opt_to_u8(data.get("event_type")))
+        })?;
     let status = match status_raw {
         0 => InputStatusKind::Speaking,
         1 => InputStatusKind::Typing,
@@ -2155,18 +2210,16 @@ fn extract_message_chunks<'a>(
                         }
                         "reply" => {
                             if capture_reply {
-                                if let Some(id) = data
-                                    .and_then(|d| d.get("id"))
-                                    .and_then(value_to_string)
+                                if let Some(id) =
+                                    data.and_then(|d| d.get("id")).and_then(value_to_string)
                                 {
                                     reply_id = Some(id);
                                 }
                             }
                         }
                         "face" => {
-                            if let Some(id) = data
-                                .and_then(|d| d.get("id"))
-                                .and_then(value_to_string)
+                            if let Some(id) =
+                                data.and_then(|d| d.get("id")).and_then(value_to_string)
                             {
                                 let placeholder = face_inline_placeholder(&id)
                                     .unwrap_or_else(|| format!("[face:{}]", id));
@@ -2278,7 +2331,9 @@ async fn resolve_forward_chunks(
             }]
         }
     };
-    resolver.cache.insert(forward_id.to_string(), resolved.clone());
+    resolver
+        .cache
+        .insert(forward_id.to_string(), resolved.clone());
     resolved
 }
 
@@ -2379,10 +2434,7 @@ pub(crate) fn extract_message_lite(value: Option<&Value>) -> ExtractedMessage {
                         }
                     }
                     "face" => {
-                        if let Some(id) = data
-                            .and_then(|d| d.get("id"))
-                            .and_then(value_to_string)
-                        {
+                        if let Some(id) = data.and_then(|d| d.get("id")).and_then(value_to_string) {
                             let placeholder = face_inline_placeholder(&id)
                                 .unwrap_or_else(|| format!("[face:{}]", id));
                             text.push_str(&placeholder);
@@ -2394,9 +2446,7 @@ pub(crate) fn extract_message_lite(value: Option<&Value>) -> ExtractedMessage {
                         summary_text.push_str("[卡片]");
                     }
                     "forward" => {
-                        if let Some(id) =
-                            data.and_then(|d| d.get("id")).and_then(value_to_string)
-                        {
+                        if let Some(id) = data.and_then(|d| d.get("id")).and_then(value_to_string) {
                             text.push_str(&format!("[合并转发:{}]", id));
                             summary_text.push_str(&format!("[合并转发:{}]", id));
                         } else {
@@ -2480,13 +2530,19 @@ fn image_sub_type(data: Option<&Value>) -> Option<i64> {
 fn extract_reference(data: Option<&Value>) -> Option<MediaReference> {
     let data = data?;
     if let Some(url) = data.get("url").and_then(|v| v.as_str()) {
-        return Some(MediaReference::RemoteUrl { url: url.to_string() });
+        return Some(MediaReference::RemoteUrl {
+            url: url.to_string(),
+        });
     }
     if let Some(file) = data.get("file").and_then(|v| v.as_str()) {
-        return Some(MediaReference::RemoteUrl { url: file.to_string() });
+        return Some(MediaReference::RemoteUrl {
+            url: file.to_string(),
+        });
     }
     if let Some(path) = data.get("path").and_then(|v| v.as_str()) {
-        return Some(MediaReference::RemoteUrl { url: path.to_string() });
+        return Some(MediaReference::RemoteUrl {
+            url: path.to_string(),
+        });
     }
     None
 }
@@ -2553,7 +2609,9 @@ fn parse_cq_face_id(segment: &str) -> Option<String> {
 
 fn face_inline_placeholder(face_id: &str) -> Option<String> {
     let face_id = normalize_face_id(face_id)?;
-    let path = Path::new("res").join("face").join(format!("{}.png", face_id));
+    let path = Path::new("res")
+        .join("face")
+        .join(format!("{}.png", face_id));
     if !path.exists() {
         return None;
     }
@@ -2568,46 +2626,12 @@ fn normalize_face_id(raw: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-async fn fetch_review_code_from_reply(account_id: &str, reply_id: &str) -> Option<ReviewCode> {
-    let body = match napcat_ws_request(
-        account_id,
-        "get_msg",
-        json!({ "message_id": reply_id }),
-        Duration::from_secs(6),
-    )
-    .await
-    {
-        Ok(body) => body,
-        Err(_err) => {
-            debug_log!(
-                "napcat get_msg ws failed: account_id={} message_id={} err={}",
-                account_id,
-                reply_id,
-                _err
-            );
-            return None;
-        }
-    };
-    let data = body.get("data")?;
-    let message_value = data.get("message").or_else(|| data.get("raw_message"));
-    let extracted = extract_message_lite(message_value);
-    let review_code = parse_review_code(&extracted.text);
-    if review_code.is_none() {
-        debug_log!(
-            "napcat get_msg missing review code: message_id={} text_len={}",
-            reply_id,
-            extracted.text.len()
-        );
-    }
-    review_code
-}
-
 async fn parse_review_command(
     runtime: &NapCatRuntimeConfig,
     state: &Arc<Mutex<NapCatState>>,
     out_tx: &mpsc::Sender<String>,
     user_id: &str,
-    account_id: &str,
+    _account_id: &str,
     group_id: &str,
     review_code: Option<ReviewCode>,
     action: ReviewAction,
@@ -2640,35 +2664,15 @@ async fn parse_review_command(
                 }
             }
         }
-
-    }
-
-    if review_id.is_none() && review_code.is_none() && reply_missing {
-        if let Some(reply_id) = reply_id.as_ref() {
-            if let Some(code) = fetch_review_code_from_reply(account_id, reply_id).await {
-                review_code = Some(code);
-                audit_msg_id = None;
-                reply_missing = false;
-            }
-        }
-    }
-
-    if review_id.is_none() {
-        if let Some(code) = review_code {
-            let mapped = {
-                let guard = state.lock().await;
-                guard.review_by_code.get(&code).copied()
-            };
-            if let Some(mapped) = mapped {
-                review_id = Some(mapped);
-                review_code = None;
-                audit_msg_id = None;
-            }
-        }
     }
 
     if reply_missing && review_id.is_none() && review_code.is_none() {
         send_group_text(out_tx, group_id, "找不到回复的消息").await;
+        return None;
+    }
+
+    if review_id.is_none() && review_code.is_some() {
+        send_group_text(out_tx, group_id, "找不到编号对应稿件").await;
         return None;
     }
 
@@ -2679,6 +2683,14 @@ async fn parse_review_command(
 
     if let Some(resolved_id) = review_id {
         let guard = state.lock().await;
+        let Some(info) = guard.review_info.get(&resolved_id) else {
+            send_group_text(out_tx, group_id, "找不到编号对应稿件").await;
+            return None;
+        };
+        if info.group_id != runtime.group_id {
+            send_group_text(out_tx, group_id, "无权限操作该稿件").await;
+            return None;
+        }
         is_processed = guard.processed_reviews.contains(&resolved_id);
     }
 
@@ -2698,6 +2710,43 @@ async fn parse_review_command(
         now_ms,
         tz_offset_minutes: runtime.tz_offset_minutes,
     }))
+}
+
+fn message_mentions_self(value: Option<&Value>, self_id: &str) -> bool {
+    if self_id.trim().is_empty() {
+        return false;
+    }
+    match value {
+        Some(Value::Array(items)) => items.iter().any(|item| {
+            if item.get("type").and_then(|v| v.as_str()) != Some("at") {
+                return false;
+            }
+            let at_target = item
+                .get("data")
+                .and_then(|data| data.get("qq"))
+                .and_then(value_to_string)
+                .unwrap_or_default();
+            at_target.trim() == self_id
+        }),
+        Some(Value::String(raw)) => {
+            let token = format!("qq={}", self_id);
+            raw.contains("[CQ:at,") && raw.contains(&token)
+        }
+        _ => false,
+    }
+}
+
+fn command_context_allowed(command: &AuditCommand, mentions_self: bool, reply_bound: bool) -> bool {
+    match command {
+        AuditCommand::Global(_) => mentions_self,
+        AuditCommand::Review {
+            review_code: Some(_),
+            ..
+        } => mentions_self,
+        AuditCommand::Review {
+            review_code: None, ..
+        } => reply_bound,
+    }
 }
 
 fn parse_audit_command(text: &str, has_reply: bool) -> Option<AuditCommand> {
@@ -2821,8 +2870,9 @@ fn parse_global_action(command: &str, rest: &str) -> Option<GlobalAction> {
         "发送暂存区" => Some(GlobalAction::SendQueueFlush),
         "清理发送中" => Some(GlobalAction::SendInFlightClear),
         "列出拉黑" => Some(GlobalAction::BlacklistList),
-        "取消拉黑" => parse_first_token(rest)
-            .map(|sender_id| GlobalAction::BlacklistRemove { sender_id }),
+        "取消拉黑" => {
+            parse_first_token(rest).map(|sender_id| GlobalAction::BlacklistRemove { sender_id })
+        }
         "设定编号" => parse_u64(rest).map(|value| GlobalAction::SetExternalNumber { value }),
         "快捷回复" => parse_quick_reply_action(rest),
         "自检" => Some(GlobalAction::SelfCheck),
@@ -2869,7 +2919,9 @@ fn parse_review_code(text: &str) -> Option<ReviewCode> {
 }
 
 fn parse_first_token(text: &str) -> Option<String> {
-    text.split_whitespace().next().map(|token| token.to_string())
+    text.split_whitespace()
+        .next()
+        .map(|token| token.to_string())
 }
 
 fn parse_u64(text: &str) -> Option<u64> {
@@ -2933,7 +2985,9 @@ fn build_pending_list_text(state: &NapCatState, group_id: &str) -> String {
         .map(|(_, label)| label)
         .collect::<Vec<_>>();
 
-    if pending_review_labels.is_empty() && pending_send_labels.is_empty() && sending_labels.is_empty()
+    if pending_review_labels.is_empty()
+        && pending_send_labels.is_empty()
+        && sending_labels.is_empty()
     {
         return "待处理为空".to_string();
     }
@@ -3000,7 +3054,12 @@ fn post_code_text(state: &NapCatState, post_id: PostId) -> Option<String> {
         .post_external_code
         .get(&post_id)
         .map(|code| code.to_string())
-        .or_else(|| state.post_review_code.get(&post_id).map(|code| code.to_string()))
+        .or_else(|| {
+            state
+                .post_review_code
+                .get(&post_id)
+                .map(|code| code.to_string())
+        })
 }
 
 fn resolve_post_submitter(state: &NapCatState, post_id: PostId) -> Option<String> {
@@ -3043,7 +3102,10 @@ fn format_list(items: &[String]) -> String {
 
 fn extract_sender_name(value: &Value) -> Option<String> {
     let sender = value.get("sender")?;
-    let card = sender.get("card").and_then(|v| v.as_str()).map(|s| s.trim());
+    let card = sender
+        .get("card")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim());
     if let Some(card) = card {
         if !card.is_empty() {
             return Some(card.to_string());
@@ -3053,7 +3115,9 @@ fn extract_sender_name(value: &Value) -> Option<String> {
         .get("nickname")
         .and_then(|v| v.as_str())
         .map(|s| s.trim());
-    nickname.filter(|name| !name.is_empty()).map(|name| name.to_string())
+    nickname
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_string())
 }
 
 const SUMMARY_LINE_MAX_CHARS: usize = 120;
@@ -3115,7 +3179,10 @@ fn build_audit_message(
                 review_code, display_name, user_id, safety_text
             )
         }
-        None => format!("#{} post {} 系统判断{}", review_code, post_id.0, safety_text),
+        None => format!(
+            "#{} post {} 系统判断{}",
+            review_code, post_id.0, safety_text
+        ),
     };
 
     let mut text = String::new();
@@ -3284,7 +3351,9 @@ fn image_source_from_attachment(
                 .map(|path| file_uri_from_path(Path::new(path)))
         }
         MediaReference::RemoteUrl { url } => {
-            if url.starts_with("file://") || url.starts_with("data:") || url.starts_with("base64://")
+            if url.starts_with("file://")
+                || url.starts_with("data:")
+                || url.starts_with("base64://")
             {
                 return Some(url.clone());
             }
@@ -3538,6 +3607,35 @@ fn next_echo(state: &mut NapCatState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex as StdMutex, MutexGuard, OnceLock as StdOnceLock};
+
+    fn global_test_lock() -> &'static StdMutex<()> {
+        static LOCK: StdOnceLock<StdMutex<()>> = StdOnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
+    }
+
+    fn lock_globals_for_test() -> MutexGuard<'static, ()> {
+        match global_test_lock().lock() {
+            Ok(guard) => guard,
+            Err(err) => err.into_inner(),
+        }
+    }
+
+    fn mock_session() -> NapCatWsSession {
+        let (out_tx, _out_rx) = mpsc::channel(1);
+        NapCatWsSession {
+            out_tx,
+            state: Arc::new(Mutex::new(NapCatState::default())),
+        }
+    }
+
+    fn clear_group_accounts_for_test(group_id: &str) {
+        let mut guard = match group_accounts().lock() {
+            Ok(guard) => guard,
+            Err(err) => err.into_inner(),
+        };
+        guard.remove(group_id);
+    }
 
     #[test]
     fn parse_help_and_review_with_code() {
@@ -3583,11 +3681,15 @@ mod tests {
     fn parse_global_and_quick_reply_actions() {
         assert_eq!(
             parse_audit_command("调出 42", false),
-            Some(AuditCommand::Global(GlobalAction::Recall { review_code: 42 }))
+            Some(AuditCommand::Global(GlobalAction::Recall {
+                review_code: 42
+            }))
         );
         assert_eq!(
             parse_audit_command("调出 #42", false),
-            Some(AuditCommand::Global(GlobalAction::Recall { review_code: 42 }))
+            Some(AuditCommand::Global(GlobalAction::Recall {
+                review_code: 42
+            }))
         );
         assert_eq!(
             parse_audit_command("清理发送中", false),
@@ -3645,6 +3747,93 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn account_status_text_formats_online_and_offline() {
+        assert_eq!(account_status_text("10001", true), "账号10001已上线");
+        assert_eq!(account_status_text("10001", false), "账号10001已离线");
+    }
+
+    #[test]
+    fn message_mentions_self_only_for_matching_at_segment() {
+        let msg = serde_json::json!([
+            {"type":"at","data":{"qq":"10001"}},
+            {"type":"text","data":{"text":" 帮助"}}
+        ]);
+        assert!(message_mentions_self(Some(&msg), "10001"));
+        assert!(!message_mentions_self(Some(&msg), "10002"));
+        assert!(!message_mentions_self(
+            Some(&serde_json::json!("帮助")),
+            "10001"
+        ));
+    }
+
+    #[test]
+    fn command_context_requires_at_or_bound_reply() {
+        let global = AuditCommand::Global(GlobalAction::Help);
+        assert!(command_context_allowed(&global, true, false));
+        assert!(!command_context_allowed(&global, false, true));
+
+        let review_with_code = AuditCommand::Review {
+            review_code: Some(42),
+            action: ReviewAction::Approve,
+        };
+        assert!(command_context_allowed(&review_with_code, true, false));
+        assert!(!command_context_allowed(&review_with_code, false, true));
+
+        let review_reply = AuditCommand::Review {
+            review_code: None,
+            action: ReviewAction::Approve,
+        };
+        assert!(command_context_allowed(&review_reply, false, true));
+        assert!(!command_context_allowed(&review_reply, true, false));
+    }
+
+    #[test]
+    fn napcat_account_for_group_prefers_first_online_in_accounts_order() {
+        let _guard = lock_globals_for_test();
+        set_group_accounts("g-test", vec!["100".to_string(), "200".to_string()]);
+        register_ws_session("200", mock_session());
+        assert_eq!(napcat_account_for_group("g-test"), Some("200".to_string()));
+
+        register_ws_session("100", mock_session());
+        assert_eq!(napcat_account_for_group("g-test"), Some("100".to_string()));
+
+        unregister_ws_session("100");
+        unregister_ws_session("200");
+        clear_group_accounts_for_test("g-test");
+    }
+
+    #[test]
+    fn effective_primary_account_uses_accounts_order_with_online_fallback() {
+        let _guard = lock_globals_for_test();
+        let runtime = NapCatRuntimeConfig {
+            napcat: NapCatConfig {
+                base_url: "127.0.0.1:3001/oqqwall/ws".to_string(),
+                access_token: None,
+            },
+            audit_group_id: Some("1".to_string()),
+            group_id: "g-test2".to_string(),
+            accounts: vec!["100".to_string(), "200".to_string()],
+            tz_offset_minutes: 0,
+            friend_request_window_sec: 0,
+            friend_add_message: None,
+            max_queue: 1,
+        };
+
+        register_ws_session("200", mock_session());
+        assert_eq!(effective_primary_account(&runtime), Some("200".to_string()));
+        assert!(is_effective_primary_account(&runtime, "200"));
+        assert!(!is_effective_primary_account(&runtime, "100"));
+
+        register_ws_session("100", mock_session());
+        assert_eq!(effective_primary_account(&runtime), Some("100".to_string()));
+        assert!(is_effective_primary_account(&runtime, "100"));
+        assert!(!is_effective_primary_account(&runtime, "200"));
+
+        unregister_ws_session("100");
+        unregister_ws_session("200");
     }
 
     #[test]

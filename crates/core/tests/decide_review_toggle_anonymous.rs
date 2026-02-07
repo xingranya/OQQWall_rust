@@ -1,8 +1,8 @@
 use oqqwall_rust_core::decide::decide;
 use oqqwall_rust_core::event::{DraftEvent, Event, RenderEvent, ReviewEvent};
 use oqqwall_rust_core::{
-    derive_review_id, Command, CoreConfig, Draft, EventEnvelope, Id128, ReviewAction,
-    ReviewActionCommand, StateView,
+    Command, CoreConfig, Draft, EventEnvelope, Id128, ReviewAction, ReviewActionCommand, StateView,
+    derive_review_id,
 };
 
 fn wrap(event: Event, id: u128, ts_ms: i64) -> EventEnvelope {

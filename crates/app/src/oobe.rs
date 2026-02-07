@@ -3,7 +3,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::Path;
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 pub fn run(args: &[String]) -> Result<(), String> {
     let mut config_path = env::var("OQQWALL_CONFIG").unwrap_or_else(|_| "config.json".to_string());
@@ -46,17 +46,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
     println!("开始配置 OQQWall_RUST（按回车使用默认值）");
     let group_id = prompt_with_default("逻辑组名（group id）", "default")?;
     let audit_group_id = prompt_required("审核群 ID（mangroupid）")?;
-    let mainqqid = prompt_required("主账号 QQ 号（mainqqid）")?;
-    let minorqqid = prompt_csv_strings("副账号 QQ 号列表（逗号分隔，可留空）")?;
-    let mut account_ids = Vec::new();
-    account_ids.push(mainqqid.clone());
-    account_ids.extend(minorqqid.iter().cloned());
+    let account_ids =
+        prompt_csv_strings_required("账号列表（accounts，逗号分隔，第一个为主账号）")?;
 
     let napcat_base_url =
         prompt_with_default("本组 NapCat 反向 WS Base URL", "0.0.0.0:3001/oqqwall/ws")?;
-    let access_token = prompt_optional(
-        "本组 NapCat access_token（留空则自动生成随机值）",
-    )?;
+    let access_token = prompt_optional("本组 NapCat access_token（留空则自动生成随机值）")?;
     let access_token = match access_token {
         Some(token) => Some(token),
         None => Some(generate_access_token()?),
@@ -64,8 +59,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let process_waittime_sec = prompt_u64("聚合窗口秒数（process_waittime_sec）", 20)?;
     let tz_offset_minutes = prompt_i64("时区偏移分钟数（中国大陆=480）", 480)?;
     let max_cache_mb = prompt_u64("内存图片缓存上限 MB（max_cache_mb）", 256)?;
-    let at_unprived_sender =
-        prompt_bool("发件时是否 @ 非匿名投稿人（at_unprived_sender）", false)?;
+    let at_unprived_sender = prompt_bool("发件时是否 @ 非匿名投稿人（at_unprived_sender）", false)?;
 
     let max_post_stack = prompt_u64("最大暂存条数（max_post_stack）", 1)?;
     let max_image_number_one_post = prompt_u64("单条最大图片数（max_image_number_one_post）", 30)?;
@@ -99,26 +93,20 @@ pub fn run(args: &[String]) -> Result<(), String> {
     );
 
     let mut group = Map::new();
-    group.insert(
-        "mangroupid".to_string(),
-        Value::String(audit_group_id),
-    );
+    group.insert("mangroupid".to_string(), Value::String(audit_group_id));
     group.insert(
         "napcat_base_url".to_string(),
         Value::String(napcat_base_url.clone()),
     );
     if let Some(token) = access_token.as_ref() {
-        group.insert("napcat_access_token".to_string(), Value::String(token.clone()));
+        group.insert(
+            "napcat_access_token".to_string(),
+            Value::String(token.clone()),
+        );
     }
-    group.insert("mainqqid".to_string(), Value::String(mainqqid));
     group.insert(
-        "minorqqid".to_string(),
-        Value::Array(
-            minorqqid
-                .into_iter()
-                .map(Value::String)
-                .collect(),
-        ),
+        "accounts".to_string(),
+        Value::Array(account_ids.iter().cloned().map(Value::String).collect()),
     );
     group.insert(
         "max_post_stack".to_string(),
@@ -288,6 +276,17 @@ fn prompt_i64(label: &str, default: i64) -> Result<i64, String> {
 fn prompt_csv_strings(label: &str) -> Result<Vec<String>, String> {
     let input = prompt_line(&format!("{}: ", label))?;
     Ok(parse_csv(&input))
+}
+
+fn prompt_csv_strings_required(label: &str) -> Result<Vec<String>, String> {
+    loop {
+        let values = prompt_csv_strings(label)?;
+        if values.is_empty() {
+            println!("至少需要提供一个账号。");
+            continue;
+        }
+        return Ok(values);
+    }
 }
 
 fn prompt_schedule(label: &str) -> Result<Vec<String>, String> {

@@ -1,11 +1,11 @@
-mod ingress;
-mod tick;
-mod review;
-mod global;
 mod driver;
 mod flush;
+mod global;
+mod ingress;
+mod review;
 mod scheduler;
 mod sender;
+mod tick;
 
 pub mod builder;
 

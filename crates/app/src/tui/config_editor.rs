@@ -3,23 +3,27 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Frame;
 use serde_json::{Map, Value};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Clone, Copy)]
 enum FieldKind {
     Text,
-    Bool { default: bool },
+    Bool {
+        default: bool,
+    },
     StringList,
-    PairList { left: &'static str, right: &'static str },
+    #[allow(dead_code)]
+    PairList {
+        left: &'static str,
+        right: &'static str,
+    },
     MapList,
     AdminList,
 }
@@ -193,30 +197,9 @@ const GROUP_FIELDS: &[FieldSpec] = &[
         aliases: &[],
     },
     FieldSpec {
-        key: "mainqqid",
-        kind: FieldKind::Text,
-        hint: "Primary account id (mainqqid)",
-        aliases: &[],
-    },
-    FieldSpec {
-        key: "mainqq_http_port",
-        kind: FieldKind::Text,
-        hint: "Primary account HTTP port",
-        aliases: &[],
-    },
-    FieldSpec {
-        key: "minorqqid",
-        kind: FieldKind::PairList {
-            left: "minorqqid",
-            right: "minorqq_http_port",
-        },
-        hint: "Secondary account ids (paired with minorqq_http_port)",
-        aliases: &[],
-    },
-    FieldSpec {
         key: "accounts",
         kind: FieldKind::StringList,
-        hint: "Account list (override main/minor)",
+        hint: "Account ids (first is primary)",
         aliases: &[],
     },
     FieldSpec {
@@ -368,8 +351,13 @@ enum EditMode {
         key: String,
         spec: Option<FieldSpec>,
     },
-    NewKeyName { section: SectionKind },
-    NewKeyValue { section: SectionKind, key: String },
+    NewKeyName {
+        section: SectionKind,
+    },
+    NewKeyValue {
+        section: SectionKind,
+        key: String,
+    },
     NewGroupName,
 }
 
@@ -577,13 +565,13 @@ impl ConfigEditor {
             .split(area);
 
         let header_line = self.header_line(layout[0].width as usize);
-        let header = Paragraph::new(header_line)
-            .style(Style::default().add_modifier(Modifier::REVERSED));
+        let header =
+            Paragraph::new(header_line).style(Style::default().add_modifier(Modifier::REVERSED));
         f.render_widget(header, layout[0]);
 
         let groupbar_line = self.group_bar_line(layout[1].width as usize);
-        let groupbar = Paragraph::new(groupbar_line)
-            .style(Style::default().add_modifier(Modifier::REVERSED));
+        let groupbar =
+            Paragraph::new(groupbar_line).style(Style::default().add_modifier(Modifier::REVERSED));
         f.render_widget(groupbar, layout[1]);
         self.layout_groupbar = layout[1];
 
@@ -599,11 +587,8 @@ impl ConfigEditor {
         self.ensure_visible();
 
         let section_lines = self.section_lines(&sections, body[0].width as usize);
-        let sections_widget = Paragraph::new(Text::from(section_lines)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Sections"),
-        );
+        let sections_widget = Paragraph::new(Text::from(section_lines))
+            .block(Block::default().borders(Borders::ALL).title("Sections"));
         f.render_widget(sections_widget, body[0]);
 
         let field_lines = self.field_lines(&fields, body[1].width as usize);
@@ -617,21 +602,18 @@ impl ConfigEditor {
                 }
             }
         };
-        let fields_widget = Paragraph::new(Text::from(field_lines)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(fields_title),
-        );
+        let fields_widget = Paragraph::new(Text::from(field_lines))
+            .block(Block::default().borders(Borders::ALL).title(fields_title));
         f.render_widget(fields_widget, body[1]);
 
         let hint_line = self.hint_line(layout[3].width as usize);
-        let hint_widget = Paragraph::new(hint_line)
-            .style(Style::default().add_modifier(Modifier::REVERSED));
+        let hint_widget =
+            Paragraph::new(hint_line).style(Style::default().add_modifier(Modifier::REVERSED));
         f.render_widget(hint_widget, layout[3]);
 
         let footer = self.footer_line(layout[4].width as usize);
-        let footer_widget = Paragraph::new(footer)
-            .style(Style::default().add_modifier(Modifier::REVERSED));
+        let footer_widget =
+            Paragraph::new(footer).style(Style::default().add_modifier(Modifier::REVERSED));
         f.render_widget(footer_widget, layout[4]);
     }
 
@@ -795,12 +777,17 @@ impl ConfigEditor {
 
     fn save(&mut self) -> Result<(), String> {
         let mut root = Map::new();
-        root.insert("common".to_string(), Value::Object(sanitize_map(&self.common)));
+        root.insert(
+            "common".to_string(),
+            Value::Object(sanitize_map(&self.common)),
+        );
         match self.storage {
             GroupStorage::Nested => {
                 let mut groups_map = Map::new();
                 for (name, map) in &self.groups {
-                    groups_map.insert(name.clone(), Value::Object(sanitize_map(map)));
+                    let mut group = sanitize_map(map);
+                    normalize_group_accounts_map(&mut group);
+                    groups_map.insert(name.clone(), Value::Object(group));
                 }
                 root.insert("groups".to_string(), Value::Object(groups_map));
                 for (key, value) in sanitize_map(&self.other_root) {
@@ -818,7 +805,9 @@ impl ConfigEditor {
                     root.insert(key, value);
                 }
                 for (name, map) in &self.groups {
-                    root.insert(name.clone(), Value::Object(sanitize_map(map)));
+                    let mut group = sanitize_map(map);
+                    normalize_group_accounts_map(&mut group);
+                    root.insert(name.clone(), Value::Object(group));
                 }
             }
         }
@@ -931,7 +920,9 @@ impl ConfigEditor {
                     end: col.saturating_add(width_label),
                 };
                 let style = if active {
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
@@ -954,7 +945,9 @@ impl ConfigEditor {
         };
         spans.push(Span::styled(
             add_label,
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ));
         self.group_actions.push(GroupActionTab {
             action: GroupAction::Add,
@@ -962,11 +955,7 @@ impl ConfigEditor {
         });
 
         let line = Line::from(spans);
-        if width == 0 {
-            Line::raw("")
-        } else {
-            line
-        }
+        if width == 0 { Line::raw("") } else { line }
     }
 
     fn select_prev_group(&mut self) {
@@ -1203,7 +1192,9 @@ impl ConfigEditor {
                 if is_unset_value(value) {
                     "<unset>".to_string()
                 } else {
-                    value.map(value_display).unwrap_or_else(|| "<unset>".to_string())
+                    value
+                        .map(value_display)
+                        .unwrap_or_else(|| "<unset>".to_string())
                 }
             }
         }
@@ -1368,7 +1359,10 @@ impl ConfigEditor {
         }
         if let Some(spec) = entry.spec {
             match spec.kind {
-                FieldKind::StringList | FieldKind::PairList { .. } | FieldKind::MapList | FieldKind::AdminList => {
+                FieldKind::StringList
+                | FieldKind::PairList { .. }
+                | FieldKind::MapList
+                | FieldKind::AdminList => {
                     self.open_list_editor(section, entry, spec);
                     return;
                 }
@@ -1467,7 +1461,10 @@ impl ConfigEditor {
         let mut bool_field = false;
         let mut spec = None;
         if let Some(entry_spec) = entry.spec {
-            if let FieldKind::Bool { default: spec_default } = entry_spec.kind {
+            if let FieldKind::Bool {
+                default: spec_default,
+            } = entry_spec.kind
+            {
                 default = spec_default;
                 bool_field = true;
                 spec = Some(entry_spec);
@@ -1524,12 +1521,9 @@ impl ConfigEditor {
     fn handle_mouse_click(&mut self, x: u16, y: u16) {
         if let Some(editor) = self.list_editor.as_mut() {
             if rect_contains(self.layout_list, x, y) {
-                if let Some(index) = list_click_index(
-                    self.layout_list,
-                    y,
-                    editor.offset,
-                    editor.items.len(),
-                ) {
+                if let Some(index) =
+                    list_click_index(self.layout_list, y, editor.offset, editor.items.len())
+                {
                     let was_selected = index == editor.selected;
                     editor.selected = index;
                     if was_selected {
@@ -1584,12 +1578,9 @@ impl ConfigEditor {
 
         if rect_contains(self.layout_fields, x, y) {
             let fields = self.current_fields();
-            if let Some(index) = list_click_index(
-                self.layout_fields,
-                y,
-                self.field_offset,
-                fields.len(),
-            ) {
+            if let Some(index) =
+                list_click_index(self.layout_fields, y, self.field_offset, fields.len())
+            {
                 let was_selected = index == self.selected_field;
                 self.focus_fields();
                 self.selected_field = index;
@@ -1634,11 +1625,7 @@ impl ConfigEditor {
 
     fn commit_edit(&mut self, edit: EditState) {
         match edit.mode {
-            EditMode::Value {
-                section,
-                key,
-                spec,
-            } => {
+            EditMode::Value { section, key, spec } => {
                 if let Some(map) = self.section_map_mut(&section) {
                     if let Some(spec) = spec {
                         clear_aliases(map, &spec);
@@ -1792,17 +1779,17 @@ impl ConfigEditor {
                 let value = value.or_else(|| map.get(key));
                 extract_map_list(value)
             }
-                .into_iter()
-                .map(|(k, v)| ListItem::MapEntry(k, v))
-                .collect(),
+            .into_iter()
+            .map(|(k, v)| ListItem::MapEntry(k, v))
+            .collect(),
             ListKind::AdminList => {
                 let value = spec.and_then(|spec| resolve_value(map, &spec));
                 let value = value.or_else(|| map.get(key));
                 extract_admin_list(value)
             }
-                .into_iter()
-                .map(|(u, p)| ListItem::Admin(u, p))
-                .collect(),
+            .into_iter()
+            .map(|(u, p)| ListItem::Admin(u, p))
+            .collect(),
         }
     }
 
@@ -1884,13 +1871,17 @@ impl ConfigEditor {
         };
         let layout = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
             .split(area);
 
         self.layout_list = layout[1];
         let header_line = editor.header_line(layout[0].width as usize);
-        let header = Paragraph::new(header_line)
-            .style(Style::default().add_modifier(Modifier::REVERSED));
+        let header =
+            Paragraph::new(header_line).style(Style::default().add_modifier(Modifier::REVERSED));
         f.render_widget(header, layout[0]);
 
         let list_height = layout[1].height.saturating_sub(2) as usize;
@@ -1901,18 +1892,16 @@ impl ConfigEditor {
         f.render_widget(list_widget, layout[1]);
 
         let footer = editor.footer_line(self.status.as_ref(), layout[2].width as usize);
-        let footer_widget = Paragraph::new(footer)
-            .style(Style::default().add_modifier(Modifier::REVERSED));
+        let footer_widget =
+            Paragraph::new(footer).style(Style::default().add_modifier(Modifier::REVERSED));
         f.render_widget(footer_widget, layout[2]);
     }
 
     fn validate(&self) -> (Vec<String>, Vec<String>) {
         let mut errors = Vec::new();
-        let mut warnings = Vec::new();
+        let warnings = Vec::new();
 
-        let mut main_ids = HashSet::new();
-        let mut minor_ids = HashSet::new();
-        let mut ports = HashSet::new();
+        let mut account_ids = HashSet::new();
 
         let audit_cmds = [
             "\u{662f}",
@@ -1941,68 +1930,28 @@ impl ConfigEditor {
             }
 
             let mangroupid = value_to_string(obj.get("mangroupid")).unwrap_or_default();
-            let mainqqid = value_to_string(obj.get("mainqqid")).unwrap_or_default();
-            let main_port = value_to_string(obj.get("mainqq_http_port")).unwrap_or_default();
-
             if mangroupid.is_empty() || !is_numeric(&mangroupid) {
                 errors.push(format!("{group}: mangroupid must be numeric"));
             }
-            if !mainqqid.is_empty() {
-                if !is_numeric(&mainqqid) {
-                    errors.push(format!("{group}: mainqqid must be numeric"));
-                } else if !main_ids.insert(mainqqid.clone()) {
-                    errors.push(format!("mainqqid {mainqqid} is duplicated"));
+            let mut accounts = extract_string_list(obj.get("accounts"));
+            if accounts.is_empty() {
+                if let Some(main) = value_to_string(obj.get("mainqqid")) {
+                    accounts.push(main);
                 }
-            } else {
-                errors.push(format!("{group}: mainqqid is missing"));
+                accounts.extend(extract_string_list(obj.get("minorqqid")));
             }
-            if !main_port.is_empty() {
-                if !is_numeric(&main_port) {
-                    errors.push(format!("{group}: mainqq_http_port must be numeric"));
-                } else if !ports.insert(main_port.clone()) {
-                    errors.push(format!("mainqq_http_port {main_port} is duplicated"));
-                }
-            } else {
-                errors.push(format!("{group}: mainqq_http_port is missing"));
+            if accounts.is_empty() {
+                errors.push(format!("{group}: accounts is missing or empty"));
             }
-
-            let minor_list = extract_string_list(obj.get("minorqqid"));
-            let minor_ports = extract_string_list(obj.get("minorqq_http_port"));
-
-            if minor_list.is_empty() {
-                warnings.push(format!("{group}: minorqqid is empty"));
-            }
-            if minor_ports.is_empty() {
-                warnings.push(format!("{group}: minorqq_http_port is empty"));
-            }
-            for mid in &minor_list {
-                if mid.is_empty() {
+            for account in &accounts {
+                if account.is_empty() {
                     continue;
                 }
-                if !is_numeric(mid) {
-                    errors.push(format!("{group}: minorqqid contains non-numeric {mid}"));
-                } else if !minor_ids.insert(mid.clone()) || main_ids.contains(mid) {
-                    errors.push(format!("minorqqid {mid} is duplicated"));
+                if !is_numeric(account) {
+                    errors.push(format!("{group}: accounts contains non-numeric {account}"));
+                } else if !account_ids.insert(account.clone()) {
+                    errors.push(format!("accounts {account} is duplicated"));
                 }
-            }
-            for mp in &minor_ports {
-                if mp.is_empty() {
-                    continue;
-                }
-                if !is_numeric(mp) {
-                    errors.push(format!(
-                        "{group}: minorqq_http_port contains non-numeric {mp}"
-                    ));
-                } else if !ports.insert(mp.clone()) {
-                    errors.push(format!("minorqq_http_port {mp} is duplicated"));
-                }
-            }
-            if minor_list.len() != minor_ports.len() {
-                errors.push(format!(
-                    "{group}: minorqqid count ({}) != minorqq_http_port count ({})",
-                    minor_list.len(),
-                    minor_ports.len()
-                ));
             }
 
             for key in ["max_post_stack", "max_image_number_one_post"] {
@@ -2026,9 +1975,7 @@ impl ConfigEditor {
                         for item in items {
                             if let Some(s) = value_to_string(Some(item)) {
                                 if !s.is_empty() && parse_schedule_str(&s).is_none() {
-                                    errors.push(format!(
-                                        "{group}: send_schedule invalid time {s}"
-                                    ));
+                                    errors.push(format!("{group}: send_schedule invalid time {s}"));
                                 }
                             }
                         }
@@ -2415,6 +2362,51 @@ fn sanitize_value(value: &Value) -> Option<Value> {
     }
 }
 
+fn normalize_group_accounts_map(map: &mut Map<String, Value>) {
+    if !map.contains_key("accounts") {
+        if let Some(alias) = map.remove("acount") {
+            map.insert("accounts".to_string(), alias);
+        }
+    } else {
+        map.remove("acount");
+    }
+
+    let mut accounts = extract_string_list(map.get("accounts"));
+    if accounts.is_empty() {
+        if let Some(main) = value_to_string(map.get("mainqqid")) {
+            accounts.push(main);
+        }
+        accounts.extend(extract_string_list(map.get("minorqqid")));
+    }
+
+    let mut normalized = Vec::new();
+    for account in accounts {
+        let trimmed = account.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let account = trimmed.to_string();
+        if !normalized.contains(&account) {
+            normalized.push(account);
+        }
+    }
+    if !normalized.is_empty() {
+        map.insert(
+            "accounts".to_string(),
+            Value::Array(normalized.into_iter().map(Value::String).collect()),
+        );
+    }
+
+    for key in [
+        "mainqqid",
+        "minorqqid",
+        "mainqq_http_port",
+        "minorqq_http_port",
+    ] {
+        map.remove(key);
+    }
+}
+
 fn resolve_value<'a>(map: &'a Map<String, Value>, spec: &FieldSpec) -> Option<&'a Value> {
     if let Some(value) = map.get(spec.key) {
         return Some(value);
@@ -2445,22 +2437,14 @@ fn list_click_index(rect: Rect, y: u16, offset: usize, len: usize) -> Option<usi
         return None;
     }
     let start_y = rect.y.saturating_add(1);
-    let end_y = rect
-        .y
-        .saturating_add(rect.height)
-        .saturating_sub(1);
+    let end_y = rect.y.saturating_add(rect.height).saturating_sub(1);
     if y < start_y || y >= end_y {
         return None;
     }
     let row = y.saturating_sub(start_y) as usize;
     let index = offset.saturating_add(row);
-    if index < len {
-        Some(index)
-    } else {
-        None
-    }
+    if index < len { Some(index) } else { None }
 }
-
 
 fn map_from_value(value: Option<&Value>) -> (Map<String, Value>, Option<String>) {
     match value {

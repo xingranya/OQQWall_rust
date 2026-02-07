@@ -1,10 +1,12 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::collections::HashMap;
+use std::io::Write;
+use std::path::PathBuf;
 
 use oqqwall_rust_core::{CoreConfig, GroupConfig};
 use oqqwall_rust_drivers::napcat::NapCatConfig;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 #[cfg(debug_assertions)]
 macro_rules! debug_log {
@@ -52,8 +54,11 @@ impl AppConfig {
         let data = fs::read_to_string(&path)
             .map_err(|err| format!("failed to read config {}: {}", path, err))?;
         debug_log!("config bytes={}", data.len());
-        let root: Value =
+        let mut root: Value =
             serde_json::from_str(&data).map_err(|err| format!("invalid config json: {}", err))?;
+        if normalize_config_in_place(&mut root)? {
+            write_normalized_config(&path, &root)?;
+        }
         Self::from_value(&root)
     }
 
@@ -72,8 +77,7 @@ impl AppConfig {
             })
             .unwrap_or(20_000);
 
-        let tz_offset_minutes = parse_i64(common.get("tz_offset_minutes"))
-            .unwrap_or(0) as i32;
+        let tz_offset_minutes = parse_i64(common.get("tz_offset_minutes")).unwrap_or(0) as i32;
         let max_cache_mb = env::var("OQQWALL_MAX_CACHE_MB")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -95,12 +99,25 @@ impl AppConfig {
 
         let mut group_configs = Vec::new();
         for (group_id, group_value) in &groups {
-            let audit_group_id = parse_string(group_value.get("mangroupid"));
+            let audit_group_id = parse_string(group_value.get("mangroupid"))
+                .ok_or_else(|| format!("group {}: missing required field mangroupid", group_id))?;
+            let accounts = parse_accounts(group_value);
+            if accounts.is_empty() {
+                return Err(format!(
+                    "group {}: missing required field accounts",
+                    group_id
+                ));
+            }
+            if let Some(invalid) = accounts.iter().find(|value| !is_numeric(value)) {
+                return Err(format!(
+                    "group {}: accounts contains non-numeric value {}",
+                    group_id, invalid
+                ));
+            }
             let napcat = parse_napcat_config(&common, Some(group_value))
                 .map_err(|err| format!("group {}: {}", group_id, err))?;
-            let friend_request_window_sec =
-                parse_u32(group_value.get("friend_request_window_sec"))
-                    .unwrap_or(default_friend_request_window_sec);
+            let friend_request_window_sec = parse_u32(group_value.get("friend_request_window_sec"))
+                .unwrap_or(default_friend_request_window_sec);
             let friend_add_message = parse_string(group_value.get("friend_add_message"))
                 .or_else(|| default_friend_add_message.clone());
             let _napcat_ws_log = base_url_for_log(&napcat.base_url);
@@ -113,7 +130,7 @@ impl AppConfig {
             );
             group_configs.push(AppGroupConfig {
                 group_id: group_id.clone(),
-                audit_group_id,
+                audit_group_id: Some(audit_group_id),
                 napcat,
                 friend_request_window_sec,
                 friend_add_message,
@@ -173,10 +190,7 @@ fn split_config(root: &Value) -> Result<(Value, std::collections::HashMap<String
         .ok_or_else(|| "config must be a json object".to_string())?;
     let common = obj.get("common").cloned().unwrap_or(Value::Null);
     if let Some(groups) = obj.get("groups").and_then(|v| v.as_object()) {
-        let map = groups
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let map = groups.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         return Ok((common, map));
     }
     let mut map = std::collections::HashMap::new();
@@ -238,6 +252,10 @@ fn parse_duration_ms(value: Option<&Value>) -> Option<i64> {
     parse_i64(value)
 }
 
+fn is_numeric(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|c| c.is_ascii_digit())
+}
+
 fn env_override(key: &str, fallback: Option<String>) -> Option<String> {
     env::var(key).ok().or(fallback)
 }
@@ -249,8 +267,7 @@ fn build_core_config(
 ) -> CoreConfig {
     let mut core = CoreConfig::default();
     core.default_process_waittime_ms = default_process_waittime_ms;
-    core.default_min_interval_ms =
-        parse_duration_ms(common.get("min_interval_ms")).unwrap_or(0);
+    core.default_min_interval_ms = parse_duration_ms(common.get("min_interval_ms")).unwrap_or(0);
     core.default_max_queue = parse_usize(common.get("max_queue")).unwrap_or(0);
     core.default_max_images_per_post =
         parse_usize(common.get("max_image_number_one_post")).unwrap_or(30);
@@ -259,8 +276,8 @@ fn build_core_config(
     core.default_send_max_attempts = parse_u32(common.get("send_max_attempts")).unwrap_or(3);
 
     for (group_id, value) in groups {
-        let process_waittime_ms = parse_duration_ms(value.get("process_waittime_sec"))
-            .map(|v| v.saturating_mul(1000));
+        let process_waittime_ms =
+            parse_duration_ms(value.get("process_waittime_sec")).map(|v| v.saturating_mul(1000));
 
         let min_interval_ms = parse_duration_ms(value.get("min_interval_ms"));
         let max_queue = parse_usize(value.get("max_post_stack"));
@@ -305,9 +322,12 @@ fn build_core_config(
 }
 
 fn parse_accounts(value: &Value) -> Vec<String> {
-    let accounts = parse_string_list(value.get("accounts"));
+    let mut accounts = parse_string_list(value.get("accounts"));
+    if accounts.is_empty() {
+        accounts = parse_string_list(value.get("acount"));
+    }
     if !accounts.is_empty() {
-        return accounts;
+        return normalize_account_ids(accounts);
     }
 
     let mut out = Vec::new();
@@ -315,7 +335,146 @@ fn parse_accounts(value: &Value) -> Vec<String> {
         out.push(main);
     }
     out.extend(parse_string_list(value.get("minorqqid")));
+    normalize_account_ids(out)
+}
+
+fn normalize_account_ids(ids: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for id in ids {
+        let trimmed = id.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let normalized = trimmed.to_string();
+        if !out.contains(&normalized) {
+            out.push(normalized);
+        }
+    }
     out
+}
+
+fn normalize_config_in_place(root: &mut Value) -> Result<bool, String> {
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| "config must be a json object".to_string())?;
+    let mut changed = false;
+    if let Some(groups) = obj
+        .get_mut("groups")
+        .and_then(|value| value.as_object_mut())
+    {
+        for group in groups.values_mut() {
+            let Some(group_obj) = group.as_object_mut() else {
+                continue;
+            };
+            if normalize_group_accounts(group_obj) {
+                changed = true;
+            }
+        }
+        return Ok(changed);
+    }
+
+    for (key, value) in obj.iter_mut() {
+        if key == "common" || key == "schema_version" {
+            continue;
+        }
+        let Some(group_obj) = value.as_object_mut() else {
+            continue;
+        };
+        if normalize_group_accounts(group_obj) {
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+fn normalize_group_accounts(group_obj: &mut Map<String, Value>) -> bool {
+    let mut changed = false;
+    if !group_obj.contains_key("accounts") {
+        if let Some(alias) = group_obj.remove("acount") {
+            group_obj.insert("accounts".to_string(), alias);
+            changed = true;
+        }
+    } else if group_obj.contains_key("acount") {
+        group_obj.remove("acount");
+        changed = true;
+    }
+
+    let mut accounts = parse_string_list(group_obj.get("accounts"));
+    if accounts.is_empty() {
+        let mut legacy = Vec::new();
+        if let Some(main) = parse_string(group_obj.get("mainqqid")) {
+            legacy.push(main);
+        }
+        legacy.extend(parse_string_list(group_obj.get("minorqqid")));
+        if !legacy.is_empty() {
+            accounts = legacy;
+            changed = true;
+        }
+    }
+    let accounts = normalize_account_ids(accounts);
+    if !accounts.is_empty() {
+        let current = parse_string_list(group_obj.get("accounts"));
+        if normalize_account_ids(current) != accounts {
+            changed = true;
+        }
+        group_obj.insert(
+            "accounts".to_string(),
+            Value::Array(accounts.into_iter().map(Value::String).collect()),
+        );
+    }
+
+    for key in [
+        "mainqqid",
+        "minorqqid",
+        "mainqq_http_port",
+        "minorqq_http_port",
+    ] {
+        if group_obj.remove(key).is_some() {
+            changed = true;
+        }
+    }
+
+    changed
+}
+
+fn write_normalized_config(path: &str, root: &Value) -> Result<(), String> {
+    let mut output = serde_json::to_string_pretty(root)
+        .map_err(|err| format!("failed to encode normalized config {}: {}", path, err))?;
+    output.push('\n');
+    let mut temp = PathBuf::from(path);
+    temp.set_extension("tmp");
+    {
+        let mut file = fs::File::create(&temp).map_err(|err| {
+            format!(
+                "failed to write normalized config temp {}: {}",
+                temp.display(),
+                err
+            )
+        })?;
+        file.write_all(output.as_bytes()).map_err(|err| {
+            format!(
+                "failed to write normalized config temp {}: {}",
+                temp.display(),
+                err
+            )
+        })?;
+        file.sync_all().map_err(|err| {
+            format!(
+                "failed to sync normalized config temp {}: {}",
+                temp.display(),
+                err
+            )
+        })?;
+    }
+    fs::rename(&temp, path).map_err(|err| {
+        format!(
+            "failed to replace config with normalized version {} -> {}: {}",
+            temp.display(),
+            path,
+            err
+        )
+    })?;
+    Ok(())
 }
 
 fn parse_string_list(value: Option<&Value>) -> Vec<String> {
@@ -323,10 +482,7 @@ fn parse_string_list(value: Option<&Value>) -> Vec<String> {
         return Vec::new();
     };
     match value {
-        Value::Array(items) => items
-            .iter()
-            .filter_map(|v| parse_string(Some(v)))
-            .collect(),
+        Value::Array(items) => items.iter().filter_map(|v| parse_string(Some(v))).collect(),
         Value::String(s) => s
             .split(',')
             .map(|item| item.trim())
@@ -414,7 +570,6 @@ fn resolve_napcat_base_url(common: &Value, group: Option<&Value>) -> Option<Stri
     env_override("OQQWALL_NAPCAT_BASE_URL", group_base.or(common_base))
 }
 
-
 fn resolve_napcat_token(common: &Value, group: Option<&Value>) -> Option<String> {
     let group_token = group.and_then(|v| parse_string(v.get("napcat_access_token")));
     let common_token = parse_string(common.get("napcat_access_token"));
@@ -440,4 +595,59 @@ fn base_url_for_log(url: &str) -> &str {
 #[cfg(not(debug_assertions))]
 fn base_url_for_log(_url: &str) -> &str {
     "<redacted>"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn normalize_group_accounts_prefers_accounts_and_removes_legacy_keys() {
+        let mut group = json!({
+            "accounts": ["10001", "10002"],
+            "mainqqid": "20001",
+            "minorqqid": ["20002"],
+            "mainqq_http_port": "3000",
+            "minorqq_http_port": ["3001"]
+        })
+        .as_object()
+        .cloned()
+        .expect("group object");
+        assert!(normalize_group_accounts(&mut group));
+        assert_eq!(group.get("accounts"), Some(&json!(["10001", "10002"])));
+        assert!(!group.contains_key("mainqqid"));
+        assert!(!group.contains_key("minorqqid"));
+        assert!(!group.contains_key("mainqq_http_port"));
+        assert!(!group.contains_key("minorqq_http_port"));
+    }
+
+    #[test]
+    fn normalize_group_accounts_migrates_from_acount_alias() {
+        let mut group = json!({
+            "acount": ["12345", "12346"]
+        })
+        .as_object()
+        .cloned()
+        .expect("group object");
+        assert!(normalize_group_accounts(&mut group));
+        assert_eq!(group.get("accounts"), Some(&json!(["12345", "12346"])));
+        assert!(!group.contains_key("acount"));
+    }
+
+    #[test]
+    fn normalize_group_accounts_migrates_from_legacy_main_minor() {
+        let mut group = json!({
+            "mainqqid": "12345",
+            "minorqqid": ["12346", "12347"]
+        })
+        .as_object()
+        .cloned()
+        .expect("group object");
+        assert!(normalize_group_accounts(&mut group));
+        assert_eq!(
+            group.get("accounts"),
+            Some(&json!(["12345", "12346", "12347"]))
+        );
+    }
 }

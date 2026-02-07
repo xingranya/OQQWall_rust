@@ -1,8 +1,8 @@
 use oqqwall_rust_drivers::blob_cache;
-use oqqwall_rust_drivers::media_fetcher::{spawn_media_fetcher, MediaFetcherRuntimeConfig};
-use oqqwall_rust_drivers::napcat::{spawn_napcat_ws, NapCatRuntimeConfig};
-use oqqwall_rust_drivers::renderer::{spawn_renderer, RendererRuntimeConfig};
-use oqqwall_rust_drivers::qzone::{spawn_qzone_sender, QzoneRuntimeConfig};
+use oqqwall_rust_drivers::media_fetcher::{MediaFetcherRuntimeConfig, spawn_media_fetcher};
+use oqqwall_rust_drivers::napcat::{NapCatRuntimeConfig, spawn_napcat_ws};
+use oqqwall_rust_drivers::qzone::{QzoneRuntimeConfig, spawn_qzone_sender};
+use oqqwall_rust_drivers::renderer::{RendererRuntimeConfig, spawn_renderer};
 use std::collections::HashMap;
 
 use crate::config::AppConfig;
@@ -22,7 +22,10 @@ macro_rules! debug_log {
 
 pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) {
     blob_cache::configure_max_cache_mb(config.max_cache_mb);
-    debug_log!("blob cache configured: max_cache_mb={}", config.max_cache_mb);
+    debug_log!(
+        "blob cache configured: max_cache_mb={}",
+        config.max_cache_mb
+    );
     debug_log!(
         "spawning drivers: groups={} tz_offset_minutes={}",
         config.groups.len(),
@@ -90,11 +93,7 @@ pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) {
         default_napcat: config.fallback_napcat.clone(),
         ..RendererRuntimeConfig::default()
     };
-    spawn_renderer(
-        handle.cmd_tx.clone(),
-        handle.subscribe(),
-        renderer_config,
-    );
+    spawn_renderer(handle.cmd_tx.clone(), handle.subscribe(), renderer_config);
     let runtime = QzoneRuntimeConfig {
         napcat_by_group,
         default_napcat: config.fallback_napcat.clone(),

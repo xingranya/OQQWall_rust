@@ -35,9 +35,7 @@ fn main() {
 
     for path in files {
         println!("cargo:rerun-if-changed={}", path.display());
-        let rel = path
-            .strip_prefix(&res_dir)
-            .expect("res path strip failed");
+        let rel = path.strip_prefix(&res_dir).expect("res path strip failed");
         let rel_str = rel.to_string_lossy().replace('\\', "/");
         let rel_lit = escape_rust_string(&rel_str);
         out.push_str(&format!(

@@ -69,7 +69,11 @@ fn cooldown_until(runtime: Option<&AccountRuntime>) -> Option<TimestampMs> {
 }
 
 #[allow(dead_code)]
-pub fn backoff_delay_ms(base_ms: TimestampMs, attempt: u32, max_delay_ms: TimestampMs) -> TimestampMs {
+pub fn backoff_delay_ms(
+    base_ms: TimestampMs,
+    attempt: u32,
+    max_delay_ms: TimestampMs,
+) -> TimestampMs {
     if attempt == 0 {
         return base_ms.min(max_delay_ms);
     }

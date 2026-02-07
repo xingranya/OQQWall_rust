@@ -3,12 +3,12 @@ use oqqwall_rust_core::event::{
     DraftEvent, GroupFlushReason, MediaEvent, RenderEvent, ReviewEvent, ScheduleEvent,
     SendPriority, SessionEvent,
 };
+use oqqwall_rust_core::state::{PostMeta, PostStage, RenderMeta, ReviewMeta};
 use oqqwall_rust_core::{
     Command, CoreConfig, Event, EventEnvelope, GroupConfig, Id128, IngressAttachment,
     IngressCommand, IngressMessage, MediaFetchKey, MediaFetchMeta, MediaKind, MediaReference,
     StateView, TickCommand,
 };
-use oqqwall_rust_core::state::{PostMeta, PostStage, RenderMeta, ReviewMeta};
 
 fn wrap(event: Event, id: u128) -> EventEnvelope {
     EventEnvelope {
@@ -73,7 +73,11 @@ fn tick_closes_session_and_creates_draft() {
     for event in tick_events {
         match event {
             Event::Session(SessionEvent::Closed { .. }) => saw_close = true,
-            Event::Draft(DraftEvent::PostDraftCreated { group_id, ingress_ids, .. }) => {
+            Event::Draft(DraftEvent::PostDraftCreated {
+                group_id,
+                ingress_ids,
+                ..
+            }) => {
                 assert_eq!(group_id, "group-a");
                 assert_eq!(ingress_ids.len(), 1);
                 saw_draft = true;

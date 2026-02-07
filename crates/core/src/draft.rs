@@ -8,7 +8,9 @@ pub struct Draft {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DraftBlock {
-    Paragraph { text: String },
+    Paragraph {
+        text: String,
+    },
     Attachment {
         kind: MediaKind,
         reference: MediaReference,

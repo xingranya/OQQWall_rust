@@ -53,15 +53,11 @@
 ### 组内字段编辑
 基础字段（文本输入）：
 - `mangroupid`（群号）
-- `mainqqid`（主账号）
-- `mainqq_http_port`（主账号端口）
+- `accounts`（账号列表，首项为主账号）
 - `max_post_stack`
 - `max_image_number_one_post`
 - `watermark_text`
 - `friend_add_message`
-
-副账号与端口：
-- 成对列表（`minorqqid` / `minorqq_http_port`），支持新增与删除。
 
 发送计划：
 - `send_schedule` 以时间字符串列表维护（HH:MM），支持新增与删除。
@@ -79,13 +75,8 @@
 ### 保存时校验
 保存前会执行校验，错误会阻止写入，警告会提示但允许保存：
 - 组名仅允许字母、数字、下划线。
-- `mangroupid`、`mainqqid`、`mainqq_http_port` 必须为数字。
-- 主账号与端口跨组唯一。
-- 副账号与端口：
-  - 列表长度必须一致。
-  - 值必须为数字。
-  - 账号/端口不能与其他组重复。
-  - 为空会给出警告。
+- `mangroupid` 必须为数字。
+- `accounts` 必须存在且每项为数字；账号跨组唯一。
 - `max_post_stack` / `max_image_number_one_post` 若填写必须为数字。
 - `friend_add_message` / `watermark_text` 若存在必须为字符串。
 - `send_schedule` 必须为数组且时间格式为 HH:MM。

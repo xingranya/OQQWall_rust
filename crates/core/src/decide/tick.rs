@@ -1,18 +1,18 @@
 use crate::anonymous::detect_anonymous;
-use crate::safety::detect_safe;
 use crate::command::TickCommand;
 use crate::config::CoreConfig;
 use crate::decide::builder::build_draft_from_messages;
 use crate::decide::flush::build_group_flush_events;
 use crate::decide::scheduler::{day_index, minute_of_day};
-use crate::decide::sender::{choose_account, AccountChoice};
+use crate::decide::sender::{AccountChoice, choose_account};
+use crate::draft::MediaReference;
 use crate::event::{
     DraftEvent, Event, GroupFlushReason, InputStatusKind, MediaEvent, RenderEvent, ReviewEvent,
     ScheduleEvent, SendEvent, SendPriority, SessionEvent,
 };
-use crate::ids::{derive_post_id, TimestampMs};
+use crate::ids::{TimestampMs, derive_post_id};
+use crate::safety::detect_safe;
 use crate::state::{PostStage, SessionMeta, StateView};
-use crate::draft::MediaReference;
 
 const INPUT_STATUS_ACTIVE_MAX_MS: i64 = 30 * 60 * 1000;
 const SEND_TIMEOUT_RETRY_DELAY_MS: i64 = 30 * 1000;
@@ -36,9 +36,10 @@ fn close_due_sessions(state: &StateView, cmd: &TickCommand, config: &CoreConfig)
     let mut due_sessions = state
         .sessions
         .values()
-        .filter(|meta| session_due_at_ms(state, meta, cmd.now_ms, config).is_some_and(|due_at| {
-            cmd.now_ms >= due_at
-        }))
+        .filter(|meta| {
+            session_due_at_ms(state, meta, cmd.now_ms, config)
+                .is_some_and(|due_at| cmd.now_ms >= due_at)
+        })
         .map(|meta| meta.session_id)
         .collect::<Vec<_>>();
     due_sessions.sort();
@@ -139,9 +140,11 @@ fn trigger_review_delays(state: &StateView, cmd: &TickCommand) -> Vec<Event> {
                     post_id: review.post_id,
                     review_code: review.review_code,
                 }));
-                events.push(Event::Review(crate::event::ReviewEvent::ReviewPublishRequested {
-                    review_id: review.review_id,
-                }));
+                events.push(Event::Review(
+                    crate::event::ReviewEvent::ReviewPublishRequested {
+                        review_id: review.review_id,
+                    },
+                ));
             }
         }
     }
@@ -309,13 +312,15 @@ fn maybe_start_send(state: &StateView, cmd: &TickCommand, config: &CoreConfig) -
             account_id,
             started_at_ms: cmd.now_ms,
         })],
-        AccountChoice::RetryAt(retry_at) => vec![Event::Schedule(ScheduleEvent::SendPlanRescheduled {
-            post_id: plan.post_id,
-            group_id: plan.group_id.clone(),
-            not_before_ms: retry_at,
-            priority: plan.priority,
-            seq: state.next_send_seq,
-        })],
+        AccountChoice::RetryAt(retry_at) => {
+            vec![Event::Schedule(ScheduleEvent::SendPlanRescheduled {
+                post_id: plan.post_id,
+                group_id: plan.group_id.clone(),
+                not_before_ms: retry_at,
+                priority: plan.priority,
+                seq: state.next_send_seq,
+            })]
+        }
         AccountChoice::Unavailable => vec![Event::Schedule(ScheduleEvent::SendPlanRescheduled {
             post_id: plan.post_id,
             group_id: plan.group_id.clone(),

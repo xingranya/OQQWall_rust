@@ -343,20 +343,10 @@ pub enum SendEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlobEvent {
-    BlobRegistered {
-        blob_id: BlobId,
-        size_bytes: u64,
-    },
-    BlobPersisted {
-        blob_id: BlobId,
-        path: String,
-    },
-    BlobReleased {
-        blob_id: BlobId,
-    },
-    BlobGcRequested {
-        blob_id: BlobId,
-    },
+    BlobRegistered { blob_id: BlobId, size_bytes: u64 },
+    BlobPersisted { blob_id: BlobId, path: String },
+    BlobReleased { blob_id: BlobId },
+    BlobGcRequested { blob_id: BlobId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -379,11 +369,6 @@ pub enum AccountEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ManualEvent {
-    ManualInterventionRequired {
-        post_id: PostId,
-        reason: String,
-    },
-    ManualInterventionResolved {
-        post_id: PostId,
-    },
+    ManualInterventionRequired { post_id: PostId, reason: String },
+    ManualInterventionResolved { post_id: PostId },
 }

@@ -138,8 +138,12 @@ pub struct SendDueKey {
 
 impl Ord for SendDueKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (self.not_before_ms, self.priority, self.seq, self.post_id.0)
-            .cmp(&(other.not_before_ms, other.priority, other.seq, other.post_id.0))
+        (self.not_before_ms, self.priority, self.seq, self.post_id.0).cmp(&(
+            other.not_before_ms,
+            other.priority,
+            other.seq,
+            other.post_id.0,
+        ))
     }
 }
 

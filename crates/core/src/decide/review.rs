@@ -1,5 +1,4 @@
 use crate::anonymous::detect_anonymous;
-use crate::safety::detect_safe;
 use crate::command::{ReviewAction, ReviewActionCommand};
 use crate::config::CoreConfig;
 use crate::decide::builder::build_draft_from_messages;
@@ -11,6 +10,7 @@ use crate::event::{
     SendPriority,
 };
 use crate::ids::{ExternalCode, IngressId, PostId, ReviewCode, ReviewId};
+use crate::safety::detect_safe;
 use crate::state::StateView;
 
 const STACKING_HOLD_MS: i64 = 365 * 24 * 60 * 60 * 1000;
@@ -34,7 +34,9 @@ pub fn decide_review_action(
         .unwrap_or_default();
 
     match &cmd.action {
-        ReviewAction::Approve => build_approve_events(state, cmd, config, review_id, post_id, group_id),
+        ReviewAction::Approve => {
+            build_approve_events(state, cmd, config, review_id, post_id, group_id)
+        }
         ReviewAction::Reject => {
             let mut events = vec![Event::Review(ReviewEvent::ReviewDecisionRecorded {
                 review_id,
@@ -89,14 +91,18 @@ pub fn decide_review_action(
             }
             events
         }
-        ReviewAction::Immediate => build_immediate_events(state, cmd, config, review_id, post_id, group_id),
+        ReviewAction::Immediate => {
+            build_immediate_events(state, cmd, config, review_id, post_id, group_id)
+        }
         ReviewAction::Refresh => {
             let mut events = Vec::new();
             events.extend(build_ingress_sync_events(state, post_id));
             if let Some(draft_event) = rebuild_draft_event(state, post_id, cmd.now_ms) {
                 events.push(Event::Draft(draft_event));
             }
-            events.push(Event::Review(ReviewEvent::ReviewRefreshRequested { review_id }));
+            events.push(Event::Review(ReviewEvent::ReviewRefreshRequested {
+                review_id,
+            }));
             events.push(Event::Render(RenderEvent::RenderRequested {
                 post_id,
                 attempt: 1,
@@ -106,7 +112,9 @@ pub fn decide_review_action(
         }
         ReviewAction::Rerender => {
             let mut events = build_ingress_sync_events(state, post_id);
-            events.push(Event::Review(ReviewEvent::ReviewRerenderRequested { review_id }));
+            events.push(Event::Review(ReviewEvent::ReviewRerenderRequested {
+                review_id,
+            }));
             events.push(Event::Render(RenderEvent::RenderRequested {
                 post_id,
                 attempt: 1,
@@ -120,7 +128,9 @@ pub fn decide_review_action(
             if let Some(draft_event) = rebuild_draft_event(state, post_id, cmd.now_ms) {
                 events.push(Event::Draft(draft_event));
             }
-            events.push(Event::Review(ReviewEvent::ReviewSelectAllRequested { review_id }));
+            events.push(Event::Review(ReviewEvent::ReviewSelectAllRequested {
+                review_id,
+            }));
             events.push(Event::Render(RenderEvent::RenderRequested {
                 post_id,
                 attempt: 1,
@@ -152,16 +162,18 @@ pub fn decide_review_action(
             review_id,
             text: text.clone(),
         })],
-        ReviewAction::Blacklist { reason } => vec![Event::Review(ReviewEvent::ReviewBlacklistRequested {
-            review_id,
-            reason: reason.clone(),
-        })],
-        ReviewAction::QuickReply { key } => vec![Event::Review(
-            ReviewEvent::ReviewQuickReplyRequested {
+        ReviewAction::Blacklist { reason } => {
+            vec![Event::Review(ReviewEvent::ReviewBlacklistRequested {
+                review_id,
+                reason: reason.clone(),
+            })]
+        }
+        ReviewAction::QuickReply { key } => {
+            vec![Event::Review(ReviewEvent::ReviewQuickReplyRequested {
                 review_id,
                 key: key.clone(),
-            },
-        )],
+            })]
+        }
         ReviewAction::Merge { review_code } => {
             build_merge_events(state, cmd, review_id, *review_code)
         }
@@ -303,11 +315,7 @@ fn build_send_plan_events(
     events
 }
 
-fn maybe_assign_external_code(
-    state: &StateView,
-    group_id: &str,
-    post_id: PostId,
-) -> Option<Event> {
+fn maybe_assign_external_code(state: &StateView, group_id: &str, post_id: PostId) -> Option<Event> {
     if state.external_code_by_post.contains_key(&post_id) {
         return None;
     }
@@ -449,7 +457,8 @@ fn build_merge_events(
         }
     }
     let draft = build_draft_from_messages(&messages);
-    let is_anonymous = post_is_anonymous(state, post_id) || post_is_anonymous(state, target_post_id);
+    let is_anonymous =
+        post_is_anonymous(state, post_id) || post_is_anonymous(state, target_post_id);
     let is_safe = post_is_safe(state, post_id) && post_is_safe(state, target_post_id);
 
     let mut events = Vec::new();
@@ -465,7 +474,9 @@ fn build_merge_events(
         draft,
         created_at_ms: cmd.now_ms,
     }));
-    events.push(Event::Review(ReviewEvent::ReviewRefreshRequested { review_id }));
+    events.push(Event::Review(ReviewEvent::ReviewRefreshRequested {
+        review_id,
+    }));
     events.push(Event::Render(RenderEvent::RenderRequested {
         post_id,
         attempt: 1,
@@ -559,7 +570,11 @@ fn count_group_queue_images(
     extra_post_id: Option<PostId>,
 ) -> usize {
     let mut total: usize = 0;
-    for plan in state.send_plans.values().filter(|plan| plan.group_id == group_id) {
+    for plan in state
+        .send_plans
+        .values()
+        .filter(|plan| plan.group_id == group_id)
+    {
         total = total.saturating_add(count_post_images(state, plan.post_id));
     }
     if let Some(post_id) = extra_post_id {

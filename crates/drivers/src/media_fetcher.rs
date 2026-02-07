@@ -4,15 +4,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use oqqwall_rust_core::draft::{IngressAttachment, IngressMessage, MediaKind, MediaReference};
 use oqqwall_rust_core::event::{BlobEvent, Event, IngressEvent, MediaEvent};
 use oqqwall_rust_core::ids::{BlobId, IngressId, TimestampMs};
-use oqqwall_rust_core::{derive_blob_id, Command};
-use reqwest::header::CONTENT_TYPE;
+use oqqwall_rust_core::{Command, derive_blob_id};
 use reqwest::Client;
-use tokio::sync::{broadcast, mpsc, Mutex};
+use reqwest::header::CONTENT_TYPE;
+use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
@@ -172,11 +172,7 @@ async fn prime_avatar_cache(client: Client, user_id: String) {
         }
     };
     if !resp.status().is_success() {
-        debug_log!(
-            "avatar http status {}: {}",
-            resp.status().as_u16(),
-            user_id
-        );
+        debug_log!("avatar http status {}: {}", resp.status().as_u16(), user_id);
         avatar_cache::finish_fetch(&user_id);
         return;
     }
@@ -239,7 +235,8 @@ async fn handle_fetch(
             Ok(fetched) => {
                 let ext = choose_extension(&attachment, &url, &fetched);
                 let bytes: Arc<[u8]> = Arc::from(fetched.bytes);
-                if let Some((kind, retention)) = blob_cache::cache_policy_for_media(attachment.kind) {
+                if let Some((kind, retention)) = blob_cache::cache_policy_for_media(attachment.kind)
+                {
                     blob_cache::store_arc(
                         blob_id,
                         bytes.clone(),
@@ -254,12 +251,14 @@ async fn handle_fetch(
                     &ext,
                     blob_id,
                     bytes.as_ref(),
-                )
-                {
+                ) {
                     Ok((path, size_bytes)) => {
                         let _ = send_event(
                             &cmd_tx,
-                            Event::Blob(BlobEvent::BlobRegistered { blob_id, size_bytes }),
+                            Event::Blob(BlobEvent::BlobRegistered {
+                                blob_id,
+                                size_bytes,
+                            }),
                         )
                         .await;
                         let _ = send_event(
@@ -278,28 +277,17 @@ async fn handle_fetch(
                         .await;
                     }
                     Err(err) => {
-                        let _ = send_media_failed(
-                            &cmd_tx,
-                            ingress_id,
-                            attachment_index,
-                            attempt,
-                            err,
-                        )
-                        .await;
+                        let _ =
+                            send_media_failed(&cmd_tx, ingress_id, attachment_index, attempt, err)
+                                .await;
                     }
                 }
                 break;
             }
             Err(err) => {
                 if local_attempt >= max_attempts {
-                    let _ = send_media_failed(
-                        &cmd_tx,
-                        ingress_id,
-                        attachment_index,
-                        attempt,
-                        err,
-                    )
-                    .await;
+                    let _ = send_media_failed(&cmd_tx, ingress_id, attachment_index, attempt, err)
+                        .await;
                     break;
                 }
                 let delay_ms = retry_delay_ms(attempt);
@@ -366,8 +354,7 @@ async fn fetch_bytes(client: &Client, source: &str) -> Result<FetchedBytes, Stri
         });
     }
     if let Some(path) = source.strip_prefix("file://") {
-        let bytes =
-            fs::read(path).map_err(|err| format!("read file failed: {}", err))?;
+        let bytes = fs::read(path).map_err(|err| format!("read file failed: {}", err))?;
         return Ok(FetchedBytes {
             bytes,
             content_type: None,
@@ -375,8 +362,7 @@ async fn fetch_bytes(client: &Client, source: &str) -> Result<FetchedBytes, Stri
         });
     }
     if Path::new(source).exists() {
-        let bytes =
-            fs::read(source).map_err(|err| format!("read file failed: {}", err))?;
+        let bytes = fs::read(source).map_err(|err| format!("read file failed: {}", err))?;
         return Ok(FetchedBytes {
             bytes,
             content_type: None,
@@ -507,8 +493,7 @@ fn persist_blob(
     bytes: &[u8],
 ) -> Result<(String, u64), String> {
     let dir = root.join(kind_dir);
-    fs::create_dir_all(&dir)
-        .map_err(|err| format!("create blob dir failed: {}", err))?;
+    fs::create_dir_all(&dir).map_err(|err| format!("create blob dir failed: {}", err))?;
     let filename = format!("{}.{}", id128_hex(blob_id.0), ext);
     let path = dir.join(filename);
     fs::write(&path, bytes).map_err(|err| format!("write blob failed: {}", err))?;
@@ -562,6 +547,8 @@ fn retry_delay_ms(attempt: u32) -> TimestampMs {
 }
 
 fn now_ms() -> TimestampMs {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     now.as_millis() as TimestampMs
 }

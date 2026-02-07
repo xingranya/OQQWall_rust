@@ -3,7 +3,7 @@ use crate::event::{
     Event, ManualEvent, RenderEvent, ReviewDecision, ReviewEvent, ScheduleEvent, SendEvent,
     SendPriority,
 };
-use crate::ids::{derive_review_id, PostId, ReviewCode, ReviewId};
+use crate::ids::{PostId, ReviewCode, ReviewId, derive_review_id};
 use crate::state::StateView;
 
 pub fn decide_driver_event(state: &StateView, event: &Event, config: &CoreConfig) -> Vec<Event> {
@@ -43,7 +43,9 @@ pub fn decide_driver_event(state: &StateView, event: &Event, config: &CoreConfig
                     post_id: *post_id,
                     review_code,
                 }));
-                events.push(Event::Review(ReviewEvent::ReviewPublishRequested { review_id }));
+                events.push(Event::Review(ReviewEvent::ReviewPublishRequested {
+                    review_id,
+                }));
             }
             events
         }

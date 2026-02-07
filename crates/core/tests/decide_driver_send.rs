@@ -2,7 +2,7 @@ use oqqwall_rust_core::event::{
     Event, ManualEvent, ReviewDecision, ReviewEvent, ScheduleEvent, SendEvent,
 };
 use oqqwall_rust_core::{
-    derive_review_id, Command, CoreConfig, EventEnvelope, GroupConfig, Id128, StateView,
+    Command, CoreConfig, EventEnvelope, GroupConfig, Id128, StateView, derive_review_id,
 };
 
 fn wrap(event: Event, id: u128) -> EventEnvelope {
@@ -76,10 +76,11 @@ fn send_failed_below_max_reschedules() {
             ..
         }) if group_id == "group-a" && *not_before_ms == 1_000
     )));
-    assert!(!events.iter().any(|event| matches!(
-        event,
-        Event::Send(SendEvent::SendGaveUp { .. })
-    )));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::Send(SendEvent::SendGaveUp { .. })))
+    );
 }
 
 #[test]

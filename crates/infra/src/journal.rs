@@ -23,7 +23,10 @@ pub struct JournalCursor {
 
 impl JournalCursor {
     pub fn origin() -> Self {
-        Self { segment: 1, offset: 0 }
+        Self {
+            segment: 1,
+            offset: 0,
+        }
     }
 }
 
@@ -89,16 +92,22 @@ impl LocalJournal {
         })
     }
 
-    pub fn open_with_config(data_dir: impl AsRef<Path>, config: JournalConfig) -> InfraResult<Self> {
+    pub fn open_with_config(
+        data_dir: impl AsRef<Path>,
+        config: JournalConfig,
+    ) -> InfraResult<Self> {
         let dir = data_dir.as_ref().join("journal");
         fs::create_dir_all(&dir)?;
-        Ok(Self { dir, config, writer: None })
+        Ok(Self {
+            dir,
+            config,
+            writer: None,
+        })
     }
 
     pub fn append(&mut self, env: &EventEnvelope) -> InfraResult<JournalCursor> {
         self.ensure_writer()?;
-        let payload =
-            bincode::serialize(env).map_err(|err| InfraError::Codec(err.to_string()))?;
+        let payload = bincode::serialize(env).map_err(|err| InfraError::Codec(err.to_string()))?;
         if payload.len() > MAX_RECORD_BYTES {
             return Err(InfraError::InvalidData(format!(
                 "event too large: {} bytes",
@@ -120,11 +129,14 @@ impl LocalJournal {
             }
         }
 
-        let writer = self.writer.as_mut().ok_or_else(|| {
-            InfraError::InvalidData("journal writer unavailable".to_string())
-        })?;
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| InfraError::InvalidData("journal writer unavailable".to_string()))?;
         let checksum = crc32fast::hash(&payload);
-        writer.writer.write_all(&(payload.len() as u32).to_le_bytes())?;
+        writer
+            .writer
+            .write_all(&(payload.len() as u32).to_le_bytes())?;
         writer.writer.write_all(&checksum.to_le_bytes())?;
         writer.writer.write_all(&payload)?;
         writer.offset = writer.offset.saturating_add(record_bytes);
@@ -144,7 +156,11 @@ impl LocalJournal {
         })
     }
 
-    pub fn replay<F>(&self, start: Option<JournalCursor>, mut apply: F) -> InfraResult<ReplayOutcome>
+    pub fn replay<F>(
+        &self,
+        start: Option<JournalCursor>,
+        mut apply: F,
+    ) -> InfraResult<ReplayOutcome>
     where
         F: FnMut(&EventEnvelope),
     {

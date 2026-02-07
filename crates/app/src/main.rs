@@ -1,6 +1,6 @@
-mod engine;
-mod connect;
 mod config;
+mod connect;
+mod engine;
 mod oobe;
 mod status;
 
@@ -16,13 +16,13 @@ macro_rules! debug_log {
     ($($arg:tt)*) => {};
 }
 
-use engine::Engine;
-use connect::spawn_napcat_drivers;
 use config::AppConfig;
-use oqqwall_rust_core::Command;
+use connect::spawn_napcat_drivers;
+use engine::Engine;
 use oqqwall_rust::tui::oqqwall_tui;
-use tokio::time::{sleep, Duration};
+use oqqwall_rust_core::Command;
 use std::env;
+use tokio::time::{Duration, sleep};
 
 #[tokio::main]
 async fn main() {
@@ -60,8 +60,7 @@ async fn main() {
         core_config.groups.len()
     );
     let data_dir = env::var("OQQWALL_DATA_DIR").unwrap_or_else(|_| "data".to_string());
-    let (engine, handle) =
-        Engine::new(core_config, &data_dir).expect("failed to init engine");
+    let (engine, handle) = Engine::new(core_config, &data_dir).expect("failed to init engine");
     debug_log!("engine created: data_dir={}", data_dir);
     let _status = status::spawn_status_logger(&handle);
     debug_log!("status logger spawned");

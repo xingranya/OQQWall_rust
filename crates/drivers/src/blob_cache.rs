@@ -146,10 +146,7 @@ where
 {
     let mut state = cache_state().lock().unwrap_or_else(|err| err.into_inner());
     for blob_id in blob_ids {
-        let retention = state
-            .entries
-            .get(&blob_id)
-            .map(|entry| entry.retention);
+        let retention = state.entries.get(&blob_id).map(|entry| entry.retention);
         if retention != Some(CacheRetention::RenderOnly) {
             continue;
         }

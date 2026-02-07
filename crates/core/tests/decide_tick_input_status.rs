@@ -1,5 +1,7 @@
 use oqqwall_rust_core::event::{Event, IngressEvent, InputStatusKind, SessionEvent};
-use oqqwall_rust_core::{Command, CoreConfig, EventEnvelope, Id128, IngressMessage, StateView, TickCommand};
+use oqqwall_rust_core::{
+    Command, CoreConfig, EventEnvelope, Id128, IngressMessage, StateView, TickCommand,
+};
 
 fn wrap(event: Event, id: u128, ts_ms: i64) -> EventEnvelope {
     EventEnvelope {

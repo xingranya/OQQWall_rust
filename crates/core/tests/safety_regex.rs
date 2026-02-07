@@ -1,5 +1,5 @@
-use oqqwall_rust_core::safety::detect_safe;
 use oqqwall_rust_core::IngressMessage;
+use oqqwall_rust_core::safety::detect_safe;
 
 fn msg(text: &str) -> IngressMessage {
     IngressMessage {

@@ -68,10 +68,8 @@ pub fn decide_global_action(
                 .reviews
                 .iter()
                 .filter_map(|(review_id, review)| {
-                    let is_pending = matches!(
-                        review.decision,
-                        None | Some(ReviewDecision::Deferred)
-                    );
+                    let is_pending =
+                        matches!(review.decision, None | Some(ReviewDecision::Deferred));
                     if !is_pending {
                         return None;
                     }
@@ -116,6 +114,12 @@ pub fn decide_global_action(
             let Some(meta) = state.reviews.get(&review_id) else {
                 return Vec::new();
             };
+            let Some(post_meta) = state.posts.get(&meta.post_id) else {
+                return Vec::new();
+            };
+            if post_meta.group_id != cmd.group_id {
+                return Vec::new();
+            }
             vec![
                 Event::Review(ReviewEvent::ReviewRerenderRequested { review_id }),
                 Event::Render(RenderEvent::RenderRequested {
@@ -125,18 +129,18 @@ pub fn decide_global_action(
                 }),
             ]
         }
-        GlobalAction::SetExternalNumber { value } => vec![Event::Review(
-            ReviewEvent::ReviewExternalNumberSet {
+        GlobalAction::SetExternalNumber { value } => {
+            vec![Event::Review(ReviewEvent::ReviewExternalNumberSet {
                 group_id: cmd.group_id.clone(),
                 next_number: *value,
-            },
-        )],
-        GlobalAction::BlacklistRemove { sender_id } => vec![Event::Review(
-            ReviewEvent::ReviewBlacklistRemoved {
+            })]
+        }
+        GlobalAction::BlacklistRemove { sender_id } => {
+            vec![Event::Review(ReviewEvent::ReviewBlacklistRemoved {
                 group_id: cmd.group_id.clone(),
                 sender_id: sender_id.clone(),
-            },
-        )],
+            })]
+        }
         _ => Vec::new(),
     }
 }

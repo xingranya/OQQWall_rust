@@ -159,7 +159,10 @@ fn approve_stacks_until_threshold() {
     });
     assert_eq!(not_before, Some(now_ms + hold_ms));
     assert!(!out.iter().any(|event| {
-        matches!(event, Event::Schedule(ScheduleEvent::SendPlanRescheduled { .. }))
+        matches!(
+            event,
+            Event::Schedule(ScheduleEvent::SendPlanRescheduled { .. })
+        )
     }));
 }
 

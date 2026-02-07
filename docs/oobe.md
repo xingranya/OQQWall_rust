@@ -23,8 +23,7 @@ OOBE 会依次询问并写入配置：
 
 - `group id`：逻辑组名（默认 `default`），对应 `groups.<group_id>`。
 - `mangroupid`：审核群 ID（必填）。
-- `mainqqid`：主账号 QQ 号（必填）。
-- `minorqqid`：副账号 QQ 号列表（可选，逗号分隔）。
+- `accounts`：账号列表（必填，逗号分隔；第一个为主账号）。
 - `napcat_base_url`：NapCat 反向 WS 的 base url（示例：`0.0.0.0:3001/oqqwall/ws`）。
 - `napcat_access_token`：NapCat access token（可留空，运行时用环境变量覆盖更安全）。
 - `process_waittime_sec`：投稿聚合窗口秒数。
@@ -37,7 +36,7 @@ OOBE 会依次询问并写入配置：
 
 ## 下一步
 
-1. 确认 NapCat 已启动并配置反向 WS，连接到 `ws://<base_url>/<QQ号>`（示例：`ws://127.0.0.1:3001/oqqwall/ws/456787654`）。
+1. 确认 NapCat 已启动并为 `accounts` 中每个账号配置反向 WS，连接到 `ws://<base_url>/<QQ号>`（示例：`ws://127.0.0.1:3001/oqqwall/ws/456787654`）。
 2. 运行主程序：
 
 ```bash

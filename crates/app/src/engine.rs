@@ -50,16 +50,21 @@ impl EngineHandle {
 }
 
 impl Engine {
-    pub fn new(config: CoreConfig, data_dir: impl AsRef<Path>) -> Result<(Self, EngineHandle), String> {
+    pub fn new(
+        config: CoreConfig,
+        data_dir: impl AsRef<Path>,
+    ) -> Result<(Self, EngineHandle), String> {
         let (cmd_tx, cmd_rx) = mpsc::channel(1024);
         let (bus, _) = broadcast::channel(1024);
-        let handle = EngineHandle { cmd_tx, bus: bus.clone() };
-        let mut journal =
-            LocalJournal::open(data_dir.as_ref()).map_err(|err| format!("journal init: {}", err))?;
-        let snapshot =
-            SnapshotStore::open(data_dir.as_ref()).map_err(|err| format!("snapshot init: {}", err))?;
-        let (state, last_cursor, last_snapshot_ms) =
-            Self::restore_state(&mut journal, &snapshot)?;
+        let handle = EngineHandle {
+            cmd_tx,
+            bus: bus.clone(),
+        };
+        let mut journal = LocalJournal::open(data_dir.as_ref())
+            .map_err(|err| format!("journal init: {}", err))?;
+        let snapshot = SnapshotStore::open(data_dir.as_ref())
+            .map_err(|err| format!("snapshot init: {}", err))?;
+        let (state, last_cursor, last_snapshot_ms) = Self::restore_state(&mut journal, &snapshot)?;
         let next_event_id = state
             .last_event_id
             .map(|id| id.0.saturating_add(1))
@@ -129,10 +134,7 @@ impl Engine {
                 last_snapshot_ms = loaded.taken_at_ms;
                 cursor = loaded.journal_cursor;
                 state = loaded.state;
-                debug_log!(
-                    "snapshot loaded: last_event_id={:?}",
-                    state.last_event_id
-                );
+                debug_log!("snapshot loaded: last_event_id={:?}", state.last_event_id);
             }
             Ok(None) => {
                 debug_log!("snapshot missing");
@@ -216,6 +218,8 @@ impl Engine {
 }
 
 fn now_ms() -> i64 {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     now.as_millis() as i64
 }

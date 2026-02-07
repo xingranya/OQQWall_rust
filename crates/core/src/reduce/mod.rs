@@ -265,9 +265,7 @@ fn reduce_media(state: &mut StateView, event: &MediaEvent) {
 fn reduce_render(state: &mut StateView, event: &RenderEvent) {
     match event {
         RenderEvent::RenderRequested {
-            post_id,
-            attempt,
-            ..
+            post_id, attempt, ..
         } => {
             let meta = state.render.entry(*post_id).or_insert(RenderMeta {
                 png_blob: None,
@@ -488,7 +486,10 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
     }
 }
 
-fn resolve_review_sender(state: &StateView, review_id: crate::ids::ReviewId) -> Option<(String, String)> {
+fn resolve_review_sender(
+    state: &StateView,
+    review_id: crate::ids::ReviewId,
+) -> Option<(String, String)> {
     let review = state.reviews.get(&review_id)?;
     let ingress_ids = state.post_ingress.get(&review.post_id)?;
     let ingress_id = ingress_ids.first()?;
@@ -616,11 +617,14 @@ fn reduce_send(state: &mut StateView, event: &SendEvent) {
         } => {
             let sending = state.sending.remove(post_id);
             state.update_post_stage(*post_id, PostStage::Sent);
-            let runtime = state.accounts.entry(account_id.clone()).or_insert(AccountRuntime {
-                enabled: true,
-                cooldown_until_ms: None,
-                last_send_ms: None,
-            });
+            let runtime = state
+                .accounts
+                .entry(account_id.clone())
+                .or_insert(AccountRuntime {
+                    enabled: true,
+                    cooldown_until_ms: None,
+                    last_send_ms: None,
+                });
             runtime.last_send_ms = Some(*finished_at_ms);
             if let Some(sending) = sending {
                 let runtime = state
@@ -644,11 +648,14 @@ fn reduce_send(state: &mut StateView, event: &SendEvent) {
                 meta.last_error = Some(error.clone());
             }
             state.update_post_stage(*post_id, PostStage::Failed);
-            state.accounts.entry(account_id.clone()).or_insert(AccountRuntime {
-                enabled: true,
-                cooldown_until_ms: None,
-                last_send_ms: None,
-            });
+            state
+                .accounts
+                .entry(account_id.clone())
+                .or_insert(AccountRuntime {
+                    enabled: true,
+                    cooldown_until_ms: None,
+                    last_send_ms: None,
+                });
         }
         SendEvent::SendGaveUp { post_id, reason } => {
             if let Some(meta) = state.posts.get_mut(post_id) {
@@ -661,7 +668,10 @@ fn reduce_send(state: &mut StateView, event: &SendEvent) {
 
 fn reduce_blob(state: &mut StateView, event: &BlobEvent) {
     match event {
-        BlobEvent::BlobRegistered { blob_id, size_bytes } => {
+        BlobEvent::BlobRegistered {
+            blob_id,
+            size_bytes,
+        } => {
             state.blobs.insert(
                 *blob_id,
                 BlobMeta {
@@ -693,41 +703,53 @@ fn reduce_blob(state: &mut StateView, event: &BlobEvent) {
 fn reduce_account(state: &mut StateView, event: &AccountEvent) {
     match event {
         AccountEvent::AccountEnabled { account_id } => {
-            let runtime = state.accounts.entry(account_id.clone()).or_insert(AccountRuntime {
-                enabled: true,
-                cooldown_until_ms: None,
-                last_send_ms: None,
-            });
+            let runtime = state
+                .accounts
+                .entry(account_id.clone())
+                .or_insert(AccountRuntime {
+                    enabled: true,
+                    cooldown_until_ms: None,
+                    last_send_ms: None,
+                });
             runtime.enabled = true;
         }
         AccountEvent::AccountDisabled { account_id } => {
-            let runtime = state.accounts.entry(account_id.clone()).or_insert(AccountRuntime {
-                enabled: false,
-                cooldown_until_ms: None,
-                last_send_ms: None,
-            });
+            let runtime = state
+                .accounts
+                .entry(account_id.clone())
+                .or_insert(AccountRuntime {
+                    enabled: false,
+                    cooldown_until_ms: None,
+                    last_send_ms: None,
+                });
             runtime.enabled = false;
         }
         AccountEvent::AccountCooldownSet {
             account_id,
             cooldown_until_ms,
         } => {
-            let runtime = state.accounts.entry(account_id.clone()).or_insert(AccountRuntime {
-                enabled: true,
-                cooldown_until_ms: None,
-                last_send_ms: None,
-            });
+            let runtime = state
+                .accounts
+                .entry(account_id.clone())
+                .or_insert(AccountRuntime {
+                    enabled: true,
+                    cooldown_until_ms: None,
+                    last_send_ms: None,
+                });
             runtime.cooldown_until_ms = Some(*cooldown_until_ms);
         }
         AccountEvent::AccountLastSendUpdated {
             account_id,
             last_send_ms,
         } => {
-            let runtime = state.accounts.entry(account_id.clone()).or_insert(AccountRuntime {
-                enabled: true,
-                cooldown_until_ms: None,
-                last_send_ms: None,
-            });
+            let runtime = state
+                .accounts
+                .entry(account_id.clone())
+                .or_insert(AccountRuntime {
+                    enabled: true,
+                    cooldown_until_ms: None,
+                    last_send_ms: None,
+                });
             runtime.last_send_ms = Some(*last_send_ms);
         }
     }

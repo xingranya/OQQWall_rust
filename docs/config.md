@@ -96,7 +96,7 @@
 
 ## 4. groups（账号组配置）字段说明
 
-> 原版 TUI 列出了组配置键顺序（GROUP_CONFIG_ORDER），覆盖了主要字段：mangroupid/mainqqid/阈值/send_schedule/quick_replies/admins 。
+> 当前实现以 `accounts` 为账号列表来源；其中 `accounts[0]` 是主账号。兼容读取旧字段 `mainqqid/minorqqid` 与别名 `acount`，启动时会自动迁移并写回为 `accounts`。
 
 ### 4.1 字段表（每个 group 对象）
 
@@ -105,8 +105,7 @@
 | mangroupid                |                     string | 必填               | 已支持                   | 审核群 ID：审核指令/回复仅在该群处理；其他群消息会被忽略                           |
 | napcat_base_url           |                     string | 必填               | 已支持                   | 本组 NapCat 反向 WS base url（推荐）                                  |
 | napcat_access_token       |                     string | 必填（可 env 覆盖）   | 已支持                   | 本组 NapCat token；可用 `OQQWALL_NAPCAT_TOKEN` 覆盖                 |
-| mainqqid                  |                     string | 必填               | 已支持                   | 主账号 QQ 号，用于组归属等                                                 |
-| minorqqid                 |              array[string] | 可空               | 已支持                   | 副账号 QQ 列表                                                       |
+| accounts                  |              array[string] | 必填（至少 1 个；首项为主账号） | 已支持                   | 账号列表，按顺序作为主号/替补优先级；审核相关群消息仅由当前有效主账号发送，主号离线按顺序替补 |
 | max_post_stack            |                        int | 默认 1；只允许正整数（1 表示单条直接发送，>1 启用暂存堆栈） | 已支持                   | sendcontrol 对此字段做默认值与数字校验                                       |
 | max_image_number_one_post |                        int | 默认 30；只允许正整数     | 已支持                   | 单条最大图片数；超限会拆分发送，并触发暂存区 flush                       |
 | individual_image_in_posts |                       bool | 默认 true          | 未支持                   | preprocess 缺省为 true，决定是否把用户原图也发送到空间（否则只发送概览图）                  |
@@ -147,7 +146,7 @@ Rust 版落地建议：
 
 ### 5.2 校验失败策略（建议）
 
-* **启动时**：关键字段缺失（如 napcat_base_url、napcat_access_token、mangroupid、mainqqid）→ 直接报错退出
+* **启动时**：关键字段缺失（如 napcat_base_url、napcat_access_token、mangroupid、accounts）→ 直接报错退出
 * **热更新时**：新配置解析失败 → 保留旧 `EffectiveConfig`，并发出告警/日志
 
 ---
@@ -206,8 +205,7 @@ Rust 版落地建议：
       "mangroupid": "993802974",
       "napcat_base_url": "0.0.0.0:3001/oqqwall/ws",
       "napcat_access_token": "REDACTED",
-      "mainqqid": "3995477265",
-      "minorqqid": [],
+      "accounts": ["3995477265"],
       "max_post_stack": 3,
       "max_image_number_one_post": 9,
       "individual_image_in_posts": false,

@@ -47,7 +47,7 @@ logs/                    # 可选：文件日志
 - `config.json` 必须存在并可读
 - 必填字段检查：
   - 每个 group 的 `napcat_base_url` / `napcat_access_token`
-  - 每个 group 的 `mangroupid / mainqqid`
+  - 每个 group 的 `mangroupid / accounts`（且 `accounts[0]` 为主账号）
 - 建议先用：
   - `OQQWall_RUST doctor --config ./config.json`（如果已实现）
   - 或临时增加一个 `--check-config` 子命令（推荐实现）

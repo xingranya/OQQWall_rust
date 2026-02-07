@@ -1,38 +1,42 @@
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
 use crate::avatar_cache;
 use crate::blob_cache::{self, CacheKind, CacheRetention};
-use crate::napcat::{extract_message_lite, napcat_account_for_group, napcat_ws_request, NapCatConfig};
+use crate::napcat::{
+    NapCatConfig, extract_message_lite, napcat_account_for_group, napcat_ws_request,
+};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use oqqwall_rust_core::decide::builder::build_draft_from_messages;
-use oqqwall_rust_core::event::{BlobEvent, Event, IngressEvent, MediaEvent, RenderEvent, SendEvent};
+use oqqwall_rust_core::event::{
+    BlobEvent, Event, IngressEvent, MediaEvent, RenderEvent, SendEvent,
+};
 use oqqwall_rust_core::{
-    derive_blob_id, BlobId, Command, Draft, DraftBlock, IngressId, IngressMessage, MediaKind,
-    MediaReference, PostId, StateView,
+    BlobId, Command, Draft, DraftBlock, IngressId, IngressMessage, MediaKind, MediaReference,
+    PostId, StateView, derive_blob_id,
 };
 use oqqwall_rust_infra::{LocalJournal, SnapshotStore};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use skia_safe::canvas::SrcRectConstraint;
+use skia_safe::font_style::{Slant, Weight, Width};
 use skia_safe::textlayout::{
     FontCollection, Paragraph, ParagraphBuilder, ParagraphStyle, TextStyle, TypefaceFontProvider,
 };
-use skia_safe::font_style::{Slant, Weight, Width};
-use skia_safe::{
-    image_filters, Canvas, ClipOp, Color4f, Data, EncodedImageFormat, FontStyle, Image, Paint,
-    PathBuilder, Rect, RRect, SamplingOptions, Typeface,
-};
 use skia_safe::utils::OrderedFontMgr;
+use skia_safe::{
+    Canvas, ClipOp, Color4f, Data, EncodedImageFormat, FontStyle, Image, Paint, PathBuilder, RRect,
+    Rect, SamplingOptions, Typeface, image_filters,
+};
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
-use tokio::sync::broadcast::error::RecvError;
 
 mod embedded_resources {
     include!(concat!(env!("OUT_DIR"), "/embedded_resources.rs"));
@@ -93,8 +97,12 @@ struct HeaderInfo {
 
 #[derive(Debug, Clone)]
 enum BlockKind {
-    Text { lines: Vec<InlineLine> },
-    Image { image: Option<ResolvedImage> },
+    Text {
+        lines: Vec<InlineLine>,
+    },
+    Image {
+        image: Option<ResolvedImage>,
+    },
     MediaCard {
         lines: Vec<String>,
         icon_text: String,
@@ -241,8 +249,16 @@ impl TextMeasurer {
 impl ImageMemoryCache {
     fn on_event(&mut self, state: &StateView, event: &Event) {
         match event {
-            Event::Ingress(IngressEvent::MessageAccepted { ingress_id, message, .. })
-            | Event::Ingress(IngressEvent::MessageSynced { ingress_id, message, .. }) => {
+            Event::Ingress(IngressEvent::MessageAccepted {
+                ingress_id,
+                message,
+                ..
+            })
+            | Event::Ingress(IngressEvent::MessageSynced {
+                ingress_id,
+                message,
+                ..
+            }) => {
                 self.prime_from_message(*ingress_id, message);
             }
             Event::Media(MediaEvent::MediaFetchSucceeded {
@@ -290,7 +306,10 @@ impl ImageMemoryCache {
         if !attachment_is_image(state, ingress_id, attachment_index) {
             return;
         }
-        if let Some(key) = self.attachment_sources.remove(&(ingress_id, attachment_index)) {
+        if let Some(key) = self
+            .attachment_sources
+            .remove(&(ingress_id, attachment_index))
+        {
             self.entries.remove(&key);
         }
         let key = ImageCacheKey::Blob(blob_id);
@@ -404,13 +423,18 @@ pub fn spawn_renderer(
             }
 
             if let Event::Render(RenderEvent::RenderRequested {
-                post_id,
-                attempt,
-                ..
+                post_id, attempt, ..
             }) = env.event
             {
-                if let Err(_err) =
-                    handle_render_request(&cmd_tx, &state, post_id, attempt, &config, &mut image_cache).await
+                if let Err(_err) = handle_render_request(
+                    &cmd_tx,
+                    &state,
+                    post_id,
+                    attempt,
+                    &config,
+                    &mut image_cache,
+                )
+                .await
                 {
                     debug_log!("render failed: post_id={} err={}", post_id.0, _err);
                 }
@@ -425,25 +449,18 @@ fn load_state_view_cached() -> StateView {
     static CACHE: OnceLock<StateView> = OnceLock::new();
     CACHE
         .get_or_init(|| {
-            let data_dir =
-                std::env::var("OQQWALL_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+            let data_dir = std::env::var("OQQWALL_DATA_DIR").unwrap_or_else(|_| "data".to_string());
             let journal = match LocalJournal::open(&data_dir) {
                 Ok(journal) => journal,
                 Err(_err) => {
-                    debug_log!(
-                        "renderer preload skipped: journal open failed: {}",
-                        _err
-                    );
+                    debug_log!("renderer preload skipped: journal open failed: {}", _err);
                     return StateView::default();
                 }
             };
             let snapshot = match SnapshotStore::open(&data_dir) {
                 Ok(snapshot) => snapshot,
                 Err(_err) => {
-                    debug_log!(
-                        "renderer preload skipped: snapshot open failed: {}",
-                        _err
-                    );
+                    debug_log!("renderer preload skipped: snapshot open failed: {}", _err);
                     return StateView::default();
                 }
             };
@@ -521,7 +538,8 @@ async fn handle_render_request(
         CacheRetention::UntilSend,
         Some("image/png".to_string()),
     );
-    let (path, size_bytes) = persist_blob(&config.blob_root, "png", "png", blob_id, bytes.as_ref())?;
+    let (path, size_bytes) =
+        persist_blob(&config.blob_root, "png", "png", blob_id, bytes.as_ref())?;
 
     send_event(
         cmd_tx,
@@ -533,14 +551,15 @@ async fn handle_render_request(
     .await?;
     send_event(
         cmd_tx,
-        Event::Blob(BlobEvent::BlobPersisted {
-            blob_id,
-            path,
-        }),
+        Event::Blob(BlobEvent::BlobPersisted { blob_id, path }),
     )
     .await?;
 
-    send_event(cmd_tx, Event::Render(RenderEvent::PngReady { post_id, blob_id })).await?;
+    send_event(
+        cmd_tx,
+        Event::Render(RenderEvent::PngReady { post_id, blob_id }),
+    )
+    .await?;
 
     Ok(())
 }
@@ -702,7 +721,9 @@ async fn forward_blocks_for_id(
             }]
         }
     };
-    context.cache.insert(forward_id.to_string(), resolved.clone());
+    context
+        .cache
+        .insert(forward_id.to_string(), resolved.clone());
     resolved
 }
 
@@ -732,9 +753,7 @@ async fn forward_messages_to_blocks(
 ) -> Vec<DraftBlock> {
     let mut blocks = Vec::new();
     for message in messages {
-        let payload = message
-            .get("message")
-            .or_else(|| message.get("content"));
+        let payload = message.get("message").or_else(|| message.get("content"));
         let extracted = extract_message_lite(payload);
         let mut text_blocks = expand_forward_in_text(&extracted.text, context, depth).await;
         blocks.append(&mut text_blocks);
@@ -763,7 +782,10 @@ fn extract_header(state: &StateView, post_id: PostId) -> HeaderInfo {
             if let Some(meta) = state.ingress_meta.get(ingress_id) {
                 group_id = meta.group_id.clone();
                 user_id = meta.user_id.clone();
-                sender_name = meta.sender_name.clone().filter(|name| !name.trim().is_empty());
+                sender_name = meta
+                    .sender_name
+                    .clone()
+                    .filter(|name| !name.trim().is_empty());
                 break;
             }
         }
@@ -823,7 +845,9 @@ fn render_png(
         config.max_height_px,
         scale
     );
-    let content_width = config.canvas_width_px.saturating_sub(padding.saturating_mul(2));
+    let content_width = config
+        .canvas_width_px
+        .saturating_sub(padding.saturating_mul(2));
     let header_x = padding;
     let header_y = padding;
     let header_text_x = header_x + avatar_size + header_gap;
@@ -900,8 +924,7 @@ fn render_png(
                 let bubble_w = (max_line_w + bubble_pad_left + bubble_pad_right)
                     .min(content_width)
                     .max(1);
-                let height =
-                    bubble_pad_top + bubble_pad_bottom + line_height * lines.len() as u32;
+                let height = bubble_pad_top + bubble_pad_bottom + line_height * lines.len() as u32;
                 BlockLayout {
                     x: padding,
                     y: cursor_y,
@@ -924,8 +947,7 @@ fn render_png(
                     .get(block_idx)
                     .and_then(|value| value.clone());
                 match *kind {
-                    oqqwall_rust_core::MediaKind::Image
-                    | oqqwall_rust_core::MediaKind::Sticker => {
+                    oqqwall_rust_core::MediaKind::Image | oqqwall_rust_core::MediaKind::Sticker => {
                         let max_width = (content_width / 2).max(1);
                         let max_height = 300u32;
                         let (width, height) = match image
@@ -984,9 +1006,8 @@ fn render_png(
                             &mut text_measurer,
                             &emoji_cache,
                         );
-                        let meta_line = size_bytes
-                            .as_ref()
-                            .and_then(|size| format_size_line(*size));
+                        let meta_line =
+                            size_bytes.as_ref().and_then(|size| format_size_line(*size));
                         let name_height = name_lines.len() as u32 * file_line_height;
                         let meta_height = if meta_line.is_some() {
                             file_meta_height + file_meta_gap
@@ -1056,9 +1077,7 @@ fn render_png(
                 );
             }
             BlockKind::Image { image } => {
-                let _size = image
-                    .as_ref()
-                    .and_then(|img| img.width.zip(img.height));
+                let _size = image.as_ref().and_then(|img| img.width.zip(img.height));
                 debug_log!(
                     "layout block: idx={} kind=image width={} height={} image_size={:?}",
                     block_idx,
@@ -1124,7 +1143,9 @@ fn render_png(
                 .min(content_width)
                 .max(1);
             let trunc_height = bubble_pad_top + bubble_pad_bottom + line_height;
-            let trunc_bottom = cursor_y.saturating_add(trunc_height).saturating_add(padding);
+            let trunc_bottom = cursor_y
+                .saturating_add(trunc_height)
+                .saturating_add(padding);
             if trunc_bottom <= config.max_height_px {
                 debug_log!("layout truncate: adding truncation block");
                 blocks.push(BlockLayout {
@@ -1132,11 +1153,11 @@ fn render_png(
                     y: cursor_y,
                     width: bubble_w,
                     height: trunc_height,
-                    kind: BlockKind::Text {
-                        lines: trunc_lines,
-                    },
+                    kind: BlockKind::Text { lines: trunc_lines },
                 });
-                cursor_y = cursor_y.saturating_add(trunc_height).saturating_add(spacing_lg);
+                cursor_y = cursor_y
+                    .saturating_add(trunc_height)
+                    .saturating_add(spacing_lg);
             }
             break;
         }
@@ -1171,11 +1192,9 @@ fn render_png(
         output_height
     );
 
-    let mut surface = skia_safe::surfaces::raster_n32_premul((
-        output_width as i32,
-        output_height as i32,
-    ))
-    .ok_or_else(|| "surface alloc failed".to_string())?;
+    let mut surface =
+        skia_safe::surfaces::raster_n32_premul((output_width as i32, output_height as i32))
+            .ok_or_else(|| "surface alloc failed".to_string())?;
     let canvas = surface.canvas();
     canvas.scale((scale as f32, scale as f32));
 
@@ -1190,7 +1209,12 @@ fn render_png(
     bg_paint.set_color4f(color_bg, None);
     bg_paint.set_anti_alias(true);
     canvas.draw_rect(
-        Rect::from_xywh(0.0, 0.0, config.canvas_width_px as f32, background_height as f32),
+        Rect::from_xywh(
+            0.0,
+            0.0,
+            config.canvas_width_px as f32,
+            background_height as f32,
+        ),
         &bg_paint,
     );
 
@@ -1269,8 +1293,14 @@ fn render_png(
     divider.set_style(skia_safe::paint::Style::Stroke);
     divider.set_stroke_width(1.0);
     canvas.draw_line(
-        (padding as f32, (header_y + header_height + spacing_xxl / 2) as f32),
-        ((padding + content_width) as f32, (header_y + header_height + spacing_xxl / 2) as f32),
+        (
+            padding as f32,
+            (header_y + header_height + spacing_xxl / 2) as f32,
+        ),
+        (
+            (padding + content_width) as f32,
+            (header_y + header_height + spacing_xxl / 2) as f32,
+        ),
         &divider,
     );
 
@@ -1304,8 +1334,7 @@ fn render_png(
                 let line_x = block.x + bubble_pad_left;
                 let line_y = block.y + bubble_pad_top + font_size;
                 for (idx, line) in lines.iter().enumerate() {
-                    let baseline_y =
-                        line_y + line_height.saturating_mul(idx as u32);
+                    let baseline_y = line_y + line_height.saturating_mul(idx as u32);
                     let mut cursor_x = line_x;
                     for run in &line.runs {
                         match run {
@@ -1486,13 +1515,21 @@ fn render_png(
                     let mut icon_bg = Paint::default();
                     icon_bg.set_color4f(color_bg, None);
                     icon_bg.set_anti_alias(true);
-                    canvas.draw_circle((cx as f32, cy as f32), (card_icon_size / 2) as f32, &icon_bg);
+                    canvas.draw_circle(
+                        (cx as f32, cy as f32),
+                        (card_icon_size / 2) as f32,
+                        &icon_bg,
+                    );
                     let mut icon_border = Paint::default();
                     icon_border.set_color4f(color_border, None);
                     icon_border.set_style(skia_safe::paint::Style::Stroke);
                     icon_border.set_stroke_width(1.0);
                     icon_border.set_anti_alias(true);
-                    canvas.draw_circle((cx as f32, cy as f32), (card_icon_size / 2) as f32, &icon_border);
+                    canvas.draw_circle(
+                        (cx as f32, cy as f32),
+                        (card_icon_size / 2) as f32,
+                        &icon_border,
+                    );
 
                     let tri_x = icon_x + card_icon_size / 3;
                     let tri_y = icon_y + card_icon_size / 4;
@@ -1536,8 +1573,7 @@ fn render_png(
                         font_weight_body,
                         color_meta,
                     ) {
-                        let icon_baseline =
-                            center_baseline(icon_center_y as f32, &metrics);
+                        let icon_baseline = center_baseline(icon_center_y as f32, &metrics);
                         let icon_x = icon_center_x as f32 - metrics.width * 0.5;
                         let top_y = icon_baseline - metrics.baseline;
                         paragraph.paint(canvas, (icon_x, top_y));
@@ -1591,11 +1627,9 @@ fn render_png(
                 let icon_y = block.y + (block.height - file_icon_size) / 2;
                 let mut drew_icon = false;
                 if let Some(path) = icon_path {
-                    let icon_image = file_icon_cache
-                        .entry(path)
-                        .or_insert_with(|| {
-                            resolved_image_from_path(path).and_then(|img| decode_image(&img))
-                        });
+                    let icon_image = file_icon_cache.entry(path).or_insert_with(|| {
+                        resolved_image_from_path(path).and_then(|img| decode_image(&img))
+                    });
                     if let Some(image) = icon_image.as_ref() {
                         let pad = 2.0f32;
                         let icon_dst = Rect::from_xywh(
@@ -1827,7 +1861,9 @@ impl EmojiRenderCache {
         if let Some(entry) = self.image_cache.get(&glyph_id) {
             return entry.clone();
         }
-        let Some(store_ref) = self.store else { return None; };
+        let Some(store_ref) = self.store else {
+            return None;
+        };
         let mut store = match store_ref.lock() {
             Ok(guard) => guard,
             Err(guard) => guard.into_inner(),
@@ -1845,7 +1881,6 @@ impl EmojiRenderCache {
         self.image_cache.insert(glyph_id, image.clone());
         image
     }
-
 }
 
 fn decode_emoji_image(bytes: &[u8]) -> Option<Image> {
@@ -1910,9 +1945,7 @@ fn init_emoji_png_store_inner() -> Option<Mutex<EmojiPngStore>> {
     let metadata = match load_embedded_emoji_png_metadata() {
         Some(metadata) => metadata,
         None => {
-            debug_log!(
-                "emoji png: metadata missing; run scripts/extract_apple_emoji_pngs.py"
-            );
+            debug_log!("emoji png: metadata missing; run scripts/extract_apple_emoji_pngs.py");
             return None;
         }
     };
@@ -2166,7 +2199,12 @@ fn draw_image_cover_rounded(canvas: &Canvas, img: &Image, dst: Rect, radius: f32
     let crop_h = dst.height() / scale;
     let crop_x = (sw - crop_w) * 0.5;
     let crop_y = (sh - crop_h) * 0.5;
-    let src = Rect::from_xywh(crop_x.max(0.0), crop_y.max(0.0), crop_w.max(1.0), crop_h.max(1.0));
+    let src = Rect::from_xywh(
+        crop_x.max(0.0),
+        crop_y.max(0.0),
+        crop_w.max(1.0),
+        crop_h.max(1.0),
+    );
     let rr = RRect::new_rect_xy(dst, radius, radius);
 
     canvas.save();
@@ -2212,7 +2250,10 @@ async fn resolve_image_sources(
     let mut block_labels = vec![None; draft.blocks.len()];
     let mut used_keys = HashSet::new();
     for (idx, block) in draft.blocks.iter().enumerate() {
-        if let DraftBlock::Attachment { kind, reference, .. } = block {
+        if let DraftBlock::Attachment {
+            kind, reference, ..
+        } = block
+        {
             if is_renderable_image(*kind) {
                 block_images[idx] = resolve_media_reference_for_image(
                     reference,
@@ -2296,7 +2337,10 @@ fn format_bytes(size_bytes: u64) -> String {
     }
 }
 
-fn resolve_face_image(id: &str, cache: &mut HashMap<String, ResolvedImage>) -> Option<ResolvedImage> {
+fn resolve_face_image(
+    id: &str,
+    cache: &mut HashMap<String, ResolvedImage>,
+) -> Option<ResolvedImage> {
     if let Some(found) = cache.get(id) {
         debug_log!("face cache hit: id={}", id);
         return Some(found.clone());
@@ -2506,9 +2550,9 @@ fn file_icon_path(name: &str) -> Option<&'static str> {
         "pages" => "res/pages.png",
         "key" | "keynote" => "res/keynote.png",
         "numbers" => "res/numbers.png",
-        "rs" | "js" | "ts" | "json" | "yaml" | "yml" | "toml" | "go" | "py" | "java"
-        | "c" | "cc" | "cpp" | "h" | "hpp" | "cs" | "php" | "rb" | "swift" | "kt"
-        | "kts" | "html" | "css" | "scss" | "sh" | "bat" | "ps1" | "sql" => "res/code.png",
+        "rs" | "js" | "ts" | "json" | "yaml" | "yml" | "toml" | "go" | "py" | "java" | "c"
+        | "cc" | "cpp" | "h" | "hpp" | "cs" | "php" | "rb" | "swift" | "kt" | "kts" | "html"
+        | "css" | "scss" | "sh" | "bat" | "ps1" | "sql" => "res/code.png",
         "" => "res/unknown.png",
         _ => "res/unknown.png",
     };
@@ -2554,9 +2598,11 @@ fn measure_inline_text_width(
     while idx < bytes.len() {
         if let Some((_glyph_id, consumed)) = emoji_cache.match_sequence(text, idx) {
             if !segment.is_empty() {
-                width = width.saturating_add(
-                    measurer.measure_text_width(&segment, font_size, font_weight),
-                );
+                width = width.saturating_add(measurer.measure_text_width(
+                    &segment,
+                    font_size,
+                    font_weight,
+                ));
                 segment.clear();
             }
             width = width.saturating_add(emoji_size);
@@ -2570,9 +2616,11 @@ fn measure_inline_text_width(
         }
         if emoji_cache.is_emoji_char(ch) {
             if !segment.is_empty() {
-                width = width.saturating_add(
-                    measurer.measure_text_width(&segment, font_size, font_weight),
-                );
+                width = width.saturating_add(measurer.measure_text_width(
+                    &segment,
+                    font_size,
+                    font_weight,
+                ));
                 segment.clear();
             }
             width = width.saturating_add(emoji_size);
@@ -2582,9 +2630,7 @@ fn measure_inline_text_width(
         idx += ch.len_utf8();
     }
     if !segment.is_empty() {
-        width = width.saturating_add(
-            measurer.measure_text_width(&segment, font_size, font_weight),
-        );
+        width = width.saturating_add(measurer.measure_text_width(&segment, font_size, font_weight));
     }
     width
 }
@@ -2603,23 +2649,12 @@ fn truncate_text(
     let mut out = String::new();
     for ch in text.chars() {
         out.push(ch);
-        let width = measure_inline_text_width(
-            &out,
-            font_size,
-            font_weight,
-            measurer,
-            emoji_cache,
-        );
+        let width = measure_inline_text_width(&out, font_size, font_weight, measurer, emoji_cache);
         if width > max_width {
             out.pop();
             let ellipsis_width = measurer.measure_text_width("...", font_size, font_weight);
-            let base_width = measure_inline_text_width(
-                &out,
-                font_size,
-                font_weight,
-                measurer,
-                emoji_cache,
-            );
+            let base_width =
+                measure_inline_text_width(&out, font_size, font_weight, measurer, emoji_cache);
             if base_width + ellipsis_width <= max_width && !out.is_empty() {
                 out.push_str("...");
             }
@@ -2708,8 +2743,7 @@ fn wrap_inline_text(
                 }
             }
             current.push(atom);
-            let segment_width =
-                measurer.measure_text_width(&segment_text, font_size, font_weight);
+            let segment_width = measurer.measure_text_width(&segment_text, font_size, font_weight);
             let current_width = base_width.saturating_add(segment_width);
             if current_width > max_width && current.len() > 1 {
                 if let Some(break_idx) = last_break {
@@ -2852,7 +2886,11 @@ fn wrap_text(
                     let line: String = current[..break_idx].iter().collect();
                     lines.push(line.trim_end().to_string());
                     let mut remainder: Vec<char> = current[break_idx..].iter().copied().collect();
-                    while remainder.first().map(|c| c.is_whitespace()).unwrap_or(false) {
+                    while remainder
+                        .first()
+                        .map(|c| c.is_whitespace())
+                        .unwrap_or(false)
+                    {
                         remainder.remove(0);
                     }
                     current = remainder;
@@ -2959,7 +2997,11 @@ fn inline_atom_is_whitespace(atom: &InlineAtom) -> bool {
 }
 
 fn trim_inline_leading_spaces(atoms: &mut Vec<InlineAtom>) {
-    while atoms.first().map(inline_atom_is_whitespace).unwrap_or(false) {
+    while atoms
+        .first()
+        .map(inline_atom_is_whitespace)
+        .unwrap_or(false)
+    {
         atoms.remove(0);
     }
 }
@@ -2988,9 +3030,11 @@ fn build_inline_line(
             }
             InlineAtom::Face(id) => {
                 if !current.is_empty() {
-                    width = width.saturating_add(
-                        measurer.measure_text_width(&current, font_size, font_weight),
-                    );
+                    width = width.saturating_add(measurer.measure_text_width(
+                        &current,
+                        font_size,
+                        font_weight,
+                    ));
                     runs.push(InlineRun::Text(current.clone()));
                     current.clear();
                 }
@@ -2999,20 +3043,23 @@ fn build_inline_line(
             }
             InlineAtom::Emoji(glyph_id) => {
                 if !current.is_empty() {
-                    width = width.saturating_add(
-                        measurer.measure_text_width(&current, font_size, font_weight),
-                    );
+                    width = width.saturating_add(measurer.measure_text_width(
+                        &current,
+                        font_size,
+                        font_weight,
+                    ));
                     runs.push(InlineRun::Text(current.clone()));
                     current.clear();
                 }
-                runs.push(InlineRun::Emoji { glyph_id: *glyph_id });
+                runs.push(InlineRun::Emoji {
+                    glyph_id: *glyph_id,
+                });
                 width = width.saturating_add(emoji_size);
             }
         }
     }
     if !current.is_empty() {
-        width =
-            width.saturating_add(measurer.measure_text_width(&current, font_size, font_weight));
+        width = width.saturating_add(measurer.measure_text_width(&current, font_size, font_weight));
         runs.push(InlineRun::Text(current));
     }
     InlineLine { runs, width }
@@ -3033,7 +3080,6 @@ fn should_skip_emoji_char(ch: char) -> bool {
         || (0xE0020..=0xE007F).contains(&(ch as u32))
 }
 
-
 fn persist_blob(
     root: &Path,
     kind_dir: &str,
@@ -3042,18 +3088,15 @@ fn persist_blob(
     bytes: &[u8],
 ) -> Result<(String, u64), String> {
     let dir = root.join(kind_dir);
-    fs::create_dir_all(&dir)
-        .map_err(|err| format!("create blob dir failed: {}", err))?;
+    fs::create_dir_all(&dir).map_err(|err| format!("create blob dir failed: {}", err))?;
     let filename = format!("{}.{}", id128_hex(blob_id.0), ext);
     let path = dir.join(filename);
     let tmp_path = dir.join(format!("{}.{}.tmp", id128_hex(blob_id.0), ext));
     fs::write(&tmp_path, bytes).map_err(|err| format!("write blob failed: {}", err))?;
     if let Err(err) = fs::rename(&tmp_path, &path) {
         if err.kind() == std::io::ErrorKind::AlreadyExists {
-            fs::remove_file(&path)
-                .map_err(|err| format!("cleanup blob failed: {}", err))?;
-            fs::rename(&tmp_path, &path)
-                .map_err(|err| format!("rename blob failed: {}", err))?;
+            fs::remove_file(&path).map_err(|err| format!("cleanup blob failed: {}", err))?;
+            fs::rename(&tmp_path, &path).map_err(|err| format!("rename blob failed: {}", err))?;
         } else {
             return Err(format!("rename blob failed: {}", err));
         }
@@ -3123,7 +3166,10 @@ fn init_font_bytes_cache(font_dir: &Path) {
         if let Ok(entries) = fs::read_dir(font_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("");
+                let ext = path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("");
                 if !matches!(ext.to_ascii_lowercase().as_str(), "ttf" | "otf") {
                     continue;
                 }
@@ -3183,7 +3229,10 @@ fn build_font_collection(font_dir: &Path) -> FontCollection {
             let mut _disk_count = 0usize;
             for entry in entries.flatten() {
                 let path = entry.path();
-                let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("");
+                let ext = path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("");
                 if !matches!(ext.to_ascii_lowercase().as_str(), "ttf" | "otf") {
                     debug_log!("font skip non-ttf/otf: {}", path.display());
                     continue;
@@ -3236,7 +3285,10 @@ fn register_embedded_fonts(
             continue;
         }
         let path = Path::new(entry.path);
-        let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("");
+        let ext = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
         if !matches!(ext.to_ascii_lowercase().as_str(), "ttf" | "otf") {
             debug_log!("embedded font skip non-ttf/otf: {}", entry.path);
             continue;
@@ -3338,11 +3390,7 @@ fn path_to_slash(path: &Path) -> Option<String> {
             _ => return None,
         }
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 fn resolve_res_dir() -> PathBuf {

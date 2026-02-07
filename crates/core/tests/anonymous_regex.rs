@@ -1,5 +1,5 @@
-use oqqwall_rust_core::anonymous::detect_anonymous;
 use oqqwall_rust_core::IngressMessage;
+use oqqwall_rust_core::anonymous::detect_anonymous;
 
 fn msg(text: &str) -> IngressMessage {
     IngressMessage {

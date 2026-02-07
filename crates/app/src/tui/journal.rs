@@ -4,13 +4,14 @@ use std::fmt::Write as _;
 use std::io::{self, Stdout, Write};
 use std::time::Duration;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyCode, KeyEvent,
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use oqqwall_rust_core::draft::{Draft, DraftBlock, IngressMessage};
 use oqqwall_rust_core::event::{
@@ -20,14 +21,13 @@ use oqqwall_rust_core::event::{
 };
 use oqqwall_rust_core::ids::Id128;
 use oqqwall_rust_infra::{JournalCorruption, LocalJournal};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
-use unicode_width::UnicodeWidthChar;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
+use unicode_width::UnicodeWidthChar;
 
 struct EventEntry {
     summary: String,
@@ -670,15 +670,16 @@ fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
 
-fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    app: &mut App,
-) -> io::Result<()> {
+fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::Result<()> {
     let tick_rate = Duration::from_millis(200);
     loop {
         terminal.draw(|f| ui(f, app, f.area()))?;
@@ -772,12 +773,9 @@ fn handle_mouse_click(app: &mut App, x: u16, y: u16) {
     match app.view {
         ViewMode::All => {
             if rect_contains(app.layout.all_list, x, y) {
-                if let Some(index) = list_click_index(
-                    app.layout.all_list,
-                    y,
-                    app.list_offset,
-                    app.events.len(),
-                ) {
+                if let Some(index) =
+                    list_click_index(app.layout.all_list, y, app.list_offset, app.events.len())
+                {
                     app.select_index(index);
                 }
             }
@@ -798,12 +796,9 @@ fn handle_mouse_click(app: &mut App, x: u16, y: u16) {
             if rect_contains(app.layout.user_events, x, y) {
                 app.focus_events();
                 let len = app.selected_user_event_len();
-                if let Some(index) = list_click_index(
-                    app.layout.user_events,
-                    y,
-                    app.user_event_offset,
-                    len,
-                ) {
+                if let Some(index) =
+                    list_click_index(app.layout.user_events, y, app.user_event_offset, len)
+                {
                     app.select_user_event_index(index);
                 }
             }
@@ -903,20 +898,13 @@ fn list_click_index(rect: Rect, y: u16, offset: usize, len: usize) -> Option<usi
         return None;
     }
     let start_y = rect.y.saturating_add(1);
-    let end_y = rect
-        .y
-        .saturating_add(rect.height)
-        .saturating_sub(1);
+    let end_y = rect.y.saturating_add(rect.height).saturating_sub(1);
     if y < start_y || y >= end_y {
         return None;
     }
     let row = y.saturating_sub(start_y) as usize;
     let index = offset.saturating_add(row);
-    if index < len {
-        Some(index)
-    } else {
-        None
-    }
+    if index < len { Some(index) } else { None }
 }
 
 fn detail_line_at_y(app: &mut App, y: u16, clamp: bool) -> Option<usize> {
@@ -970,11 +958,7 @@ fn detail_selection_text(app: &mut App) -> Option<String> {
         }
         out.push_str(line);
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 fn wrap_detail_text(text: &str, width: usize) -> Vec<String> {
@@ -1036,13 +1020,12 @@ fn ui(f: &mut Frame, app: &mut App, area: Rect) {
     app.layout.tabs = chunks[0];
     app.layout.tab_all = tab_all.offset(chunks[0].x);
     app.layout.tab_users = tab_users.offset(chunks[0].x);
-    let tabs = Paragraph::new(tabs_line)
-        .style(Style::default().add_modifier(Modifier::REVERSED));
+    let tabs = Paragraph::new(tabs_line).style(Style::default().add_modifier(Modifier::REVERSED));
     f.render_widget(tabs, chunks[0]);
 
     let status_line = status_text(app);
-    let status = Paragraph::new(status_line)
-        .style(Style::default().add_modifier(Modifier::REVERSED));
+    let status =
+        Paragraph::new(status_line).style(Style::default().add_modifier(Modifier::REVERSED));
     f.render_widget(status, chunks[1]);
 
     match app.view {
@@ -1097,8 +1080,8 @@ fn ui(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let footer_line = help_text(app);
-    let footer = Paragraph::new(footer_line)
-        .style(Style::default().add_modifier(Modifier::REVERSED));
+    let footer =
+        Paragraph::new(footer_line).style(Style::default().add_modifier(Modifier::REVERSED));
     f.render_widget(footer, chunks[3]);
 }
 
@@ -1224,8 +1207,7 @@ fn events_list_widget(app: &App) -> Paragraph<'_> {
             lines.push(Line::styled(line_text, style));
         }
     }
-    Paragraph::new(Text::from(lines))
-        .block(Block::default().borders(Borders::ALL).title("Events"))
+    Paragraph::new(Text::from(lines)).block(Block::default().borders(Borders::ALL).title("Events"))
 }
 
 fn user_list_widget(app: &App) -> Paragraph<'_> {
@@ -1318,18 +1300,15 @@ fn detail_widget(app: &mut App) -> Paragraph<'_> {
 }
 
 fn load_events(data_dir: &str) -> Result<LoadResult, String> {
-    let journal = LocalJournal::open(data_dir)
-        .map_err(|err| format!("journal open failed: {err}"))?;
+    let journal =
+        LocalJournal::open(data_dir).map_err(|err| format!("journal open failed: {err}"))?;
     let mut events = Vec::new();
     let mut users: HashMap<String, UserEntry> = HashMap::new();
     let mut ingress_user: HashMap<Id128, String> = HashMap::new();
     let replay = journal.replay(None, |env| {
         let summary = summarize_event(env);
         let detail = detail_event(env);
-        events.push(EventEntry {
-            summary,
-            detail,
-        });
+        events.push(EventEntry { summary, detail });
 
         match &env.event {
             Event::Ingress(IngressEvent::MessageAccepted {
@@ -1369,9 +1348,7 @@ fn load_events(data_dir: &str) -> Result<LoadResult, String> {
                 );
             }
             Event::Draft(DraftEvent::PostDraftCreated {
-                ingress_ids,
-                draft,
-                ..
+                ingress_ids, draft, ..
             }) => {
                 let summary = summarize_user_draft(env.ts_ms, draft);
                 let detail = detail_event(env);
@@ -1383,14 +1360,12 @@ fn load_events(data_dir: &str) -> Result<LoadResult, String> {
                     if !seen_users.insert(user_id.clone()) {
                         continue;
                     }
-                    let entry = users
-                        .entry(user_id.clone())
-                        .or_insert_with(|| UserEntry {
-                            user_id: user_id.clone(),
-                            nickname: None,
-                            events: Vec::new(),
-                            last_ts_ms: env.ts_ms,
-                        });
+                    let entry = users.entry(user_id.clone()).or_insert_with(|| UserEntry {
+                        user_id: user_id.clone(),
+                        nickname: None,
+                        events: Vec::new(),
+                        last_ts_ms: env.ts_ms,
+                    });
                     entry.events.push(EventEntry {
                         summary: summary.clone(),
                         detail: detail.clone(),
@@ -1446,10 +1421,7 @@ fn ingest_user_event(
     }
     let summary = summarize_user_message(env.ts_ms, label, message);
     let detail = detail_event(env);
-    entry.events.push(EventEntry {
-        summary,
-        detail,
-    });
+    entry.events.push(EventEntry { summary, detail });
     entry.last_ts_ms = env.ts_ms;
 }
 
@@ -1595,12 +1567,12 @@ fn summary_parts(event: &Event) -> (&'static str, String) {
         Event::System(SystemEvent::Booted) => ("System.Booted", String::new()),
         Event::System(SystemEvent::SnapshotLoaded) => ("System.SnapshotLoaded", String::new()),
         Event::System(SystemEvent::SnapshotTaken) => ("System.SnapshotTaken", String::new()),
-        Event::Config(ConfigEvent::Applied { version, config_blob }) => {
+        Event::Config(ConfigEvent::Applied {
+            version,
+            config_blob,
+        }) => {
             let blob = config_blob.map(short_id).unwrap_or_else(|| "-".to_string());
-            (
-                "Config.Applied",
-                format!("version={version} blob={blob}"),
-            )
+            ("Config.Applied", format!("version={version} blob={blob}"))
         }
         Event::Ingress(ingress) => match ingress {
             IngressEvent::MessageAccepted {
@@ -1691,7 +1663,11 @@ fn summary_parts(event: &Event) -> (&'static str, String) {
                 closed_at_ms,
             } => (
                 "Session.Closed",
-                format!("session={} closed_at={}", short_id(*session_id), closed_at_ms),
+                format!(
+                    "session={} closed_at={}",
+                    short_id(*session_id),
+                    closed_at_ms
+                ),
             ),
         },
         Event::Draft(draft) => match draft {
@@ -1713,10 +1689,9 @@ fn summary_parts(event: &Event) -> (&'static str, String) {
             ),
         },
         Event::Media(media) => match media {
-            MediaEvent::AvatarFetchRequested { user_id } => (
-                "Media.AvatarFetchRequested",
-                format!("user_id={}", user_id),
-            ),
+            MediaEvent::AvatarFetchRequested { user_id } => {
+                ("Media.AvatarFetchRequested", format!("user_id={}", user_id))
+            }
             MediaEvent::MediaFetchRequested {
                 ingress_id,
                 attachment_index,
@@ -2059,24 +2034,20 @@ fn summary_parts(event: &Event) -> (&'static str, String) {
                 "Blob.Persisted",
                 format!("blob={} path_len={}", short_id(*blob_id), path.len()),
             ),
-            BlobEvent::BlobReleased { blob_id } => (
-                "Blob.Released",
-                format!("blob={}", short_id(*blob_id)),
-            ),
-            BlobEvent::BlobGcRequested { blob_id } => (
-                "Blob.GcRequested",
-                format!("blob={}", short_id(*blob_id)),
-            ),
+            BlobEvent::BlobReleased { blob_id } => {
+                ("Blob.Released", format!("blob={}", short_id(*blob_id)))
+            }
+            BlobEvent::BlobGcRequested { blob_id } => {
+                ("Blob.GcRequested", format!("blob={}", short_id(*blob_id)))
+            }
         },
         Event::Account(account) => match account {
-            AccountEvent::AccountEnabled { account_id } => (
-                "Account.Enabled",
-                format!("account={account_id}"),
-            ),
-            AccountEvent::AccountDisabled { account_id } => (
-                "Account.Disabled",
-                format!("account={account_id}"),
-            ),
+            AccountEvent::AccountEnabled { account_id } => {
+                ("Account.Enabled", format!("account={account_id}"))
+            }
+            AccountEvent::AccountDisabled { account_id } => {
+                ("Account.Disabled", format!("account={account_id}"))
+            }
             AccountEvent::AccountCooldownSet {
                 account_id,
                 cooldown_until_ms,
