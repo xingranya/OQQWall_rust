@@ -353,6 +353,7 @@ struct StatusMessage {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ListFocus {
     Left,
+    Middle,
     Right,
 }
 
@@ -367,7 +368,7 @@ enum ListItem {
     Single(String),
     Pair(String, String),
     MapEntry(String, String),
-    Admin(String, String),
+    Admin(String, String, String),
 }
 
 struct ListInput {
@@ -1775,7 +1776,7 @@ impl ConfigEditor {
                 extract_admin_list(value)
             }
             .into_iter()
-            .map(|(u, p)| ListItem::Admin(u, p))
+            .map(|(u, p, r)| ListItem::Admin(u, p, r))
             .collect(),
         }
     }
@@ -1919,7 +1920,7 @@ impl ConfigEditor {
         }
 
         let global_admins = extract_admin_list(self.other_root.get("webview_global_admins"));
-        for (username, password) in &global_admins {
+        for (username, password, role) in &global_admins {
             if username.trim().is_empty() {
                 errors.push("webview_global_admins 存在空用户名".to_string());
                 continue;
@@ -1927,6 +1928,11 @@ impl ConfigEditor {
             if !password.trim().is_empty() && !password.starts_with("sha256:") {
                 warnings.push(format!(
                     "webview_global_admins[{username}] 使用明文密码，建议使用 sha256:..."
+                ));
+            }
+            if !role.trim().is_empty() && !is_valid_admin_role(role) {
+                errors.push(format!(
+                    "webview_global_admins[{username}] role 非法: {role}"
                 ));
             }
         }
@@ -2041,7 +2047,7 @@ impl ConfigEditor {
                     aliases: &["admins"],
                 },
             ));
-            for (username, password) in admins {
+            for (username, password, role) in admins {
                 if username.trim().is_empty() {
                     errors.push(format!("{group}: webview_admins 存在空用户名"));
                     continue;
@@ -2050,6 +2056,9 @@ impl ConfigEditor {
                     warnings.push(format!(
                         "{group}: 管理员 {username} 使用明文密码，建议使用 sha256:..."
                     ));
+                }
+                if !role.trim().is_empty() && !is_valid_admin_role(&role) {
+                    errors.push(format!("{group}: 管理员 {username} role 非法: {role}"));
                 }
             }
         }
@@ -2101,6 +2110,7 @@ impl ListEditor {
         };
         let focus = match self.focus {
             ListFocus::Left => "左列",
+            ListFocus::Middle => "中列",
             ListFocus::Right => "右列",
         };
         let text = format!("编辑 {section}::{key_label}（当前列: {focus}）");
@@ -2114,14 +2124,17 @@ impl ListEditor {
                 ListKind::PairList { .. } => match input.focus {
                     ListFocus::Left => "编辑左值: ".to_string(),
                     ListFocus::Right => "编辑右值: ".to_string(),
+                    ListFocus::Middle => "编辑右值: ".to_string(),
                 },
                 ListKind::MapList => match input.focus {
                     ListFocus::Left => "编辑指令: ".to_string(),
                     ListFocus::Right => "编辑内容: ".to_string(),
+                    ListFocus::Middle => "编辑内容: ".to_string(),
                 },
                 ListKind::AdminList => match input.focus {
                     ListFocus::Left => "编辑用户名: ".to_string(),
-                    ListFocus::Right => "编辑密码: ".to_string(),
+                    ListFocus::Middle => "编辑密码: ".to_string(),
+                    ListFocus::Right => "编辑角色: ".to_string(),
                 },
             };
             let text = format!("{label}{}", input.buffer);
@@ -2161,7 +2174,7 @@ impl ListEditor {
                 ListItem::Single(val) => val.clone(),
                 ListItem::Pair(left, right) => format!("{left} | {right}"),
                 ListItem::MapEntry(key, value) => format!("{key} | {value}"),
-                ListItem::Admin(user, pass) => format!("{user} | {pass}"),
+                ListItem::Admin(user, pass, role) => format!("{user} | {pass} | {role}"),
             };
             if let Some(input) = &self.input {
                 if input.index == absolute {
@@ -2171,14 +2184,23 @@ impl ListEditor {
                         ListItem::Pair(left, right) => match input.focus {
                             ListFocus::Left => format!("{}{} | {right}", input.buffer, cursor),
                             ListFocus::Right => format!("{left} | {}{}", input.buffer, cursor),
+                            ListFocus::Middle => format!("{left} | {}{}", input.buffer, cursor),
                         },
                         ListItem::MapEntry(key, value) => match input.focus {
                             ListFocus::Left => format!("{}{} | {value}", input.buffer, cursor),
                             ListFocus::Right => format!("{key} | {}{}", input.buffer, cursor),
+                            ListFocus::Middle => format!("{key} | {}{}", input.buffer, cursor),
                         },
-                        ListItem::Admin(user, pass) => match input.focus {
-                            ListFocus::Left => format!("{}{} | {pass}", input.buffer, cursor),
-                            ListFocus::Right => format!("{user} | {}{}", input.buffer, cursor),
+                        ListItem::Admin(user, pass, role) => match input.focus {
+                            ListFocus::Left => {
+                                format!("{}{} | {pass} | {role}", input.buffer, cursor)
+                            }
+                            ListFocus::Middle => {
+                                format!("{user} | {}{} | {role}", input.buffer, cursor)
+                            }
+                            ListFocus::Right => {
+                                format!("{user} | {pass} | {}{}", input.buffer, cursor)
+                            }
                         },
                     };
                 }
@@ -2230,7 +2252,8 @@ impl ListEditor {
             return;
         }
         self.focus = match self.focus {
-            ListFocus::Left => ListFocus::Right,
+            ListFocus::Left => ListFocus::Middle,
+            ListFocus::Middle => ListFocus::Right,
             ListFocus::Right => ListFocus::Left,
         };
     }
@@ -2246,14 +2269,17 @@ impl ListEditor {
             Some(ListItem::Pair(left, right)) => match self.focus {
                 ListFocus::Left => left.clone(),
                 ListFocus::Right => right.clone(),
+                ListFocus::Middle => right.clone(),
             },
             Some(ListItem::MapEntry(key, value)) => match self.focus {
                 ListFocus::Left => key.clone(),
                 ListFocus::Right => value.clone(),
+                ListFocus::Middle => value.clone(),
             },
-            Some(ListItem::Admin(user, pass)) => match self.focus {
+            Some(ListItem::Admin(user, pass, role)) => match self.focus {
                 ListFocus::Left => user.clone(),
-                ListFocus::Right => pass.clone(),
+                ListFocus::Middle => pass.clone(),
+                ListFocus::Right => role.clone(),
             },
             None => String::new(),
         };
@@ -2276,7 +2302,11 @@ impl ListEditor {
                 .push(ListItem::MapEntry(String::new(), String::new())),
             ListKind::AdminList => self
                 .items
-                .push(ListItem::Admin(String::new(), String::new())),
+                .push(ListItem::Admin(
+                    String::new(),
+                    String::new(),
+                    "group_admin".to_string(),
+                )),
         }
         self.selected = self.items.len().saturating_sub(1);
         self.dirty = true;
@@ -2303,14 +2333,17 @@ impl ListEditor {
                 ListItem::Pair(left, right) => match input.focus {
                     ListFocus::Left => *left = input.buffer,
                     ListFocus::Right => *right = input.buffer,
+                    ListFocus::Middle => *right = input.buffer,
                 },
                 ListItem::MapEntry(key, value) => match input.focus {
                     ListFocus::Left => *key = input.buffer,
                     ListFocus::Right => *value = input.buffer,
+                    ListFocus::Middle => *value = input.buffer,
                 },
-                ListItem::Admin(user, pass) => match input.focus {
+                ListItem::Admin(user, pass, role) => match input.focus {
                     ListFocus::Left => *user = input.buffer,
-                    ListFocus::Right => *pass = input.buffer,
+                    ListFocus::Middle => *pass = input.buffer,
+                    ListFocus::Right => *role = input.buffer,
                 },
             }
             self.dirty = true;
@@ -2358,13 +2391,16 @@ impl ListEditor {
             ListKind::AdminList => {
                 let mut list = Vec::new();
                 for item in self.items {
-                    if let ListItem::Admin(user, pass) = item {
+                    if let ListItem::Admin(user, pass, role) = item {
                         if user.trim().is_empty() {
                             continue;
                         }
                         let mut obj = Map::new();
                         obj.insert("username".to_string(), Value::String(user));
                         obj.insert("password".to_string(), Value::String(pass));
+                        if !role.trim().is_empty() {
+                            obj.insert("role".to_string(), Value::String(role));
+                        }
                         list.push(Value::Object(obj));
                     }
                 }
@@ -2840,8 +2876,8 @@ fn field_detail_text(spec: FieldSpec) -> String {
         "webview.host" => "WebView 绑定地址。127.0.0.1 仅本机可访问，0.0.0.0 允许局域网/外网访问（需自行做好安全控制）。".to_string(),
         "webview.port" => "WebView 监听端口，默认 10924。避免与其他服务冲突。".to_string(),
         "webview.session_ttl_sec" => "登录会话有效期（秒）。太短会频繁掉线，太长会增加会话泄露风险。".to_string(),
-        "webview_global_admins" => "全局管理员可访问所有组。建议使用 sha256: 前缀密码哈希，避免明文口令。".to_string(),
-        "webview_admins" => "组管理员仅可操作当前组。支持 [{\"username\":\"u\",\"password\":\"sha256:...\"}]。".to_string(),
+        "webview_global_admins" => "全局管理员可访问所有组。支持编辑 username/password/role，role 建议为 global_admin。".to_string(),
+        "webview_admins" => "组管理员仅可操作当前组。支持编辑 username/password/role，role 建议为 group_admin。".to_string(),
         "accounts" => "账号列表，首项为主账号。系统会按顺序选可用账号发送。".to_string(),
         "mangroupid" => "审核群号（数字）。审核指令通常只在该群内生效。".to_string(),
         "send_schedule" => "每天定时触发发送，格式 HH:MM，例如 [\"08:30\",\"22:10\"]。".to_string(),
@@ -2865,7 +2901,7 @@ fn field_detail_text(spec: FieldSpec) -> String {
             FieldKind::StringList => "字符串列表：按 Enter 进入列表编辑器维护多项。".to_string(),
             FieldKind::PairList { .. } => "成对列表：左列/右列一一对应。".to_string(),
             FieldKind::MapList => "映射列表：按 Enter 进入列表编辑器维护 key/value。".to_string(),
-            FieldKind::AdminList => "管理员列表：每项包含用户名和密码（建议 sha256: 哈希）。".to_string(),
+            FieldKind::AdminList => "管理员列表：每项包含用户名、密码和角色（group_admin/global_admin）。".to_string(),
         },
     }
 }
@@ -2971,7 +3007,7 @@ fn quick_reply_conflicts_with_review_command(key: &str) -> bool {
     )
 }
 
-fn extract_admin_list(value: Option<&Value>) -> Vec<(String, String)> {
+fn extract_admin_list(value: Option<&Value>) -> Vec<(String, String, String)> {
     let Some(Value::Array(items)) = value else {
         return Vec::new();
     };
@@ -2981,15 +3017,20 @@ fn extract_admin_list(value: Option<&Value>) -> Vec<(String, String)> {
             Value::Object(obj) => {
                 let user = value_to_string(obj.get("username")).unwrap_or_default();
                 let pass = value_to_string(obj.get("password")).unwrap_or_default();
-                out.push((user, pass));
+                let role = value_to_string(obj.get("role")).unwrap_or_default();
+                out.push((user, pass, role));
             }
             Value::String(s) => {
-                out.push((s.clone(), String::new()));
+                out.push((s.clone(), String::new(), String::new()));
             }
             _ => {}
         }
     }
     out
+}
+
+fn is_valid_admin_role(role: &str) -> bool {
+    matches!(role.trim(), "group_admin" | "global_admin")
 }
 
 fn bool_value(value: Option<&Value>, default: bool) -> (bool, bool, bool) {

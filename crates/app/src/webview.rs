@@ -117,12 +117,22 @@ struct PostListItem {
     sender_id: Option<String>,
     created_at_ms: i64,
     last_error: Option<String>,
+    preview_text: Option<String>,
+    preview_image_url: Option<String>,
 }
 
 #[derive(Serialize)]
 struct ListPostsResponse {
     items: Vec<PostListItem>,
     next_cursor: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct StatsResponse {
+    pending_count: usize,
+    today_count: usize,
+    total_count: usize,
+    stage_breakdown: HashMap<String, usize>,
 }
 
 #[derive(Serialize)]
@@ -238,16 +248,17 @@ pub fn spawn_webview(handle: &EngineHandle, config: &AppConfig) {
         .route("/auth/login", post(webview_login))
         .route("/auth/logout", post(webview_logout))
         .route("/auth/me", get(webview_me))
+        .route("/api/stats", get(webview_get_stats))
         .route("/api/posts", get(webview_list_posts))
-        .route("/api/posts/:post_id", get(webview_get_post))
-        .route("/api/blobs/:blob_id", get(webview_get_blob))
+        .route("/api/posts/{post_id}", get(webview_get_post))
+        .route("/api/blobs/{blob_id}", get(webview_get_blob))
         .route(
-            "/api/reviews/:review_id/decision",
+            "/api/reviews/{review_id}/decision",
             post(webview_decide_review),
         )
         .route("/api/reviews/batch", post(webview_decide_review_batch))
         .route("/", get(webview_index))
-        .route("/*path", get(webview_static))
+        .route("/{*path}", get(webview_static))
         .with_state(state);
 
     let bind_addr = format!("{}:{}", config.webview_host, config.webview_port);
@@ -389,6 +400,62 @@ async fn webview_me(State(state): State<WebviewState>, headers: HeaderMap) -> im
         .into_response()
 }
 
+async fn webview_get_stats(
+    State(state): State<WebviewState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let session = match authenticate_webview(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let allowed_groups = allowed_groups(&session.identity);
+
+    let guard = match state.state.read() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "state unavailable",
+            );
+        }
+    };
+
+    let mut pending_count = 0;
+    let mut today_count = 0;
+    let mut total_count = 0;
+    let mut stage_breakdown = HashMap::new();
+
+    let now_ms = now_ms();
+    let day_start_ms = now_ms - (now_ms % 86400000);
+
+    for (_, meta) in &guard.posts {
+        if !can_access_group(allowed_groups.as_ref(), &meta.group_id) {
+            continue;
+        }
+        total_count += 1;
+        if meta.stage == PostStage::ReviewPending {
+            pending_count += 1;
+        }
+        if meta.created_at_ms >= day_start_ms {
+            today_count += 1;
+        }
+        let stage_str = stage_to_string(meta.stage);
+        *stage_breakdown.entry(stage_str).or_insert(0) += 1;
+    }
+
+    (
+        StatusCode::OK,
+        Json(StatsResponse {
+            pending_count,
+            today_count,
+            total_count,
+            stage_breakdown,
+        }),
+    )
+        .into_response()
+}
+
 async fn webview_list_posts(
     State(state): State<WebviewState>,
     headers: HeaderMap,
@@ -439,6 +506,41 @@ async fn webview_list_posts(
             let review_code = meta
                 .review_id
                 .and_then(|id| guard.reviews.get(&id).map(|review| review.review_code));
+
+            let draft = guard.drafts.get(&meta.post_id);
+            let preview_text = draft.and_then(|d| {
+                d.blocks.iter().find_map(|b| match b {
+                    oqqwall_rust_core::draft::DraftBlock::Paragraph { text } => {
+                        Some(text.chars().take(100).collect::<String>())
+                    }
+                    _ => None,
+                })
+            });
+
+            // Priority: Rendered PNG > Draft Image Attachment
+            let preview_image_url = guard
+                .render
+                .get(&meta.post_id)
+                .and_then(|r| r.png_blob)
+                .map(|blob_id| format!("/api/blobs/{}", id_to_string(blob_id)))
+                .or_else(|| {
+                    draft.and_then(|d| {
+                        d.blocks.iter().find_map(|b| match b {
+                            oqqwall_rust_core::draft::DraftBlock::Attachment {
+                                reference,
+                                kind: oqqwall_rust_core::draft::MediaKind::Image,
+                                ..
+                            } => match reference {
+                                MediaReference::Blob { blob_id } => {
+                                    Some(format!("/api/blobs/{}", id_to_string(*blob_id)))
+                                }
+                                MediaReference::RemoteUrl { url } => Some(url.clone()),
+                            },
+                            _ => None,
+                        })
+                    })
+                });
+
             PostListItem {
                 post_id: id_to_string(meta.post_id),
                 review_id: meta.review_id.map(id_to_string),
@@ -449,6 +551,8 @@ async fn webview_list_posts(
                 sender_id,
                 created_at_ms: meta.created_at_ms,
                 last_error: meta.last_error.clone(),
+                preview_text,
+                preview_image_url,
             }
         })
         .collect::<Vec<_>>();

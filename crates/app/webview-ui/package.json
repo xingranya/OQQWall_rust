@@ -12,8 +12,11 @@
     "vue": "^3.5.13"
   },
   "devDependencies": {
+    "@vicons/ionicons5": "^0.13.0",
     "@vitejs/plugin-vue": "^5.2.1",
+    "naive-ui": "^2.43.2",
     "typescript": "^5.8.2",
+    "vfonts": "^0.0.3",
     "vite": "^5.4.14"
   }
 }

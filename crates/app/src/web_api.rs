@@ -323,16 +323,16 @@ pub fn spawn_web_api(handle: &EngineHandle, config: &AppConfig) {
     let app = Router::new()
         .route("/v1/auth/login", post(login))
         .route("/v1/auth/logout", post(logout))
-        .route("/v1/auth/sessions/:session_id/revoke", post(revoke_session))
+        .route("/v1/auth/sessions/{session_id}/revoke", post(revoke_session))
         .route("/v1/auth/tokens", post(create_token))
         .route("/v1/posts", get(list_posts))
-        .route("/v1/posts/:post_id", get(get_post))
-        .route("/v1/blobs/:blob_id", get(get_blob))
-        .route("/v1/reviews/:review_id/decision", post(decide_review))
+        .route("/v1/posts/{post_id}", get(get_post))
+        .route("/v1/blobs/{blob_id}", get(get_blob))
+        .route("/v1/reviews/{review_id}/decision", post(decide_review))
         .route("/v1/reviews/batch", post(decide_review_batch))
         .route("/v1/blacklist", get(list_blacklist).post(create_blacklist))
         .route(
-            "/v1/blacklist/:group_id/:sender_id",
+            "/v1/blacklist/{group_id}/{sender_id}",
             delete(delete_blacklist),
         )
         .route("/v1/posts/send", post(send_posts))
