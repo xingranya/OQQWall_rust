@@ -22,6 +22,7 @@
 - 登录接口：`POST /v1/auth/login`
 - 其他接口：`Authorization: Bearer <session_id>`
 - Session 为临时会话（当前默认 12 小时）
+- 子 token 可选设置 `allowed_groups`（组白名单）；root token 不受组限制。
 
 权限枚举：
 - `review.read`
@@ -102,16 +103,22 @@
 ```json
 {
   "permissions": ["review.read", "review.write"],
-  "expire_at": 1730000000
+  "expire_at": 1730000000,
+  "allowed_groups": ["10001", "10002"]
 }
 ```
+
+说明：
+- `allowed_groups` 可选；设置后该 token 仅允许操作这些组（业务接口会按组校验/过滤）。
+- `allowed_groups` 必须是配置中存在的组 ID。
 
 响应：
 ```json
 {
   "token": "32hex...",
   "token_id": "tok_2",
-  "expire_at": 1730000000
+  "expire_at": 1730000000,
+  "allowed_groups": ["10001", "10002"]
 }
 ```
 
@@ -155,6 +162,144 @@
     }
   ],
   "next_cursor": 1
+}
+```
+
+### 4.5.1 创建稿件
+
+`POST /v1/posts/create`
+
+权限：`review.write`
+
+请求头：
+- `Authorization: Bearer <session_id>`
+- 可选 `Idempotency-Key: <key>`
+
+请求体（示例）：
+```json
+{
+  "target_account": "3391146750",
+  "sender_id": "1050373508",
+  "sender_name": "Alice",
+  "sender_avatar_base64": "iVBORw0KGgoAAAANSUhEUgAA...",
+  "messages": [
+    {
+      "message_id": "171082357",
+      "time": 1767094033,
+      "message": [
+        { "type": "text", "data": { "text": "测试投稿系统" } },
+        {
+          "type": "image",
+          "data": {
+            "base64": "iVBORw0KGgoAAAANSUhEUgAA...",
+            "mime": "image/png",
+            "name": "cover.png"
+          }
+        },
+        { "type": "face", "data": { "id": "5" } }
+      ]
+    }
+  ]
+}
+```
+
+字段约束：
+- 顶层必填：`target_account`、`sender_id`、`messages`
+- `target_account` 必须映射到已配置组；`group_id` 由服务端根据 `target_account` 推导，不再由客户端传入。
+- token 若配置了 `allowed_groups`，推导出的 `group_id` 必须在白名单内。
+- `sender_name` 可选；`sender_avatar_base64` 可选。
+- `sender_id` 允许任意非空字符串；仅当 `sender_id` 为纯数字时才会尝试 QQ 资料兜底。
+- `messages[*]` 必填：`message_id`、`time`、`message`
+- 图片段 `type=image`：必须提供 `data.base64`；`data.mime`/`data.name` 可选。
+- 支持的段类型最小字段：
+  - `text`: `data.text`
+  - `image`: `data.base64`（必须）
+  - `face`: `data.id`
+  - `reply`: `data.id`（可选）
+  - `forward`: `data.id`（可选）
+  - `json`/`poke`: 无必填字段
+  - `video`/`file`/`record`: `data.base64` 或 `data.url`/`data.file`/`data.path` 至少一个
+- 其他多余字段会被忽略，不需要传 NapCat 原始裸消息里的全部字段。
+
+无效数据处理：
+- 未知段：折叠为占位文本（如 `[未知段:xxx]`），不使整单失败。
+- 段字段缺失或 base64 非法：折叠为占位文本（如 `[image:invalid]`）。
+- 通过响应里的 `warnings` 和 `normalization` 返回归一化结果。
+
+昵称与头像兜底：
+- 若 `sender_name` 缺失且 `sender_id` 为纯数字：尝试调用 `get_stranger_info` 获取昵称。
+- 若昵称仍无法获取：使用 `sender_name = "未知"`。
+- 若传入 `sender_avatar_base64` 且合法：优先使用传入头像。
+- 若头像未传且“上一步昵称成功通过 `get_stranger_info` 获取”：尝试现有头像获取链路；失败则使用匿名默认头像。
+- 若头像未传且不满足上一步条件：直接使用匿名默认头像。
+
+响应（示例）：
+```json
+{
+  "request_id": "req_xxx",
+  "post_id": "18089374114424392123",
+  "review_code": 102,
+  "accepted_messages": 1,
+  "normalization": {
+    "unknown_segments": 0,
+    "invalid_segments_folded": 0
+  },
+  "warnings": []
+}
+```
+
+返回时机：
+- 接口立即返回 `post_id`。
+- 会在最多 3 秒内尝试附带 `review_code`；超时则 `review_code = null`（后续可通过 `/v1/posts/{post_id}` 查询）。
+- 若传 `Idempotency-Key`，同一 session + 组 + 账号 + key 的重复请求返回同一个创建结果。
+
+### 4.5.2 创建无需渲染消息记录的稿件
+
+`POST /v1/posts/create_rendered`
+
+权限：`review.write`
+
+请求头：
+- `Authorization: Bearer <session_id>`
+- 可选 `Idempotency-Key: <key>`
+
+请求体（示例）：
+```json
+{
+  "target_account": "3391146750",
+  "image_base64": "iVBORw0KGgoAAAANSUhEUgAA...",
+  "image_mime": "image/png",
+  "sender_id": "1050373508",
+  "sender_name": "Alice"
+}
+```
+
+字段约束：
+- 必填：`target_account`、`image_base64`、`image_mime`
+- `image_mime` 仅支持：`image/png`、`image/jpeg`、`image/jpg`、`image/webp`
+- `sender_id` 可选：
+  - 不传或空：按匿名投稿处理
+  - 纯数字：可在发送阶段按配置 `at_unprived_sender` 触发 `@`
+  - 非数字：允许创建，但禁用 `@`（会返回 warning）
+- `sender_name` 可选；当 `sender_id` 为纯数字且 `sender_name` 缺失时，会尝试 `get_stranger_info`，失败回退 `"未知"`。
+
+处理流程：
+- 接口直接接收“已渲染图片”，落盘为 blob，并写入投稿草稿 + 渲染完成事件。
+- 创建后进入待审核流程，返回 `post_id`，并在最多 3 秒内尝试附带 `review_code`。
+- 支持幂等：同一 session + 组 + 账号 + key 重复请求返回同一个创建结果。
+
+响应（示例）：
+```json
+{
+  "request_id": "req_xxx",
+  "post_id": "18089374114424392123",
+  "review_code": 3021,
+  "accepted_messages": 1,
+  "normalization": {
+    "unknown_segments": 0,
+    "invalid_segments_folded": 0
+  },
+  "warnings": []
 }
 ```
 

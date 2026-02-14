@@ -21,7 +21,7 @@ macro_rules! debug_log {
     ($($arg:tt)*) => {};
 }
 
-pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) {
+pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) -> Result<(), String> {
     blob_cache::configure_max_cache_mb(config.max_cache_mb);
     debug_log!(
         "blob cache configured: max_cache_mb={}",
@@ -110,7 +110,7 @@ pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) {
         watermark_text_by_group,
         ..RendererRuntimeConfig::default()
     };
-    spawn_renderer(handle.cmd_tx.clone(), handle.subscribe(), renderer_config);
+    spawn_renderer(handle.cmd_tx.clone(), handle.subscribe(), renderer_config)?;
     let runtime = QzoneRuntimeConfig {
         napcat_by_group,
         default_napcat: config.fallback_napcat.clone(),
@@ -130,6 +130,7 @@ pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) {
         runtime.default_napcat.is_some()
     );
     spawn_qzone_sender(handle.cmd_tx.clone(), handle.subscribe(), runtime);
+    Ok(())
 }
 
 #[cfg(debug_assertions)]

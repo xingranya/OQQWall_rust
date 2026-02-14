@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::future::Future;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::process::Command as ProcessCommand;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -24,6 +26,7 @@ use oqqwall_rust_core::{
 use oqqwall_rust_infra::{LocalJournal, SnapshotStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use skia_safe::canvas::SrcRectConstraint;
 use skia_safe::font_style::{Slant, Weight, Width};
 use skia_safe::textlayout::{
@@ -60,6 +63,12 @@ const MEASURE_MAX_WIDTH: f32 = 10_000.0;
 const FONT_FAMILIES: [&str; 1] = ["PingFang SC"];
 const DEFAULT_AVATAR_PATH: &str = "res/Anonymous_avatar.png";
 const AVATAR_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+const REQUIRED_RES_FILES: &[&str] = &[
+    "Anonymous_avatar.png",
+    "fonts/PingFangSC-Regular.otf",
+    "face/default_config.json",
+    "emoji_png/apple_color_emoji/metadata.json",
+];
 static FONT_BYTES_CACHE: OnceLock<Vec<FontBytes>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
@@ -396,11 +405,12 @@ pub fn spawn_renderer(
     cmd_tx: mpsc::Sender<Command>,
     bus_rx: broadcast::Receiver<oqqwall_rust_core::EventEnvelope>,
     config: RendererRuntimeConfig,
-) -> JoinHandle<()> {
+) -> Result<JoinHandle<()>, String> {
+    validate_renderer_resources()?;
     let font_dir = resolve_font_dir();
     init_font_bytes_cache(&font_dir);
     let _ = emoji_png_store();
-    tokio::spawn(async move {
+    Ok(tokio::spawn(async move {
         debug_log!(
             "renderer task start: blob_root={} canvas_width={} max_height={}",
             config.blob_root.display(),
@@ -447,7 +457,7 @@ pub fn spawn_renderer(
         }
 
         debug_log!("renderer task end");
-    })
+    }))
 }
 
 fn load_state_view_cached() -> StateView {
@@ -1864,7 +1874,7 @@ struct EmojiPngStore {
     res_prefix: &'static str,
     codepoints: HashMap<char, u16>,
     sequences: HashMap<String, u16>,
-    png_cache: HashMap<u16, &'static [u8]>,
+    png_cache: HashMap<u16, Arc<[u8]>>,
 }
 
 struct EmojiRenderCache {
@@ -1976,16 +1986,16 @@ impl EmojiRenderCache {
             Ok(guard) => guard,
             Err(guard) => guard.into_inner(),
         };
-        let png_bytes = match store.png_cache.get(&glyph_id).copied() {
+        let png_bytes = match store.png_cache.get(&glyph_id).cloned() {
             Some(bytes) => bytes,
             None => {
                 let path = emoji_png_resource_path(store.res_prefix, glyph_id);
-                let bytes = embedded_resource_bytes(&path)?;
-                store.png_cache.insert(glyph_id, bytes);
+                let bytes = read_res_relative_bytes(&path)?;
+                store.png_cache.insert(glyph_id, bytes.clone());
                 bytes
             }
         };
-        let image = decode_emoji_image(png_bytes);
+        let image = decode_emoji_image(png_bytes.as_ref());
         self.image_cache.insert(glyph_id, image.clone());
         image
     }
@@ -2050,7 +2060,7 @@ fn emoji_png_store() -> Option<&'static Mutex<EmojiPngStore>> {
 }
 
 fn init_emoji_png_store_inner() -> Option<Mutex<EmojiPngStore>> {
-    let metadata = match load_embedded_emoji_png_metadata() {
+    let metadata = match load_emoji_png_metadata() {
         Some(metadata) => metadata,
         None => {
             debug_log!("emoji png: metadata missing; run scripts/extract_apple_emoji_pngs.py");
@@ -2086,9 +2096,9 @@ fn emoji_png_resource_path(prefix: &str, glyph_id: u16) -> String {
     format!("{}/gid_{:04x}.png", prefix, glyph_id)
 }
 
-fn load_embedded_emoji_png_metadata() -> Option<EmojiPngMetadata> {
-    let bytes = embedded_resource_bytes(EMOJI_PNG_METADATA_PATH)?;
-    serde_json::from_slice(bytes).ok()
+fn load_emoji_png_metadata() -> Option<EmojiPngMetadata> {
+    let bytes = read_res_relative_bytes(EMOJI_PNG_METADATA_PATH)?;
+    serde_json::from_slice(bytes.as_ref()).ok()
 }
 
 fn build_line_paragraph(
@@ -2552,12 +2562,13 @@ fn resolve_source_to_image(source: &str) -> Option<ResolvedImage> {
 
 fn resolved_image_from_path(path: &str) -> Option<ResolvedImage> {
     let path_obj = Path::new(path);
-    if let Some(bytes) = embedded_bytes_for_path(path_obj) {
-        debug_log!("image load embedded: {}", path);
-        return Some(ResolvedImage::from_bytes(bytes.to_vec()));
+    if let Some(resolved) = resolve_res_disk_path(path_obj) {
+        debug_log!("image load disk: {} -> {}", path, resolved.display());
+        let bytes = fs::read(resolved).ok()?;
+        return Some(ResolvedImage::from_bytes(bytes));
     }
     debug_log!("image load disk: {}", path);
-    let bytes = fs::read(path).ok()?;
+    let bytes = fs::read(path_obj).ok()?;
     Some(ResolvedImage::from_bytes(bytes))
 }
 
@@ -3435,70 +3446,45 @@ fn font_alias_for_path(_path: &Path) -> Option<&'static str> {
     None
 }
 
-fn embedded_bytes_for_path(path: &Path) -> Option<&'static [u8]> {
-    let rel = match path_to_res_relative(path) {
-        Some(rel) => rel,
-        None => {
-            debug_log!("embedded lookup: no res-relative path: {}", path.display());
-            return None;
-        }
-    };
-    let found = embedded_resource_bytes(&rel);
-    if let Some(_bytes) = found {
-        debug_log!("embedded lookup hit: {} bytes={}", rel, _bytes.len());
-    } else {
-        debug_log!("embedded lookup miss: {}", rel);
+fn resolve_res_disk_path(path: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        return Some(path.to_path_buf());
     }
-    found
+    if let Ok(rel) = path.strip_prefix("res") {
+        return Some(resolve_res_dir().join(rel));
+    }
+    None
 }
 
-fn embedded_resource_bytes(path: &str) -> Option<&'static [u8]> {
-    static RES_MAP: OnceLock<HashMap<&'static str, &'static [u8]>> = OnceLock::new();
-    let map = RES_MAP.get_or_init(|| {
-        let mut map = HashMap::new();
-        debug_log!(
-            "embedded resources init: count={}",
-            embedded_resources::RESOURCES.len()
-        );
-        for entry in embedded_resources::RESOURCES {
-            debug_log!(
-                "embedded resource: {} bytes={}",
-                entry.path,
-                entry.bytes.len()
-            );
-            map.insert(entry.path, entry.bytes);
-        }
-        map
-    });
-    map.get(path).copied()
+fn read_res_relative_bytes(relative: &str) -> Option<Arc<[u8]>> {
+    let path = resolve_res_dir().join(relative);
+    let bytes = fs::read(&path).ok()?;
+    Some(Arc::from(bytes))
 }
 
-fn path_to_res_relative(path: &Path) -> Option<String> {
-    if path.is_relative() {
-        let rel = path.strip_prefix("res").ok()?;
-        return path_to_slash(rel);
-    }
+fn validate_renderer_resources() -> Result<(), String> {
     let res_dir = resolve_res_dir();
-    let rel = path.strip_prefix(&res_dir).ok()?;
-    path_to_slash(rel)
-}
+    if !res_dir.is_dir() {
+        return Err(format!(
+            "资源目录不存在: {}。请将资源包解压到与程序同级的 `res/`，或设置 OQQWALL_RES_DIR；也可直接把 `OQQWall_RUST-res*.tar.gz` / `res*.tar.gz`（含 .tgz/.tar）放在程序同级目录，程序会先做 SHA256 校验再自动解压。",
+            res_dir.display()
+        ));
+    }
 
-fn path_to_slash(path: &Path) -> Option<String> {
-    let mut out = String::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::Normal(part) => {
-                let part = part.to_str()?;
-                if !out.is_empty() {
-                    out.push('/');
-                }
-                out.push_str(part);
-            }
-            std::path::Component::CurDir => {}
-            _ => return None,
+    let mut missing = Vec::new();
+    for rel in REQUIRED_RES_FILES {
+        let path = res_dir.join(rel);
+        if !path.is_file() {
+            missing.push(path.display().to_string());
         }
     }
-    if out.is_empty() { None } else { Some(out) }
+    if !missing.is_empty() {
+        return Err(format!(
+            "资源文件缺失，请补齐资源包: {}",
+            missing.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 fn resolve_res_dir() -> PathBuf {
@@ -3507,28 +3493,223 @@ fn resolve_res_dir() -> PathBuf {
         debug_log!("res dir from env: {}", resolved.display());
         return resolved;
     }
+    if let Some(exe_res_dir) = resolve_res_dir_from_exe() {
+        debug_log!("res dir from exe: {}", exe_res_dir.display());
+        return exe_res_dir;
+    }
     let cwd_candidate = PathBuf::from("res");
     if cwd_candidate.exists() {
         debug_log!("res dir from cwd: {}", cwd_candidate.display());
         return cwd_candidate;
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            let candidates = [
-                exe_dir.join("res"),
+    debug_log!("res dir fallback: {}", cwd_candidate.display());
+    cwd_candidate
+}
+
+fn resolve_res_dir_from_exe() -> Option<PathBuf> {
+    static RES_FROM_EXE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    RES_FROM_EXE
+        .get_or_init(|| {
+            let exe = std::env::current_exe().ok()?;
+            let exe_dir = exe.parent()?;
+            let exe_res_dir = exe_dir.join("res");
+            if exe_res_dir.exists() {
+                return Some(exe_res_dir);
+            }
+
+            if let Some(archive) = find_res_archive_in_dir(exe_dir) {
+                debug_log!(
+                    "res dir missing near executable, try extract archive: {}",
+                    archive.display()
+                );
+                if let Err(err) = verify_res_archive_sha256(&archive) {
+                    debug_log!("res archive sha256 verify failed: {}", err);
+                    return None;
+                }
+                match extract_res_archive(exe_dir, &archive) {
+                    Ok(()) => {
+                        if !exe_res_dir.exists() {
+                            if let Err(err) = fs::create_dir_all(&exe_res_dir) {
+                                debug_log!(
+                                    "res auto-create failed: path={} err={}",
+                                    exe_res_dir.display(),
+                                    err
+                                );
+                            }
+                        }
+                        if exe_res_dir.exists() {
+                            debug_log!(
+                                "res dir prepared by archive extraction: {}",
+                                exe_res_dir.display()
+                            );
+                            return Some(exe_res_dir);
+                        }
+                        debug_log!(
+                            "archive extracted but res dir still missing: {}",
+                            exe_res_dir.display()
+                        );
+                    }
+                    Err(err) => {
+                        debug_log!("res archive extract failed: {}", err);
+                    }
+                }
+            }
+
+            let fallback_candidates = [
                 exe_dir.join("..").join("res"),
                 exe_dir.join("..").join("..").join("res"),
             ];
-            for candidate in candidates {
+            for candidate in fallback_candidates {
                 if candidate.exists() {
-                    debug_log!("res dir from exe: {}", candidate.display());
-                    return candidate;
+                    return Some(candidate);
                 }
             }
+            None
+        })
+        .clone()
+}
+
+fn find_res_archive_in_dir(dir: &Path) -> Option<PathBuf> {
+    let mut named_candidates: Vec<PathBuf> = Vec::new();
+    let mut generic_candidates: Vec<PathBuf> = Vec::new();
+    let entries = fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !(name.ends_with(".tar.gz") || name.ends_with(".tgz") || name.ends_with(".tar")) {
+            continue;
+        }
+        if name == "OQQWall_RUST-res.tar.gz"
+            || name == "OQQWall_RUST-res.tgz"
+            || name == "OQQWall_RUST-res.tar"
+            || name.starts_with("OQQWall_RUST-res-")
+        {
+            named_candidates.push(path);
+            continue;
+        }
+        if name == "res.tar.gz" || name == "res.tgz" || name == "res.tar" || name.contains("res") {
+            generic_candidates.push(path);
         }
     }
-    debug_log!("res dir fallback: {}", cwd_candidate.display());
-    cwd_candidate
+
+    named_candidates.sort();
+    generic_candidates.sort();
+    named_candidates
+        .into_iter()
+        .rev()
+        .next()
+        .or_else(|| generic_candidates.into_iter().rev().next())
+}
+
+fn extract_res_archive(exe_dir: &Path, archive: &Path) -> Result<(), String> {
+    let archive_name = archive
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("invalid archive filename: {}", archive.display()))?;
+    let mut cmd = ProcessCommand::new("tar");
+    if archive_name.ends_with(".tar.gz") || archive_name.ends_with(".tgz") {
+        cmd.arg("-xzf");
+    } else if archive_name.ends_with(".tar") {
+        cmd.arg("-xf");
+    } else {
+        return Err(format!(
+            "unsupported archive format for auto extract: {}",
+            archive.display()
+        ));
+    }
+    let status = cmd
+        .arg(archive)
+        .arg("-C")
+        .arg(exe_dir)
+        .status()
+        .map_err(|err| format!("run tar failed: archive={} err={}", archive.display(), err))?;
+    if !status.success() {
+        return Err(format!(
+            "tar exited with non-zero status: archive={} status={}",
+            archive.display(),
+            status
+        ));
+    }
+    Ok(())
+}
+
+fn verify_res_archive_sha256(archive: &Path) -> Result<(), String> {
+    let archive_name = archive
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("invalid archive filename: {}", archive.display()))?;
+    let expected = if archive_name.ends_with(".tar.gz") || archive_name.ends_with(".tgz") {
+        embedded_resources::RES_ARCHIVE_SHA256_TAR_GZ
+    } else if archive_name.ends_with(".tar") {
+        embedded_resources::RES_ARCHIVE_SHA256_TAR
+    } else {
+        return Err(format!(
+            "unsupported archive format for sha256 verify: {}",
+            archive.display()
+        ));
+    };
+    if expected.is_empty() {
+        return Err(
+            "compiled-in resource sha256 is empty; rebuild with a complete res/ directory"
+                .to_string(),
+        );
+    }
+    let actual = sha256_file_hex(archive)?;
+    debug_log!(
+        "res archive sha256 check: archive={} expected={} actual={}",
+        archive.display(),
+        expected,
+        actual
+    );
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err(format!(
+            "sha256 mismatch: archive={} expected={} actual={}",
+            archive.display(),
+            expected,
+            actual
+        ));
+    }
+    debug_log!("res archive sha256 verified: {}", archive.display());
+    Ok(())
+}
+
+fn sha256_file_hex(path: &Path) -> Result<String, String> {
+    let mut file =
+        fs::File::open(path).map_err(|err| format!("open {} failed: {}", path.display(), err))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buf)
+            .map_err(|err| format!("read {} failed: {}", path.display(), err))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hex_encode(&hasher.finalize()))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(nibble_to_hex(b >> 4));
+        out.push(nibble_to_hex(b & 0x0f));
+    }
+    out
+}
+
+fn nibble_to_hex(value: u8) -> char {
+    match value {
+        0..=9 => (b'0' + value) as char,
+        10..=15 => (b'a' + (value - 10)) as char,
+        _ => '0',
+    }
 }
 
 fn resolve_font_dir() -> PathBuf {

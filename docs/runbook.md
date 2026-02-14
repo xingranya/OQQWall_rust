@@ -85,6 +85,19 @@ logs/                    # 可选：文件日志
 - `common.manage_napcat_internal=false`
 - 运维自己启动 NapCat（或 docker），OQQWall_RUST 只连接 OneBot 地址
 
+### 2.5 代码包/资源包拆分发布
+- 从当前仓库执行：
+  - `./scripts/package_split_release.sh`
+- 会生成两个文件（在 `dist/`）：
+  - `OQQWall_RUST-bin-*.tar.gz`（仅主程序）
+  - `OQQWall_RUST-res-*.tar.gz`（`res/` 资源目录）
+- 部署时把两个包解压到同一目录，目录示例：
+  - `./OQQWall_RUST`
+  - `./res/...`
+- 若程序目录下没有 `res/` 但存在 `OQQWall_RUST-res*.tar.gz` / `res*.tar.gz`（含 `.tgz/.tar`），启动时会先做 SHA256 校验（哈希在编译时计算并内置），校验通过后才自动解压到程序目录。
+- 若 `res/` 缺失或关键资源文件缺失，程序会在启动时报错并退出。
+- 可通过 `OQQWALL_RES_DIR=/path/to/res` 指定资源目录。
+
 ---
 
 ## 3. 启动/停止

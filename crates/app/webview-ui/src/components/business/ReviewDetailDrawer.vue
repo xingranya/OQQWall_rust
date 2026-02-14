@@ -1,7 +1,12 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { NDrawer, NDrawerContent, NDescriptions, NDescriptionsItem, NImage, NTag, NSpin, NEmpty } from 'naive-ui'
-import { STAGE_LABELS, type PostDetail } from '../../api/types'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { 
+  NDrawer, NDrawerContent, NDescriptions, NDescriptionsItem, NImage, NTag, NSpin, NEmpty,
+  NForm, NFormItem, NSelect, NInput, NButton, NSpace, NInputNumber, NDivider, useMessage,
+  NPopconfirm
+} from 'naive-ui'
+import { STAGE_LABELS, ACTIONS, ACTION_LABELS, type PostDetail } from '../../api/types'
+import { api } from '../../api/client'
 
 const props = defineProps<{
   show: boolean
@@ -11,9 +16,24 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: 'update:show', v: boolean): void
+  (e: 'refresh'): void
 }>()
 
+const message = useMessage()
 const windowWidth = ref(window.innerWidth)
+const submitting = ref(false)
+
+// Action Form State
+const actionForm = reactive({
+  action: 'approve',
+  comment: '',
+  text: '',
+  delay_ms: 180000, // 3 minutes default
+  quick_reply_key: '',
+  target_review_code: null as number | null,
+})
+
+const actionOptions = ACTIONS.map(k => ({ label: ACTION_LABELS[k], value: k }))
 
 const updateWidth = () => {
     windowWidth.value = window.innerWidth
@@ -23,14 +43,20 @@ onMounted(() => window.addEventListener('resize', updateWidth))
 onUnmounted(() => window.removeEventListener('resize', updateWidth))
 
 const isMobile = computed(() => windowWidth.value < 640)
-
-const drawerWidth = computed(() => {
-    return isMobile.value ? '100%' : 600
-})
+const drawerWidth = computed(() => isMobile.value ? '100%' : 640)
 
 const visible = computed({
   get: () => props.show,
   set: (v) => emit('update:show', v),
+})
+
+// Reset form when detail changes or drawer opens
+watch(() => props.detail?.post_id, () => {
+    actionForm.action = 'approve'
+    actionForm.comment = ''
+    actionForm.text = ''
+    actionForm.delay_ms = 180000
+    actionForm.target_review_code = null
 })
 
 function formatTime(ms: number) {
@@ -40,15 +66,70 @@ function formatTime(ms: number) {
 function renderImageUrl(blockRef: { reference_type: 'blob_id' | 'remote_url'; reference: string }) {
   return blockRef.reference_type === 'blob_id' ? '/api/blobs/' + blockRef.reference : blockRef.reference
 }
+
+async function handleExecute(actionOverride?: string) {
+    if (!props.detail?.review_id) {
+        message.error('当前稿件无法操作（无 review_id）')
+        return
+    }
+
+    const action = actionOverride ?? actionForm.action
+    const payload: any = { action }
+
+    // Dynamic Payload Construction
+    if (['reject', 'comment', 'blacklist'].includes(action)) {
+        if (!actionForm.comment && !actionOverride) { // Allow empty if quick action, or validate?
+            // For form submit, validat. For quick button, we might want prompt or default.
+            // Here we use form state.
+        }
+        if (actionForm.comment) payload.comment = actionForm.comment
+    }
+    
+    if (['reply', 'comment'].includes(action) && actionForm.text) {
+        payload.text = actionForm.text
+    }
+
+    if (action === 'defer' && actionForm.delay_ms) {
+        payload.delay_ms = actionForm.delay_ms
+    }
+
+    if (action === 'quick_reply' && actionForm.quick_reply_key) {
+        payload.quick_reply_key = actionForm.quick_reply_key
+    }
+
+    if (action === 'merge' && actionForm.target_review_code) {
+        payload.target_review_code = actionForm.target_review_code
+    }
+
+    submitting.value = true
+    try {
+        await api(`/api/reviews/${props.detail.review_id}/decision`, {
+            method: 'POST',
+            body: JSON.stringify(payload)
+        })
+        message.success(`执行成功: ${ACTION_LABELS[action]}`)
+        emit('refresh') // Refresh list and detail
+        if (['approve', 'reject', 'delete', 'immediate'].includes(action)) {
+            // Close drawer for terminal actions
+            emit('update:show', false)
+        }
+    } catch (e) {
+        message.error((e as Error).message)
+    } finally {
+        submitting.value = false
+    }
+}
 </script>
 
 <template>
   <n-drawer v-model:show="visible" :width="drawerWidth" placement="right">
-    <n-drawer-content title="稿件详情" closable>
+    <n-drawer-content title="稿件详情" closable native-scrollbar>
       <div v-if="loading" class="loading-wrap">
         <n-spin size="large" />
       </div>
-      <div v-else-if="detail" class="detail-container">
+      <div v-else-if="detail" class="detail-wrapper">
+        
+        <!-- Info Section -->
         <n-descriptions 
             bordered 
             column="1" 
@@ -69,6 +150,7 @@ function renderImageUrl(blockRef: { reference_type: 'blob_id' | 'remote_url'; re
           </n-descriptions-item>
         </n-descriptions>
 
+        <!-- Preview Section -->
         <div v-if="detail.render_png_blob_id" class="section">
           <h4>渲染预览</h4>
           <n-image
@@ -111,11 +193,11 @@ function renderImageUrl(blockRef: { reference_type: 'blob_id' | 'remote_url'; re
   justify-content: center;
   padding: 40px;
 }
-.detail-container {
+.detail-wrapper {
   display: flex;
   flex-direction: column;
-  gap: 20px;
-  padding-bottom: 40px;
+  gap: 16px;
+  padding-bottom: 24px;
 }
 .section h4 {
   margin: 0 0 10px;
@@ -125,7 +207,7 @@ function renderImageUrl(blockRef: { reference_type: 'blob_id' | 'remote_url'; re
   padding-left: 8px;
 }
 
-/* 全屏宽度自适应图片样式 */
+/* Images */
 .full-width-image {
   width: 100%;
   display: block;
@@ -171,5 +253,30 @@ function renderImageUrl(blockRef: { reference_type: 'blob_id' | 'remote_url'; re
     word-break: break-all;
     font-size: 12px;
     font-family: monospace;
+}
+
+/* Audit Panel */
+.audit-panel {
+    background: #f0fdf4;
+    border: 1px solid #bbf7d0;
+    border-radius: 8px;
+    padding: 16px;
+}
+.audit-panel h3 {
+    margin-top: 0;
+    margin-bottom: 16px;
+    color: #166534;
+}
+.quick-btns {
+    margin-bottom: 24px;
+}
+.advanced-form {
+    border-top: 1px solid #bbf7d0;
+    padding-top: 16px;
+}
+.advanced-form h4 {
+    margin: 0 0 12px;
+    font-size: 13px;
+    color: #15803d;
 }
 </style>

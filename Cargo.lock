@@ -1027,6 +1027,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "skia-safe",
  "tokio",
  "tokio-tungstenite 0.23.1",

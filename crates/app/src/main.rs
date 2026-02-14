@@ -76,7 +76,10 @@ async fn main() {
         app_config.webview_host,
         app_config.webview_port
     );
-    spawn_napcat_drivers(&handle, &app_config);
+    if let Err(err) = spawn_napcat_drivers(&handle, &app_config) {
+        eprintln!("启动失败: {}", err);
+        std::process::exit(1);
+    }
     debug_log!("drivers spawned");
 
     let cmd_tx = handle.cmd_tx.clone();
