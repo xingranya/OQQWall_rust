@@ -13,3 +13,5 @@ showcase/
 config.json
 devconfig.json
 crates/app/webview-ui/node_modules/
+
+dist/
