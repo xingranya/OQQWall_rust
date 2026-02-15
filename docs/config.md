@@ -29,8 +29,9 @@
 
 ### 2.1 文件名与位置
 - 默认：`./config.json`
-- CLI：`OQQWall_RUST run --config ./config.json`
 - 环境变量可覆盖：`OQQWALL_CONFIG=...`
+  - 主程序启动时读取该路径（当前版本不解析 `--config` 参数）
+  - OOBE/TUI 支持 `--config <path>` 写入/编辑指定配置
 
 ### 2.2 顶层结构（推荐规范）
 推荐显式 `schema_version` 与 `groups`：

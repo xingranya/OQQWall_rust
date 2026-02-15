@@ -223,10 +223,11 @@ driver 不应依赖自己的内存去重，应该依赖 state 的 request 状态
 
 ### 7.2 CLI 约定（建议）
 
-* `OQQWall_RUST run --config config.json`
-* `OQQWall_RUST replay --data-dir ./data`（调试回放）
-* `OQQWall_RUST doctor --config config.json`（检查 NapCat/端口/目录权限）
-* `OQQWall_RUST export --post <id>`（导出某条稿件和产物用于排查）
+* `OQQWALL_CONFIG=./config.json OQQWall_RUST`（当前实现）
+* `OQQWall_RUST oobe --config ./config.json`（生成/覆盖配置，当前实现）
+* `OQQWall_RUST replay ...`（规划：调试回放）
+* `OQQWall_RUST doctor ...`（规划：自检 NapCat/端口/目录权限）
+* `OQQWall_RUST export ...`（规划：导出稿件与产物用于排查）
 
 ---
 

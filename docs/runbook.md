@@ -48,9 +48,7 @@ logs/                    # 可选：文件日志
 - 必填字段检查：
   - 每个 group 的 `napcat_base_url` / `napcat_access_token`
   - 每个 group 的 `mangroupid / accounts`（且 `accounts[0]` 为主账号）
-- 建议先用：
-  - `OQQWall_RUST doctor --config ./config.json`（如果已实现）
-  - 或临时增加一个 `--check-config` 子命令（推荐实现）
+- 建议先用 OOBE 生成骨架，再按 `docs/config.md` 对照检查
 
 ### 2.3 调试配置（仅 debug build 生效）
 
@@ -104,7 +102,7 @@ logs/                    # 可选：文件日志
 
 ### 3.1 前台启动（调试）
 ```bash
-./OQQWall_RUST run --config ./config.json
+./OQQWall_RUST
 ```
 
 ### 3.2 systemd 启动（推荐）
@@ -119,9 +117,11 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/OQQWall_RUST
-ExecStart=/opt/OQQWall_RUST/OQQWall_RUST run --config /opt/OQQWall_RUST/config.json
+ExecStart=/opt/OQQWall_RUST/OQQWall_RUST
 Restart=always
 RestartSec=2
+# 当前版本使用环境变量指定配置文件路径
+Environment=OQQWALL_CONFIG=/opt/OQQWall_RUST/config.json
 # 可选：把 token 放 env，不写入 config.json
 Environment=OQQWALL_NAPCAT_TOKEN=REDACTED
 # 建议限制资源（按机器情况调整）
