@@ -21,6 +21,10 @@ Rust 版的目标是把原版脚本链路重构成可测试、可回放、可演
 ## <div align=center > [快速开始](https://github.com/gfhdhytghd/OQQWall_rust/wiki/%E5%BF%AB%E9%80%9F%E5%BC%80%E5%A7%8B) | [全部文档](https://github.com/gfhdhytghd/OQQWall_rust/wiki)</div>
 <div align="center">
 
+遥测相关文档：
+- 投稿端遥测：`docs/telemetry.md`
+- 遥测服务端（collector）：`docs/telemetry_collector.md`
+
 ## 开源项目列表
 
 本项目使用或参考了以下开源项目：

@@ -5,6 +5,8 @@
 >
 > 服务端落地见 `docs/telemetry_collector.md`（独立 `telemetry-collector` 二进制）。
 
+说明：当前主程序二进制只包含“样本生成 + 上传客户端”，不包含遥测接收 API。
+
 ---
 
 ## 1. 触发点与标签定义

@@ -25,6 +25,11 @@
 - `COLLECTOR_MAX_BODY_MB`：请求体上限（默认 10）
 - `RUST_LOG`：日志级别
 
+说明：
+
+- `root` token 每次启动都会按 `COLLECTOR_BOOTSTRAP_ROOT_TOKEN` 覆盖更新。
+- 生产环境建议把 `COLLECTOR_BOOTSTRAP_ROOT_TOKEN` 放入 secret 管理，不写入仓库。
+
 ---
 
 ## 3. 上传协议与幂等
@@ -48,22 +53,59 @@
 
 客户端仍按既有语义处理：只要收到 `2xx` 就视为整批 ACK。
 
+### 3.1 上传前校验（服务端）
+
+- `schema_version == 1`
+- `samples` 非空且不超过上限
+- `label` 只能是 `0/1`
+- `sample.chat_record_hash` 必须能在本批 `chat_objects` 或历史对象中解析
+- `chat_record_hash` 必须与 `payload` 计算结果一致
+
+### 3.2 上传响应示例
+
+首次成功：
+
+```json
+{
+  "ingested": true,
+  "duplicate": false,
+  "batch_id": "b_test_001",
+  "accepted_samples": 20,
+  "accepted_chat_objects": 14,
+  "request_id": "..."
+}
+```
+
+幂等重试：
+
+```json
+{
+  "ingested": false,
+  "duplicate": true,
+  "batch_id": "b_test_001",
+  "accepted_samples": 0,
+  "accepted_chat_objects": 0,
+  "request_id": "..."
+}
+```
+
 ---
 
-## 4. 管理 API
+## 4. 权限与 API
 
-需要 token 权限：
+### 4.1 权限矩阵
 
-- `ingest.write`
-- `batches.read`
-- `samples.read`
-- `samples.write`
-- `exports.manage`
-- `tokens.manage`
+- `ingest.write`：允许上传批次
+- `batches.read`：允许查看批次列表/详情
+- `samples.read`：允许查看样本与聊天对象
+- `samples.write`：允许修订样本（排除/纠正标签/备注）
+- `exports.manage`：允许创建与下载导出任务
+- `tokens.manage`：允许创建/删除 API token
 
-接口：
+### 4.2 接口清单
 
 - `GET /telemetry/v1/healthz`
+- `POST /telemetry/v1/submission/batch`
 - `GET /telemetry/v1/batches`
 - `GET /telemetry/v1/batches/{batch_id}`
 - `GET /telemetry/v1/samples`
@@ -77,6 +119,56 @@
 - `GET /telemetry/v1/exports/{job_id}/files/{name}`
 - `POST /telemetry/v1/admin/tokens`
 - `DELETE /telemetry/v1/admin/tokens/{token_id}`
+
+### 4.3 常用 API 示例
+
+创建 token：
+
+```bash
+curl -X POST http://127.0.0.1:10925/telemetry/v1/admin/tokens \
+  -H "Authorization: Bearer <root_token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "token_id": "ingest_bot",
+    "permissions": ["ingest.write"],
+    "note": "oqqwall uploader"
+  }'
+```
+
+查询样本：
+
+```bash
+curl "http://127.0.0.1:10925/telemetry/v1/samples?limit=50&label=1" \
+  -H "Authorization: Bearer <token>"
+```
+
+修订样本：
+
+```bash
+curl -X PATCH "http://127.0.0.1:10925/telemetry/v1/samples/<sample_id>" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "excluded": true,
+    "corrected_label": 0,
+    "note": "human corrected"
+  }'
+```
+
+创建导出任务：
+
+```bash
+curl -X POST "http://127.0.0.1:10925/telemetry/v1/exports" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "format": "parquet",
+    "from_decision_at_ms": 1700000000000,
+    "to_decision_at_ms": 1800000000000,
+    "labels": [0, 1],
+    "include_excluded": false
+  }'
+```
 
 ---
 
@@ -99,6 +191,8 @@
 - `row_count`
 - `filters`
 - `files[]`（path + row_count + sha256）
+
+训练端建议以 `manifest.json` 作为任务入口，不直接硬编码文件路径。
 
 ---
 
@@ -125,7 +219,7 @@ docker compose -f docker-compose.telemetry.yml up -d --build
 
 服务：
 
-- Postgres：`postgres:16-alpine`
+- Postgres：`postgres:16`
 - Collector：`telemetry-collector`（端口 `10925`）
 
 ### 6.2 健康检查
@@ -144,6 +238,41 @@ curl http://127.0.0.1:10925/telemetry/v1/healthz
 
 ---
 
-## 7. 数据保留
+## 7. 运维与排障
+
+### 7.1 常见错误
+
+- `401 UNAUTHORIZED`：token 缺失/无效/过期
+- `403 FORBIDDEN`：token 权限不足
+- `409 IDEMPOTENCY_CONFLICT`：同一 `Idempotency-Key` 对应了不同请求体
+- `400 BAD_REQUEST`：样本字段或 hash 校验失败
+
+### 7.2 快速自检命令
+
+```bash
+# collector 存活
+curl -sS http://127.0.0.1:10925/telemetry/v1/healthz
+
+# 批次是否持续写入
+curl -sS -H "Authorization: Bearer <token>" \
+  http://127.0.0.1:10925/telemetry/v1/batches
+
+# 查看最近日志
+docker logs --tail 200 oqqwall-telemetry-collector
+```
+
+### 7.3 备份建议
+
+建议同时备份：
+
+- Postgres 数据卷
+- `COLLECTOR_OBJECT_DIR`
+- `COLLECTOR_EXPORT_DIR`
+
+说明：`samples` 依赖 `chat_objects` 原文，不能只备份数据库。
+
+---
+
+## 8. 数据保留
 
 当前实现不做自动 TTL 清理（永久保留）。如需清理，请通过外部任务按业务策略执行。

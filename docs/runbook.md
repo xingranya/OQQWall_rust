@@ -216,6 +216,8 @@ ls -1 data/telemetry/chat_objects | wc -l
 
 Collector 部署与 API 见：`docs/telemetry_collector.md`。
 
+如需独立部署 collector，请按 `docs/telemetry_collector.md` 中 “6. Docker 运行” 执行，并先创建 `ingest.write` token 给主程序使用。
+
 ---
 
 ## 5. 升级流程（安全、可回滚）
