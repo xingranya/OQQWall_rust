@@ -479,6 +479,61 @@
 - 预期用途：当 `mode = scheduled` 时指定未来发送时间（Unix 秒/毫秒时间戳）。
 - 当前实现状态：尚未接入调度链路，传入 `schedule_at` 会返回 `422`。
 
+### 4.14 指定账号发送私信
+
+`POST /v1/messages/private/send`
+
+权限：`send.execute`
+
+请求：
+```json
+{
+  "target_account": "3391146750",
+  "group_id": "10001",
+  "user_id": "123456789",
+  "message": [
+    { "type": "text", "data": { "text": "hello" } },
+    { "type": "face", "data": { "id": "14" } }
+  ]
+}
+```
+
+字段约束：
+- 必填：`target_account`、`user_id`、`message`
+- `message` 必须是非空数组，且每个元素必须是对象；服务端不限制段类型，按 NapCat 段原样透传。
+- `group_id` 可选：
+  - 传入时：必须是已配置组，且 `target_account` 必须属于该组，且 token 必须有该组权限。
+  - 未传时：先筛出 token 可访问且包含 `target_account` 的组：
+    - 若仅 1 个候选组：直接使用；
+    - 若多个候选组：优先尝试“当前在线主账号恰好为 `target_account`”唯一命中；否则要求显式传 `group_id`。
+- 无论是否传 `group_id`，`target_account` 本身必须在线；离线会返回错误。
+
+响应：
+```json
+{
+  "request_id": "req_xxx",
+  "status": "ok",
+  "target_account": "3391146750",
+  "group_id": "10001",
+  "user_id": "123456789",
+  "message_id": "1873219",
+  "raw": {
+    "status": "ok",
+    "retcode": 0,
+    "data": {
+      "message_id": 1873219
+    },
+    "echo": "echo-1"
+  }
+}
+```
+
+错误语义：
+- `400`：参数错误（如空消息、未知账号、`group_id` 与账号不匹配）
+- `403`：无组权限
+- `409`：未传 `group_id` 且命中多个在线候选组（需显式指定 `group_id`）
+- `503`：目标账号离线或 NapCat 调用失败
+
 ## 5. 兼容性说明
 
 - `chooseall` 属于前端交互状态，不提供独立后端接口。

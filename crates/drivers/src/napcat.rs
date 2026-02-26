@@ -858,6 +858,10 @@ fn lookup_ws_session(account_id: &str) -> Option<NapCatWsSession> {
     guard.get(account_id).cloned()
 }
 
+pub fn napcat_account_online(account_id: &str) -> bool {
+    lookup_ws_session(account_id).is_some()
+}
+
 fn set_group_accounts(group_id: &str, accounts: Vec<String>) {
     let mut guard = match group_accounts().lock() {
         Ok(guard) => guard,

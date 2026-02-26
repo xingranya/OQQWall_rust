@@ -20,7 +20,9 @@ use oqqwall_rust_core::{
     derive_blob_id, derive_ingress_id, derive_post_id, derive_session_id,
 };
 use oqqwall_rust_drivers::avatar_cache;
-use oqqwall_rust_drivers::napcat::napcat_ws_request;
+use oqqwall_rust_drivers::napcat::{
+    napcat_account_for_group, napcat_account_online, napcat_ws_request,
+};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -56,6 +58,7 @@ const CREATE_REVIEW_CODE_POLL_MS: u64 = 100;
 const MAX_CREATE_WARNINGS: usize = 20;
 const MAX_SEGMENT_PLACEHOLDER_LEN: usize = 64;
 const STRANGER_INFO_TIMEOUT_MS: u64 = 3_000;
+const SEND_PRIVATE_TIMEOUT_MS: u64 = 5_000;
 const AVATAR_WAIT_AFTER_FETCH_MS: i64 = 1_500;
 const AVATAR_WAIT_POLL_MS: u64 = 100;
 
@@ -66,6 +69,7 @@ struct ApiState {
     auth: Arc<RwLock<AuthStore>>,
     tz_offset_minutes: i32,
     account_group_by_account: HashMap<String, String>,
+    account_groups_by_account: HashMap<String, Vec<String>>,
     known_groups: HashSet<String>,
 }
 
@@ -329,6 +333,15 @@ struct SendPostsRequest {
     schedule_at: Option<i64>,
 }
 
+#[derive(Deserialize)]
+struct SendPrivateMessageRequest {
+    target_account: String,
+    #[serde(default)]
+    group_id: Option<String>,
+    user_id: Value,
+    message: Vec<Value>,
+}
+
 #[derive(Serialize)]
 struct SendPostsResponse {
     accepted: usize,
@@ -339,6 +352,17 @@ struct SendPostsResponse {
 struct SendFailure {
     post_id: String,
     reason: String,
+}
+
+#[derive(Serialize)]
+struct SendPrivateMessageResponse {
+    request_id: String,
+    status: &'static str,
+    target_account: String,
+    group_id: String,
+    user_id: String,
+    message_id: Option<String>,
+    raw: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -402,6 +426,7 @@ pub fn spawn_web_api(handle: &EngineHandle, config: &AppConfig) {
     }
     let core_config = config.build_core_config();
     let mut account_group_by_account = HashMap::new();
+    let mut account_groups_by_account: HashMap<String, Vec<String>> = HashMap::new();
     let mut known_groups = HashSet::new();
     for group in &config.groups {
         known_groups.insert(group.group_id.clone());
@@ -410,6 +435,10 @@ pub fn spawn_web_api(handle: &EngineHandle, config: &AppConfig) {
                 account_group_by_account
                     .entry(account.clone())
                     .or_insert_with(|| group.group_id.clone());
+                account_groups_by_account
+                    .entry(account.clone())
+                    .or_default()
+                    .push(group.group_id.clone());
             }
         }
     }
@@ -420,6 +449,7 @@ pub fn spawn_web_api(handle: &EngineHandle, config: &AppConfig) {
         auth: Arc::new(RwLock::new(AuthStore::new(root_token))),
         tz_offset_minutes: config.tz_offset_minutes,
         account_group_by_account,
+        account_groups_by_account,
         known_groups,
     };
 
@@ -444,6 +474,7 @@ pub fn spawn_web_api(handle: &EngineHandle, config: &AppConfig) {
             delete(delete_blacklist),
         )
         .route("/v1/posts/send", post(send_posts))
+        .route("/v1/messages/private/send", post(send_private_message))
         .with_state(state);
 
     let bind_addr = format!("0.0.0.0:{}", config.web_api_port);
@@ -2067,6 +2098,227 @@ async fn send_posts(
     (StatusCode::OK, Json(SendPostsResponse { accepted, failed })).into_response()
 }
 
+async fn send_private_message(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<SendPrivateMessageRequest>,
+) -> impl IntoResponse {
+    let request_id = request_id(&headers);
+    let auth = match authenticate(&state, &headers, Some("send.execute"), &request_id) {
+        Ok(auth) => auth,
+        Err(resp) => return resp,
+    };
+
+    let target_account = req.target_account.trim();
+    if target_account.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "target_account cannot be empty",
+            request_id,
+        );
+    }
+    if !state.account_groups_by_account.contains_key(target_account) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "unknown target_account",
+            request_id,
+        );
+    }
+    if req.message.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "message cannot be empty",
+            request_id,
+        );
+    }
+    if req.message.iter().any(|segment| !segment.is_object()) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "message segments must be objects",
+            request_id,
+        );
+    }
+    let Some(user_id) = value_to_string(&req.user_id) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "user_id is required",
+            request_id,
+        );
+    };
+    let user_id = user_id.trim().to_string();
+    if user_id.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "user_id is required",
+            request_id,
+        );
+    }
+
+    let group_id = match resolve_group_for_target_account(
+        &state,
+        &auth,
+        target_account,
+        req.group_id.as_deref(),
+        &request_id,
+    ) {
+        Ok(group_id) => group_id,
+        Err(resp) => return resp,
+    };
+
+    let response = match napcat_ws_request(
+        target_account,
+        "send_private_msg",
+        json!({
+            "user_id": user_id,
+            "message": req.message,
+        }),
+        Duration::from_millis(SEND_PRIVATE_TIMEOUT_MS),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "UNAVAILABLE",
+                &format!("send_private_msg failed: {}", err),
+                request_id,
+            );
+        }
+    };
+
+    let message_id = response
+        .get("data")
+        .and_then(|value| value.get("message_id"))
+        .and_then(value_to_string);
+
+    (
+        StatusCode::OK,
+        Json(SendPrivateMessageResponse {
+            request_id,
+            status: "ok",
+            target_account: target_account.to_string(),
+            group_id,
+            user_id,
+            message_id,
+            raw: response,
+        }),
+    )
+        .into_response()
+}
+
+fn resolve_group_for_target_account(
+    state: &ApiState,
+    auth: &AuthContext,
+    target_account: &str,
+    requested_group_id: Option<&str>,
+    request_id: &str,
+) -> Result<String, axum::response::Response> {
+    let Some(candidate_groups) = state.account_groups_by_account.get(target_account) else {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "unknown target_account",
+            request_id.to_string(),
+        ));
+    };
+
+    if let Some(raw_group_id) = requested_group_id {
+        let group_id = raw_group_id.trim();
+        if group_id.is_empty() {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                "group_id cannot be empty",
+                request_id.to_string(),
+            ));
+        }
+        if !state.known_groups.contains(group_id) {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                "unknown group_id",
+                request_id.to_string(),
+            ));
+        }
+        if !candidate_groups.iter().any(|group| group == group_id) {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                "target_account is not configured in group_id",
+                request_id.to_string(),
+            ));
+        }
+        if !group_allowed(auth, group_id) {
+            return Err(error_response(
+                StatusCode::FORBIDDEN,
+                "PERMISSION_DENIED",
+                "group is not allowed for current token",
+                request_id.to_string(),
+            ));
+        }
+        if !napcat_account_online(target_account) {
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "UNAVAILABLE",
+                "target_account is not online",
+                request_id.to_string(),
+            ));
+        }
+        return Ok(group_id.to_string());
+    }
+
+    let allowed_candidates = candidate_groups
+        .iter()
+        .filter(|group_id| group_allowed(auth, group_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if allowed_candidates.is_empty() {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "PERMISSION_DENIED",
+            "target_account is not in allowed_groups",
+            request_id.to_string(),
+        ));
+    }
+    if !napcat_account_online(target_account) {
+        return Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "UNAVAILABLE",
+            "target_account is not online",
+            request_id.to_string(),
+        ));
+    }
+    if allowed_candidates.len() == 1 {
+        return Ok(allowed_candidates[0].clone());
+    }
+    let primary_matches = allowed_candidates
+        .into_iter()
+        .filter(|group_id| napcat_account_for_group(group_id).as_deref() == Some(target_account))
+        .collect::<Vec<_>>();
+    match primary_matches.len() {
+        1 => Ok(primary_matches[0].clone()),
+        0 => Err(error_response(
+            StatusCode::CONFLICT,
+            "CONFLICT",
+            "target_account matches multiple allowed groups, please provide group_id",
+            request_id.to_string(),
+        )),
+        _ => Err(error_response(
+            StatusCode::CONFLICT,
+            "CONFLICT",
+            "target_account matches multiple online groups, please provide group_id",
+            request_id.to_string(),
+        )),
+    }
+}
+
 fn normalize_allowed_groups(
     input: Option<Vec<String>>,
     known_groups: &HashSet<String>,
@@ -2975,6 +3227,14 @@ mod tests {
         let mut account_group_by_account = HashMap::new();
         account_group_by_account.insert("acc10001".to_string(), "10001".to_string());
         account_group_by_account.insert("acc20002".to_string(), "20002".to_string());
+        account_group_by_account.insert("acc_shared".to_string(), "10001".to_string());
+        let mut account_groups_by_account = HashMap::new();
+        account_groups_by_account.insert("acc10001".to_string(), vec!["10001".to_string()]);
+        account_groups_by_account.insert("acc20002".to_string(), vec!["20002".to_string()]);
+        account_groups_by_account.insert(
+            "acc_shared".to_string(),
+            vec!["10001".to_string(), "20002".to_string()],
+        );
         let known_groups = ["10001", "20002"]
             .iter()
             .map(|value| value.to_string())
@@ -2986,6 +3246,7 @@ mod tests {
                 auth: Arc::new(RwLock::new(auth)),
                 tz_offset_minutes: 0,
                 account_group_by_account,
+                account_groups_by_account,
                 known_groups,
             },
             cmd_rx,
@@ -4720,6 +4981,234 @@ mod tests {
         let cmd2 = rx.try_recv().expect("second cmd");
         assert!(matches!(cmd1, Command::ReviewAction(_)));
         assert!(matches!(cmd2, Command::ReviewAction(_)));
+    }
+
+    #[tokio::test]
+    async fn send_private_message_rejects_empty_message() {
+        let (state, _rx, session_id) = build_test_state(None);
+        let response = send_private_message(
+            State(state),
+            build_headers(&session_id, None),
+            Json(SendPrivateMessageRequest {
+                target_account: "acc10001".to_string(),
+                group_id: None,
+                user_id: json!("123456"),
+                message: Vec::new(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["message"], "message cannot be empty");
+    }
+
+    #[tokio::test]
+    async fn send_private_message_rejects_group_without_target_account() {
+        let (state, _rx, session_id) = build_test_state(None);
+        let response = send_private_message(
+            State(state),
+            build_headers(&session_id, None),
+            Json(SendPrivateMessageRequest {
+                target_account: "acc10001".to_string(),
+                group_id: Some("20002".to_string()),
+                user_id: json!("123456"),
+                message: vec![json!({"type":"text","data":{"text":"ping"}})],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|msg| msg.contains("not configured in group_id"))
+        );
+    }
+
+    #[tokio::test]
+    async fn send_private_message_rejects_when_target_account_not_in_allowed_groups() {
+        let (state, _rx, session_id) = build_test_state(Some(vec!["10001"]));
+        let response = send_private_message(
+            State(state),
+            build_headers(&session_id, None),
+            Json(SendPrivateMessageRequest {
+                target_account: "acc20002".to_string(),
+                group_id: None,
+                user_id: json!("123456"),
+                message: vec![json!({"type":"text","data":{"text":"ping"}})],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["code"], "PERMISSION_DENIED");
+    }
+
+    #[tokio::test]
+    async fn send_private_message_requires_online_target_account() {
+        let (state, _rx, session_id) = build_test_state(None);
+        let response = send_private_message(
+            State(state),
+            build_headers(&session_id, None),
+            Json(SendPrivateMessageRequest {
+                target_account: "acc10001".to_string(),
+                group_id: Some("10001".to_string()),
+                user_id: json!("123456"),
+                message: vec![json!({"type":"text","data":{"text":"ping"}})],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response_json(response).await;
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|msg| msg.contains("not online"))
+        );
+    }
+
+    #[tokio::test]
+    async fn send_private_message_rejects_empty_target_account() {
+        let (state, _rx, session_id) = build_test_state(None);
+        let response = send_private_message(
+            State(state),
+            build_headers(&session_id, None),
+            Json(SendPrivateMessageRequest {
+                target_account: "   ".to_string(),
+                group_id: None,
+                user_id: json!("123456"),
+                message: vec![json!({"type":"text","data":{"text":"ping"}})],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["message"], "target_account cannot be empty");
+    }
+
+    #[tokio::test]
+    async fn send_private_message_rejects_unknown_target_account() {
+        let (state, _rx, session_id) = build_test_state(None);
+        let response = send_private_message(
+            State(state),
+            build_headers(&session_id, None),
+            Json(SendPrivateMessageRequest {
+                target_account: "acc_missing".to_string(),
+                group_id: None,
+                user_id: json!("123456"),
+                message: vec![json!({"type":"text","data":{"text":"ping"}})],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["message"], "unknown target_account");
+    }
+
+    #[tokio::test]
+    async fn send_private_message_rejects_non_object_segment() {
+        let (state, _rx, session_id) = build_test_state(None);
+        let response = send_private_message(
+            State(state),
+            build_headers(&session_id, None),
+            Json(SendPrivateMessageRequest {
+                target_account: "acc10001".to_string(),
+                group_id: None,
+                user_id: json!("123456"),
+                message: vec![json!("plain-text-segment")],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["message"], "message segments must be objects");
+    }
+
+    #[tokio::test]
+    async fn send_private_message_rejects_missing_user_id() {
+        let (state, _rx, session_id) = build_test_state(None);
+        let response = send_private_message(
+            State(state),
+            build_headers(&session_id, None),
+            Json(SendPrivateMessageRequest {
+                target_account: "acc10001".to_string(),
+                group_id: None,
+                user_id: Value::Null,
+                message: vec![json!({"type":"text","data":{"text":"ping"}})],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["message"], "user_id is required");
+    }
+
+    #[tokio::test]
+    async fn send_private_message_rejects_blank_group_id() {
+        let (state, _rx, session_id) = build_test_state(None);
+        let response = send_private_message(
+            State(state),
+            build_headers(&session_id, None),
+            Json(SendPrivateMessageRequest {
+                target_account: "acc10001".to_string(),
+                group_id: Some("   ".to_string()),
+                user_id: json!("123456"),
+                message: vec![json!({"type":"text","data":{"text":"ping"}})],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["message"], "group_id cannot be empty");
+    }
+
+    #[tokio::test]
+    async fn send_private_message_rejects_unknown_group_id() {
+        let (state, _rx, session_id) = build_test_state(None);
+        let response = send_private_message(
+            State(state),
+            build_headers(&session_id, None),
+            Json(SendPrivateMessageRequest {
+                target_account: "acc10001".to_string(),
+                group_id: Some("99999".to_string()),
+                user_id: json!("123456"),
+                message: vec![json!({"type":"text","data":{"text":"ping"}})],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["message"], "unknown group_id");
+    }
+
+    #[tokio::test]
+    async fn send_private_message_rejects_explicit_group_without_permission() {
+        let (state, _rx, session_id) = build_test_state(Some(vec!["10001"]));
+        let response = send_private_message(
+            State(state),
+            build_headers(&session_id, None),
+            Json(SendPrivateMessageRequest {
+                target_account: "acc20002".to_string(),
+                group_id: Some("20002".to_string()),
+                user_id: json!("123456"),
+                message: vec![json!({"type":"text","data":{"text":"ping"}})],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["code"], "PERMISSION_DENIED");
     }
 
     #[tokio::test]

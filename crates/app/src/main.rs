@@ -3,6 +3,7 @@ mod connect;
 mod engine;
 mod oobe;
 mod status;
+mod telemetry;
 mod web_api;
 mod webview;
 
@@ -24,6 +25,7 @@ use engine::Engine;
 use oqqwall_rust::tui::oqqwall_tui;
 use oqqwall_rust_core::Command;
 use std::env;
+use std::io::IsTerminal;
 use tokio::time::{Duration, sleep};
 
 #[tokio::main]
@@ -46,7 +48,13 @@ async fn main() {
     }
 
     println!("系统已启动");
-    let app_config = AppConfig::load().expect("failed to load config.json");
+    let app_config = match load_app_config_with_auto_oobe() {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+    };
     debug_log!(
         "config loaded: groups={} tz_offset_minutes={} fallback_napcat={}",
         app_config.groups.len(),
@@ -65,6 +73,8 @@ async fn main() {
     let (engine, handle) = Engine::new(core_config, &data_dir).expect("failed to init engine");
     debug_log!("engine created: data_dir={}", data_dir);
     let _status = status::spawn_status_logger(&handle);
+    let _telemetry =
+        telemetry::spawn_submission_telemetry(&handle, &app_config.telemetry, &data_dir);
     debug_log!("status logger spawned");
     web_api::spawn_web_api(&handle, &app_config);
     webview::spawn_webview(&handle, &app_config);
@@ -110,4 +120,25 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     now.as_millis() as i64
+}
+
+fn load_app_config_with_auto_oobe() -> Result<AppConfig, String> {
+    let config_path = config::resolve_config_path();
+    let has_config = config::config_exists(&config_path)?;
+    if !has_config {
+        if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+            return Err(format!(
+                "未找到配置文件 '{}'，且当前无交互终端，无法自动执行 OOBE。请手动运行: OQQWall_RUST oobe --config {}",
+                config_path, config_path
+            ));
+        }
+        println!("未找到配置文件 '{}'，正在进入 OOBE 初始化...", config_path);
+        let oobe_args = vec![
+            "oobe".to_string(),
+            "--config".to_string(),
+            config_path.clone(),
+        ];
+        oobe::run(&oobe_args)?;
+    }
+    AppConfig::load()
 }

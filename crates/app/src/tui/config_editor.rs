@@ -2300,13 +2300,11 @@ impl ListEditor {
             ListKind::MapList => self
                 .items
                 .push(ListItem::MapEntry(String::new(), String::new())),
-            ListKind::AdminList => self
-                .items
-                .push(ListItem::Admin(
-                    String::new(),
-                    String::new(),
-                    "group_admin".to_string(),
-                )),
+            ListKind::AdminList => self.items.push(ListItem::Admin(
+                String::new(),
+                String::new(),
+                "group_admin".to_string(),
+            )),
         }
         self.selected = self.items.len().saturating_sub(1);
         self.dirty = true;

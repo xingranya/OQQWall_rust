@@ -2,6 +2,10 @@
 
 `OQQWall_RUST` 提供一个交互式 OOBE（out-of-box experience），用于在首次部署时生成 `config.json` 骨架，减少手动填错字段的概率。
 
+当直接运行主程序 `OQQWall_RUST` 且配置文件不存在时：
+- 如果当前是交互终端，程序会自动进入 OOBE。
+- 如果当前无交互终端（如 systemd/容器），程序会报错退出，并提示手动执行 OOBE。
+
 ## 用法
 
 在仓库根目录执行：

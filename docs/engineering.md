@@ -224,6 +224,8 @@ driver 不应依赖自己的内存去重，应该依赖 state 的 request 状态
 ### 7.2 CLI 约定（建议）
 
 * `OQQWALL_CONFIG=./config.json OQQWall_RUST`（当前实现）
+  * 若配置文件不存在且有交互终端：自动进入 OOBE
+  * 若配置文件不存在且无交互终端：报错退出并提示手动 OOBE
 * `OQQWall_RUST oobe --config ./config.json`（生成/覆盖配置，当前实现）
 * `OQQWall_RUST replay ...`（规划：调试回放）
 * `OQQWall_RUST doctor ...`（规划：自检 NapCat/端口/目录权限）

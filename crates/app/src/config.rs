@@ -48,6 +48,18 @@ pub struct WebviewAdminAccount {
 }
 
 #[derive(Debug, Clone)]
+pub struct TelemetryConfig {
+    pub enabled: bool,
+    pub local_dir: String,
+    pub upload_enabled: bool,
+    pub upload_endpoint: Option<String>,
+    pub upload_token: Option<String>,
+    pub upload_interval_sec: u64,
+    pub upload_batch_size: usize,
+    pub max_append_messages: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct AppConfig {
     pub groups: Vec<AppGroupConfig>,
     pub tz_offset_minutes: i32,
@@ -62,6 +74,7 @@ pub struct AppConfig {
     pub webview_port: u16,
     pub webview_session_ttl_sec: i64,
     pub webview_admins: Vec<WebviewAdminAccount>,
+    pub telemetry: TelemetryConfig,
     core_config: CoreConfig,
     #[cfg(debug_assertions)]
     pub dev_config: DevConfig,
@@ -75,7 +88,7 @@ pub struct DevConfig {
 
 impl AppConfig {
     pub fn load() -> Result<Self, String> {
-        let path = env::var("OQQWALL_CONFIG").unwrap_or_else(|_| "config.json".to_string());
+        let path = resolve_config_path();
         debug_log!("loading config path={}", path);
         let data = fs::read_to_string(&path)
             .map_err(|err| format!("failed to read config {}: {}", path, err))?;
@@ -118,6 +131,7 @@ impl AppConfig {
         let default_friend_add_message = parse_string(common.get("friend_add_message"));
         let common_web_api = common.get("web_api").and_then(|value| value.as_object());
         let common_webview = common.get("webview").and_then(|value| value.as_object());
+        let common_telemetry = common.get("telemetry").and_then(|value| value.as_object());
         let web_api_enabled = common_web_api
             .and_then(|obj| parse_bool(obj.get("enabled")))
             .unwrap_or(false);
@@ -145,8 +159,47 @@ impl AppConfig {
             .and_then(|obj| parse_i64(obj.get("session_ttl_sec")))
             .unwrap_or(12 * 60 * 60)
             .clamp(300, 7 * 24 * 60 * 60);
+        let telemetry_enabled = common_telemetry
+            .and_then(|obj| parse_bool(obj.get("enabled")))
+            .unwrap_or(false);
+        let telemetry_local_dir =
+            nonempty(common_telemetry.and_then(|obj| parse_string(obj.get("local_dir"))))
+                .unwrap_or_else(|| "telemetry".to_string());
+        let telemetry_upload_enabled = common_telemetry
+            .and_then(|obj| parse_bool(obj.get("upload_enabled")))
+            .unwrap_or(false);
+        let telemetry_upload_endpoint = nonempty(env_override(
+            "OQQWALL_TELEMETRY_ENDPOINT",
+            common_telemetry.and_then(|obj| parse_string(obj.get("upload_endpoint"))),
+        ));
+        let telemetry_upload_token = nonempty(env_override(
+            "OQQWALL_TELEMETRY_TOKEN",
+            common_telemetry.and_then(|obj| parse_string(obj.get("upload_token"))),
+        ));
+        let telemetry_upload_interval_sec = common_telemetry
+            .and_then(|obj| parse_u64(obj.get("upload_interval_sec")))
+            .unwrap_or(30)
+            .clamp(1, 86_400);
+        let telemetry_upload_batch_size = common_telemetry
+            .and_then(|obj| parse_usize(obj.get("upload_batch_size")))
+            .unwrap_or(20)
+            .clamp(20, 20);
+        let telemetry_max_append_messages = common_telemetry
+            .and_then(|obj| parse_usize(obj.get("max_append_messages")))
+            .unwrap_or(2)
+            .clamp(1, 10);
+        let telemetry = TelemetryConfig {
+            enabled: telemetry_enabled,
+            local_dir: telemetry_local_dir,
+            upload_enabled: telemetry_upload_enabled,
+            upload_endpoint: telemetry_upload_endpoint,
+            upload_token: telemetry_upload_token,
+            upload_interval_sec: telemetry_upload_interval_sec,
+            upload_batch_size: telemetry_upload_batch_size,
+            max_append_messages: telemetry_max_append_messages,
+        };
         debug_log!(
-            "config parsed: tz_offset_minutes={} default_process_waittime_ms={} max_cache_mb={} at_unprived_sender={} web_api_enabled={} web_api_port={} web_api_token_present={} webview_enabled={} webview_host={} webview_port={} webview_admins={}",
+            "config parsed: tz_offset_minutes={} default_process_waittime_ms={} max_cache_mb={} at_unprived_sender={} web_api_enabled={} web_api_port={} web_api_token_present={} webview_enabled={} webview_host={} webview_port={} webview_admins={} telemetry_enabled={} telemetry_upload_enabled={} telemetry_endpoint_present={}",
             tz_offset_minutes,
             default_process_waittime_ms,
             max_cache_mb,
@@ -157,7 +210,10 @@ impl AppConfig {
             webview_enabled,
             webview_host,
             webview_port,
-            parse_admin_entries(root_obj.get("webview_global_admins")).len()
+            parse_admin_entries(root_obj.get("webview_global_admins")).len(),
+            telemetry.enabled,
+            telemetry.upload_enabled,
+            telemetry.upload_endpoint.is_some()
         );
         let core_config = build_core_config(&common, &groups, default_process_waittime_ms);
         let fallback_napcat = parse_napcat_config_optional(&common);
@@ -279,10 +335,23 @@ impl AppConfig {
             webview_port,
             webview_session_ttl_sec,
             webview_admins,
+            telemetry,
             core_config,
             #[cfg(debug_assertions)]
             dev_config,
         })
+    }
+}
+
+pub fn resolve_config_path() -> String {
+    env::var("OQQWALL_CONFIG").unwrap_or_else(|_| "config.json".to_string())
+}
+
+pub fn config_exists(path: &str) -> Result<bool, String> {
+    match fs::metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(format!("failed to check config {}: {}", path, err)),
     }
 }
 
@@ -965,6 +1034,17 @@ fn base_url_for_log(_url: &str) -> &str {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs::File;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_test_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("oqqwall_{name}_{nanos}.json"))
+    }
 
     #[test]
     fn normalize_group_accounts_prefers_accounts_and_removes_legacy_keys() {
@@ -1036,5 +1116,46 @@ mod tests {
         });
         let err = parse_quick_replies(Some(&value)).expect_err("should fail");
         assert!(err.contains("conflicts"));
+    }
+
+    #[test]
+    fn resolve_config_path_defaults_to_config_json() {
+        let key = "OQQWALL_CONFIG";
+        unsafe {
+            std::env::remove_var(key);
+        }
+        assert_eq!(resolve_config_path(), "config.json");
+    }
+
+    #[test]
+    fn resolve_config_path_respects_env_override() {
+        let key = "OQQWALL_CONFIG";
+        unsafe {
+            std::env::set_var(key, "/tmp/custom-config.json");
+        }
+        assert_eq!(resolve_config_path(), "/tmp/custom-config.json");
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn config_exists_returns_false_for_missing_file() {
+        let path = unique_test_path("missing");
+        assert_eq!(
+            config_exists(path.to_string_lossy().as_ref()).expect("exists check"),
+            false
+        );
+    }
+
+    #[test]
+    fn config_exists_returns_true_for_existing_file() {
+        let path = unique_test_path("exists");
+        let _file = File::create(&path).expect("create temp config");
+        assert_eq!(
+            config_exists(path.to_string_lossy().as_ref()).expect("exists check"),
+            true
+        );
+        let _ = std::fs::remove_file(path);
     }
 }
