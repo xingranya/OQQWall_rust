@@ -29,7 +29,13 @@
 - Run `cargo test -p core` before touching IO-heavy paths.
 
 ## Commit & Pull Request Guidelines
-- Commit history uses short, lowercase summaries (for example, `add cqface`); keep subjects concise and action-oriented.
+- Use Conventional Commits for commit messages: `type(scope): subject`.
+- Recommended types: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`.
+- Keep subject concise and action-oriented (prefer lowercase, no trailing period).
+- Examples:
+  - `feat(telemetry): add batched sample uploader`
+  - `fix(web_api): stabilize rendered post tests`
+  - `docs(config): document telemetry options`
 - PRs should include a clear description, the tests you ran, and note any config or behavior changes (especially `config.json`/`devconfig.json`).
 
 ## Configuration & Runtime Notes

@@ -740,3 +740,97 @@ fn random_u64() -> u64 {
     let mut rng = rand::thread_rng();
     rng.next_u64()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oqqwall_rust_core::ids::Id128;
+    use oqqwall_rust_core::state::IngressMeta;
+
+    fn sample_chat_record() -> ChatRecord {
+        ChatRecord {
+            messages: vec![
+                ChatMessage {
+                    ingress_id: "1".to_string(),
+                    platform_msg_id: "m1".to_string(),
+                    received_at_ms: 1000,
+                    text: "first".to_string(),
+                    attachments: Vec::new(),
+                },
+                ChatMessage {
+                    ingress_id: "2".to_string(),
+                    platform_msg_id: "m2".to_string(),
+                    received_at_ms: 2000,
+                    text: "second".to_string(),
+                    attachments: Vec::new(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn truncate_tail_removes_last_message() {
+        let chat = sample_chat_record();
+        let truncated = truncate_tail(&chat).expect("truncated");
+        assert_eq!(truncated.messages.len(), 1);
+        assert_eq!(truncated.messages[0].text, "first");
+    }
+
+    #[test]
+    fn append_offtopic_appends_following_messages_from_same_sender() {
+        let mut state = StateView::default();
+        state.ingress_meta.insert(
+            Id128(11),
+            IngressMeta {
+                profile_id: "p".to_string(),
+                chat_id: "c".to_string(),
+                user_id: "sender".to_string(),
+                sender_name: Some("S".to_string()),
+                group_id: "10001".to_string(),
+                platform_msg_id: "m11".to_string(),
+                received_at_ms: 3000,
+            },
+        );
+        state.ingress_messages.insert(
+            Id128(11),
+            IngressMessage {
+                text: "offtopic".to_string(),
+                attachments: Vec::new(),
+            },
+        );
+        state.ingress_meta.insert(
+            Id128(12),
+            IngressMeta {
+                profile_id: "p".to_string(),
+                chat_id: "c".to_string(),
+                user_id: "other".to_string(),
+                sender_name: Some("O".to_string()),
+                group_id: "10001".to_string(),
+                platform_msg_id: "m12".to_string(),
+                received_at_ms: 4000,
+            },
+        );
+        state.ingress_messages.insert(
+            Id128(12),
+            IngressMessage {
+                text: "should_not_append".to_string(),
+                attachments: Vec::new(),
+            },
+        );
+
+        let base = BaseSampleContext {
+            review_id: Id128(1),
+            review_code: 101,
+            post_id: Id128(2),
+            group_id: "10001".to_string(),
+            sender_id: "sender".to_string(),
+            chat_record: sample_chat_record(),
+            post_ingress_set: HashSet::new(),
+            latest_message_ms: 2500,
+        };
+
+        let merged = append_offtopic(&state, &base, 2).expect("merged");
+        assert_eq!(merged.messages.len(), 3);
+        assert_eq!(merged.messages[2].text, "offtopic");
+    }
+}

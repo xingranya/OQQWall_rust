@@ -26,12 +26,20 @@ data/
 journal/                 # append-only 事件日志（分段）
 snapshot/                # 最近快照
 blobs/                   # 产物与附件备份（写多读少）
+telemetry/               # 遥测缓存（训练样本与聊天对象）
 logs/                    # 可选：文件日志
 ```
 
 建议将 `data/` 放在稳定磁盘（不要放 tmpfs），否则重启恢复会缺失历史。
 
 调试版会把 stderr 调试日志同步写入 `data/logs/debug.log`，可用 `OQQWALL_DEBUG_LOG` 覆盖路径（基于 `OQQWALL_DATA_DIR`）。
+
+遥测启用后会写入：
+
+- `data/telemetry/pending_samples.jsonl`
+- `data/telemetry/chat_objects/*.json`
+
+上传成功后会自动删除已上传样本，并清理无引用的聊天对象。
 
 ---
 
@@ -185,6 +193,26 @@ sudo systemctl stop OQQWall_RUST
 
 * 全局指令（如果实现）：`@机器人 系统修复`
 * 或 systemd 重启：`sudo systemctl restart OQQWall_RUST`（managed 模式会带 NapCat 一起重启）
+
+### 4.4 遥测队列检查
+
+用于模型训练的数据缓存可通过以下命令检查：
+
+```bash
+wc -l data/telemetry/pending_samples.jsonl
+ls -1 data/telemetry/chat_objects | wc -l
+```
+
+含义：
+
+- `pending_samples.jsonl` 行数：待上传样本条数
+- `chat_objects` 文件数：本地去重后的完整聊天对象数
+
+若 `pending_samples` 长期不下降，优先检查：
+
+- `common.telemetry.upload_enabled` 是否开启
+- `common.telemetry.upload_endpoint` 是否可达
+- `common.telemetry.upload_token` 是否正确
 
 ---
 

@@ -3112,7 +3112,19 @@ mod tests {
     use oqqwall_rust_core::event::ReviewDecision;
     use oqqwall_rust_core::state::{BlobMeta, PostMeta, PostStage, RenderMeta, ReviewMeta};
     use serde_json::json;
+    use std::sync::OnceLock;
     use tokio::sync::mpsc;
+
+    fn ensure_test_blob_dir() {
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(|| {
+            let dir = std::env::temp_dir().join("oqqwall_rust_web_api_test_blobs");
+            let _ = std::fs::create_dir_all(&dir);
+            unsafe {
+                std::env::set_var("OQQWALL_BLOB_DIR", &dir);
+            }
+        });
+    }
 
     #[test]
     fn parse_stage_roundtrip() {
@@ -3201,6 +3213,7 @@ mod tests {
     fn build_test_state(
         allowed_groups: Option<Vec<&str>>,
     ) -> (ApiState, mpsc::Receiver<Command>, String) {
+        ensure_test_blob_dir();
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
         let mut auth = AuthStore::new("0123456789abcdef0123456789abcdef".to_string());
         let session_id = "sess_test".to_string();
