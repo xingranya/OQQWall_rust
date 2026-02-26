@@ -15,3 +15,5 @@ devconfig.json
 crates/app/webview-ui/node_modules/
 
 dist/
+out/
+out-target/

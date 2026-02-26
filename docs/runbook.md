@@ -214,6 +214,8 @@ ls -1 data/telemetry/chat_objects | wc -l
 - `common.telemetry.upload_endpoint` 是否可达
 - `common.telemetry.upload_token` 是否正确
 
+Collector 部署与 API 见：`docs/telemetry_collector.md`。
+
 ---
 
 ## 5. 升级流程（安全、可回滚）

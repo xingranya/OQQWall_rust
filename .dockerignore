@@ -1,4 +1,14 @@
 target/
+.target/
 deps/
 data/
 .git/
+dist/
+out/*
+!out/telemetry-collector
+out-target/
+showcase/
+OQQWall_rust.wiki/
+crates/app/webview-ui/node_modules/
+*.log
+*.tmp

@@ -264,7 +264,7 @@ Rust 版落地建议：
 }
 ```
 
-> 遥测字段协议与上传包体细节见 `docs/telemetry.md`。
+> 遥测字段协议与上传包体细节见 `docs/telemetry.md`；独立服务端部署见 `docs/telemetry_collector.md`。
 
 ---
 

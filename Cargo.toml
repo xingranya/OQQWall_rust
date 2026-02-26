@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/app", "crates/core", "crates/infra", "crates/drivers"]
+members = [
+    "crates/app",
+    "crates/core",
+    "crates/infra",
+    "crates/drivers",
+    "crates/telemetry-collector",
+]
 resolver = "2"
 
 [profile.release]

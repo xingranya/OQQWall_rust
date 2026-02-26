@@ -1,0 +1,11 @@
+FROM ubuntu:20.04
+WORKDIR /app
+COPY out/telemetry-collector /usr/local/bin/telemetry-collector
+
+ENV COLLECTOR_HTTP_ADDR=0.0.0.0:10925 \
+    COLLECTOR_OBJECT_DIR=/app/data/objects \
+    COLLECTOR_EXPORT_DIR=/app/data/exports \
+    RUST_LOG=info
+
+EXPOSE 10925
+ENTRYPOINT ["/usr/local/bin/telemetry-collector"]

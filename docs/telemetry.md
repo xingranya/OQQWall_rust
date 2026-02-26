@@ -2,6 +2,8 @@
 
 > 适用范围：当前 `crates/app/src/telemetry.rs` 实现。  
 > 目标：把“审核结果”转成可训练样本，并支持本地缓存 + 批量上传（20 条/批）。
+>
+> 服务端落地见 `docs/telemetry_collector.md`（独立 `telemetry-collector` 二进制）。
 
 ---
 
@@ -139,3 +141,12 @@ ACK 语义（当前实现）：
 
 Web API 相关回归测试也已修复并通过（`create_rendered_post_*`）。
 
+---
+
+## 8. 服务端部署建议
+
+推荐把 `upload_endpoint` 指向独立 collector：
+
+- `http://<collector-host>:10925/telemetry/v1/submission/batch`
+
+启动与运维细节参见 `docs/telemetry_collector.md`。

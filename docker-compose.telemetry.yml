@@ -1,0 +1,40 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: oqqwall-telemetry-postgres
+    environment:
+      POSTGRES_DB: telemetry
+      POSTGRES_USER: telemetry
+      POSTGRES_PASSWORD: telemetry
+    volumes:
+      - telemetry_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U telemetry -d telemetry"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  collector:
+    build:
+      context: .
+      dockerfile: Dockerfile.telemetry-collector
+    container_name: oqqwall-telemetry-collector
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      COLLECTOR_HTTP_ADDR: 0.0.0.0:10925
+      COLLECTOR_PG_DSN: postgres://telemetry:telemetry@postgres:5432/telemetry
+      COLLECTOR_OBJECT_DIR: /app/data/objects
+      COLLECTOR_EXPORT_DIR: /app/data/exports
+      COLLECTOR_BOOTSTRAP_ROOT_TOKEN: change-me-at-least-16-chars
+      COLLECTOR_MAX_BODY_MB: 20
+      RUST_LOG: info
+    ports:
+      - "10925:10925"
+    volumes:
+      - telemetry_collector_data:/app/data
+
+volumes:
+  telemetry_pg_data:
+  telemetry_collector_data:
