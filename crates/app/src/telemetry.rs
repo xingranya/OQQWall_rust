@@ -32,6 +32,12 @@ macro_rules! debug_log {
     ($($arg:tt)*) => {};
 }
 
+macro_rules! telemetry_log {
+    ($($arg:tt)*) => {
+        oqqwall_rust_infra::debug_log::log(format_args!($($arg)*));
+    };
+}
+
 const SAMPLE_SCHEMA_VERSION: u32 = 1;
 const CHAT_CODEC: &str = "json";
 
@@ -106,7 +112,7 @@ impl TelemetryRuntime {
                 }
                 _ = ticker.tick() => {
                     if let Err(err) = self.flush_uploads().await {
-                        debug_log!("telemetry upload failed: {}", err);
+                        telemetry_log!("telemetry upload failed: {}", err);
                     }
                 }
             }
@@ -606,6 +612,13 @@ impl TelemetryStore {
             chat_objects,
             samples: batch_samples,
         };
+        telemetry_log!(
+            "telemetry upload start: batch_id={} endpoint={} samples={} chat_objects={}",
+            batch_id,
+            endpoint,
+            request.samples.len(),
+            request.chat_objects.len()
+        );
         let mut req = client
             .post(endpoint)
             .header("Idempotency-Key", batch_id)
@@ -631,6 +644,12 @@ impl TelemetryStore {
 
         self.rewrite_pending_samples(&remaining_samples)?;
         self.cleanup_unreferenced_objects(&remaining_samples)?;
+        telemetry_log!(
+            "telemetry upload success: batch_id={} samples={} remaining_samples={}",
+            request.batch_id,
+            request.samples.len(),
+            remaining_samples.len()
+        );
         Ok(true)
     }
 

@@ -84,11 +84,9 @@
 | webview.host                 | string |         `0.0.0.0` | 已支持               | WebView 监听主机（可设为 `127.0.0.1` 仅本机访问）                                |
 | webview.port                 |    u16 |             10924 | 已支持               | WebView 服务监听端口（默认 `0.0.0.0:10924`）                                      |
 | webview.session_ttl_sec      |    i64 |             43200 | 已支持               | WebView 会话有效期（秒，默认 12h）                                                |
-| telemetry.enabled            |   bool |             false | 已支持               | 是否启用投稿遥测（监听审核结果并生成训练样本）                                    |
+| telemetry.enabled            |   bool |              true | 已支持               | 是否启用投稿遥测（监听审核结果并生成训练样本）                                    |
 | telemetry.local_dir          | string |       `telemetry` | 已支持               | 本地遥测目录（相对 `OQQWALL_DATA_DIR`，默认 `data/telemetry`）                    |
-| telemetry.upload_enabled     |   bool |             false | 已支持               | 是否启用 HTTP 批量上传                                                            |
-| telemetry.upload_endpoint    | string |                "" | 已支持               | 遥测上传地址（可被环境变量覆盖）                                                   |
-| telemetry.upload_token       | string |                "" | 已支持               | 遥测上传 Bearer Token（可被环境变量覆盖）                                          |
+| telemetry.upload_enabled     |   bool |              true | 已支持               | 是否启用 HTTP 批量上传                                                            |
 | telemetry.upload_interval_sec|    u64 |                30 | 已支持               | 上传轮询间隔（秒，范围 1..86400）                                                  |
 | telemetry.upload_batch_size  |  usize |                20 | 已支持（固定 20）     | 每批上传样本数，当前实现钳制为 20                                                 |
 | telemetry.max_append_messages|  usize |                 2 | 已支持               | `append_offtopic` 负样本最多拼接消息数（范围 1..10）                             |
@@ -107,13 +105,13 @@
 * `OQQWALL_NAPCAT_TOKEN` > `groups.<id>.napcat_access_token`（全局覆盖所有组）
 * `OQQWALL_NAPCAT_BASE_URL` > `groups.<id>.napcat_base_url`（全局覆盖所有组）
 * `OQQWALL_API_TOKEN` > `common.web_api.root_token`（覆盖 HTTP API root token）
-* `OQQWALL_TELEMETRY_ENDPOINT` > `common.telemetry.upload_endpoint`（覆盖遥测上传地址）
-* `OQQWALL_TELEMETRY_TOKEN` > `common.telemetry.upload_token`（覆盖遥测上传 token）
 
 兼容迁移说明（启动时自动改写）：
 * `common.use_web_review` -> `common.web_api.enabled`
 * `common.web_review_port` -> `common.web_api.port`
 * `common.api_token` / `common.token` -> `common.web_api.root_token`
+
+遥测上传的 endpoint / token 为程序内置固定值，不支持通过 `config.json` 或环境变量修改。
 * `groups.<id>.admins` -> `groups.<id>.webview_admins`
 
 ---
@@ -235,8 +233,6 @@ Rust 版落地建议：
       "enabled": true,
       "local_dir": "telemetry",
       "upload_enabled": true,
-      "upload_endpoint": "https://collector.example.com/telemetry/v1/submission/batch",
-      "upload_token": "REDACTED",
       "upload_interval_sec": 30,
       "upload_batch_size": 20,
       "max_append_messages": 2

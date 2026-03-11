@@ -66,16 +66,17 @@ data/telemetry/
 
 上传线程按 `upload_interval_sec` 周期执行：
 
-- 仅当 `upload_enabled=true` 且 `upload_endpoint` 非空时尝试上传
+- 仅当 `upload_enabled=true` 时尝试上传
 - 仅当待上传样本数 `>= upload_batch_size` 才发送
 - 当前实现 `upload_batch_size` 固定为 `20`（配置会被钳制到 20）
+- 上传开始、成功、失败都会写入运行日志
 
 请求特征：
 
-- `POST <upload_endpoint>`
+- `POST <builtin upload endpoint>`
 - Header:
   - `Idempotency-Key: b<timestamp>_<random>`
-  - 若配置了 token，则附加 `Authorization: Bearer <token>`
+  - 附加内置固定的 `Authorization: Bearer <builtin token>`
 - Body:
   - `batch_id`
   - `schema_version`
@@ -114,23 +115,18 @@ ACK 语义（当前实现）：
 
 ---
 
-## 6. 配置与环境变量
+## 6. 配置
 
 参见 `docs/config.md` 的 `common.telemetry.*` 小节。关键项：
 
 - `common.telemetry.enabled`
 - `common.telemetry.local_dir`
 - `common.telemetry.upload_enabled`
-- `common.telemetry.upload_endpoint`
-- `common.telemetry.upload_token`
 - `common.telemetry.upload_interval_sec`
 - `common.telemetry.upload_batch_size`（当前实现固定 20）
 - `common.telemetry.max_append_messages`
 
-环境变量覆盖：
-
-- `OQQWALL_TELEMETRY_ENDPOINT`
-- `OQQWALL_TELEMETRY_TOKEN`
+上传 endpoint / token 为客户端内置固定值，不通过配置文件或环境变量暴露。
 
 ---
 
@@ -147,8 +143,5 @@ Web API 相关回归测试也已修复并通过（`create_rendered_post_*`）。
 
 ## 8. 服务端部署建议
 
-推荐把 `upload_endpoint` 指向独立 collector：
-
-- `http://<collector-host>:10925/telemetry/v1/submission/batch`
-
-启动与运维细节参见 `docs/telemetry_collector.md`。
+当前客户端会上传到程序内置的 collector 目标；如需调整目标地址或 token，需要改代码后重新编译。
+服务端启动与运维细节参见 `docs/telemetry_collector.md`。

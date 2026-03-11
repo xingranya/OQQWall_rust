@@ -233,8 +233,8 @@ curl http://127.0.0.1:10925/telemetry/v1/healthz
 在 OQQWall_RUST 的 `config.json`：
 
 - `common.telemetry.upload_enabled = true`
-- `common.telemetry.upload_endpoint = "http://<collector-host>:10925/telemetry/v1/submission/batch"`
-- `common.telemetry.upload_token = "<ingest token>"`
+- 上传 endpoint / token 为主程序内置固定值，不再通过 `config.json` 暴露
+- 如需改成自建 collector，请调整主程序内置 telemetry endpoint / token 后重新编译
 
 ---
 

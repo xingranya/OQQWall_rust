@@ -80,6 +80,42 @@ const COMMON_FIELDS: &[FieldSpec] = &[
         aliases: &[],
     },
     FieldSpec {
+        key: "telemetry.enabled",
+        kind: FieldKind::Bool { default: true },
+        hint: "Enable submission telemetry collection",
+        aliases: &[],
+    },
+    FieldSpec {
+        key: "telemetry.local_dir",
+        kind: FieldKind::Text,
+        hint: "Telemetry local storage directory",
+        aliases: &[],
+    },
+    FieldSpec {
+        key: "telemetry.upload_enabled",
+        kind: FieldKind::Bool { default: true },
+        hint: "Enable telemetry batch upload",
+        aliases: &[],
+    },
+    FieldSpec {
+        key: "telemetry.upload_interval_sec",
+        kind: FieldKind::Text,
+        hint: "Telemetry upload interval in seconds",
+        aliases: &[],
+    },
+    FieldSpec {
+        key: "telemetry.upload_batch_size",
+        kind: FieldKind::Text,
+        hint: "Telemetry upload batch size (currently fixed at 20)",
+        aliases: &[],
+    },
+    FieldSpec {
+        key: "telemetry.max_append_messages",
+        kind: FieldKind::Text,
+        hint: "Max appended off-topic messages for telemetry",
+        aliases: &[],
+    },
+    FieldSpec {
         key: "process_waittime_sec",
         kind: FieldKind::Text,
         hint: "Processing wait timeout in seconds",
@@ -2085,6 +2121,43 @@ impl ConfigEditor {
             }
         }
 
+        let (_, _, telemetry_enabled_invalid) =
+            bool_value(get_path_value(&self.common, "telemetry.enabled"), true);
+        if telemetry_enabled_invalid {
+            errors.push("common: telemetry.enabled 必须是布尔值".to_string());
+        }
+        let (_, _, telemetry_upload_enabled_invalid) = bool_value(
+            get_path_value(&self.common, "telemetry.upload_enabled"),
+            true,
+        );
+        if telemetry_upload_enabled_invalid {
+            errors.push("common: telemetry.upload_enabled 必须是布尔值".to_string());
+        }
+        if let Some(value) = get_path_value(&self.common, "telemetry.local_dir") {
+            if !matches!(value, Value::String(_) | Value::Null) {
+                errors.push("common: telemetry.local_dir 必须是字符串".to_string());
+            }
+        }
+        for key in [
+            "telemetry.upload_interval_sec",
+            "telemetry.upload_batch_size",
+            "telemetry.max_append_messages",
+        ] {
+            if let Some(value) = get_path_value(&self.common, key) {
+                if matches!(value, Value::Null) {
+                    continue;
+                }
+                let valid = match value {
+                    Value::Number(n) => n.as_u64().is_some(),
+                    Value::String(s) => is_numeric(s.trim()),
+                    _ => false,
+                };
+                if !valid {
+                    errors.push(format!("common: {key} 必须是非负整数"));
+                }
+            }
+        }
+
         (errors, warnings)
     }
 
@@ -2584,6 +2657,10 @@ fn normalize_tui_common(common_obj: &mut Map<String, Value>) -> bool {
         }
     }
 
+    if normalize_tui_telemetry(common_obj) {
+        changed = true;
+    }
+
     for key in [
         "manage_napcat_internal",
         "renewcookies_use_napcat",
@@ -2597,6 +2674,26 @@ fn normalize_tui_common(common_obj: &mut Map<String, Value>) -> bool {
         }
     }
 
+    changed
+}
+
+fn normalize_tui_telemetry(common_obj: &mut Map<String, Value>) -> bool {
+    let Some(telemetry_obj) = common_obj
+        .get_mut("telemetry")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return false;
+    };
+    let mut changed = false;
+    for key in ["upload_endpoint", "upload_token"] {
+        if telemetry_obj.remove(key).is_some() {
+            changed = true;
+        }
+    }
+    if telemetry_obj.is_empty() {
+        common_obj.remove("telemetry");
+        changed = true;
+    }
     changed
 }
 
@@ -2835,6 +2932,12 @@ fn field_summary_text(spec: FieldSpec) -> &'static str {
         "webview.host" => "WebView 监听地址",
         "webview.port" => "WebView 监听端口",
         "webview.session_ttl_sec" => "WebView 会话有效期",
+        "telemetry.enabled" => "启用投稿遥测",
+        "telemetry.local_dir" => "遥测本地目录",
+        "telemetry.upload_enabled" => "启用遥测上传",
+        "telemetry.upload_interval_sec" => "遥测上传间隔（秒）",
+        "telemetry.upload_batch_size" => "遥测批量大小",
+        "telemetry.max_append_messages" => "负样本追加消息上限",
         "webview_global_admins" => "全局 WebView 管理员",
         "webview_admins" => "本组 WebView 管理员",
         "http-serv-port" => "旧版 HTTP 端口（兼容）",
@@ -2874,6 +2977,12 @@ fn field_detail_text(spec: FieldSpec) -> String {
         "webview.host" => "WebView 绑定地址。127.0.0.1 仅本机可访问，0.0.0.0 允许局域网/外网访问（需自行做好安全控制）。".to_string(),
         "webview.port" => "WebView 监听端口，默认 10924。避免与其他服务冲突。".to_string(),
         "webview.session_ttl_sec" => "登录会话有效期（秒）。太短会频繁掉线，太长会增加会话泄露风险。".to_string(),
+        "telemetry.enabled" => "是否记录投稿遥测并在审核完成后生成训练样本。默认开启。".to_string(),
+        "telemetry.local_dir" => "遥测本地目录，相对 OQQWALL_DATA_DIR 解析；默认 data/telemetry。".to_string(),
+        "telemetry.upload_enabled" => "是否启用批量上传。默认开启；上传目标和鉴权为内置固定值，不在配置中暴露。".to_string(),
+        "telemetry.upload_interval_sec" => "上传轮询间隔（秒），范围 1..86400，默认 30。".to_string(),
+        "telemetry.upload_batch_size" => "每批上传样本数。当前实现固定钳制为 20，修改其他值不会生效。".to_string(),
+        "telemetry.max_append_messages" => "append_offtopic 负样本最多追加的后续消息数，范围 1..10，默认 2。".to_string(),
         "webview_global_admins" => "全局管理员可访问所有组。支持编辑 username/password/role，role 建议为 global_admin。".to_string(),
         "webview_admins" => "组管理员仅可操作当前组。支持编辑 username/password/role，role 建议为 group_admin。".to_string(),
         "accounts" => "账号列表，首项为主账号。系统会按顺序选可用账号发送。".to_string(),
@@ -3090,4 +3199,40 @@ fn truncate_to_width(text: &str, max_width: usize) -> String {
     }
     out.push_str("...");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn normalize_tui_common_removes_telemetry_endpoint_and_token() {
+        let mut common = serde_json::from_value::<Map<String, Value>>(json!({
+            "telemetry": {
+                "upload_enabled": true,
+                "upload_endpoint": "http://127.0.0.1:10925/telemetry/v1/submission/batch",
+                "upload_token": "custom-token"
+            }
+        }))
+        .expect("common");
+        assert!(normalize_tui_common(&mut common));
+        assert_eq!(get_path_value(&common, "telemetry.upload_endpoint"), None);
+        assert_eq!(get_path_value(&common, "telemetry.upload_token"), None);
+        assert_eq!(
+            get_path_value(&common, "telemetry.upload_enabled").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn common_fields_include_telemetry_entries() {
+        let keys: Vec<&str> = COMMON_FIELDS.iter().map(|spec| spec.key).collect();
+        assert!(keys.contains(&"telemetry.enabled"));
+        assert!(keys.contains(&"telemetry.local_dir"));
+        assert!(keys.contains(&"telemetry.upload_enabled"));
+        assert!(keys.contains(&"telemetry.upload_interval_sec"));
+        assert!(keys.contains(&"telemetry.upload_batch_size"));
+        assert!(keys.contains(&"telemetry.max_append_messages"));
+    }
 }
