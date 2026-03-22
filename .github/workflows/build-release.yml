@@ -52,7 +52,9 @@ jobs:
             -v "$HOME/.cargo/registry:/root/.cargo/registry" \
             -v "$HOME/.cargo/git:/root/.cargo/git" \
             rust-glibc231:20.04-oqqwall \
-            bash -lc '
+            bash -c '
+              export PATH="/usr/local/cargo/bin:$PATH"
+              cargo --version
               bash ./scripts/package_split_release.sh
             '
 
