@@ -1,4 +1,4 @@
-FROM rust-glibc231:20.04
+FROM rust:1.94.0-bullseye
 
 ENV DEBIAN_FRONTEND=noninteractive
 
