@@ -1,5 +1,5 @@
-[submodule "deps/deps/skia"]
-	path = deps/deps/skia
+[submodule "deps/skia"]
+	path = deps/skia
 	url = https://skia.googlesource.com/skia.git
 [submodule "OQQWall_rust.wiki"]
 	path = OQQWall_rust.wiki
