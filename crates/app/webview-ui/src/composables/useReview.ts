@@ -1,7 +1,7 @@
-import { ref, computed } from 'vue'
-import { api } from '../api/client'
-import { STAGE_LABELS, type PostItem, type PostDetail, type Stage } from '../api/types'
+import { computed, ref } from 'vue'
 import { useMessage } from 'naive-ui'
+import { api } from '../api/client'
+import { STAGE_LABELS, type PostDetail, type PostItem, type Stage } from '../api/types'
 
 export function useReview() {
   const message = useMessage()
@@ -12,13 +12,12 @@ export function useReview() {
   const stage = ref<Stage>('review_pending')
   const keyword = ref('')
   const posts = ref<PostItem[]>([])
-  
-  // Selection
+
   const selectedReviewIds = ref<string[]>([])
 
-  // Detail
   const detail = ref<PostDetail | null>(null)
   const detailOpen = ref(false)
+  const currentDetailId = ref<string | null>(null)
 
   const pendingCount = computed(() => posts.value.filter((item) => item.stage === 'review_pending').length)
 
@@ -35,6 +34,7 @@ export function useReview() {
         String(post.external_code ?? ''),
         STAGE_LABELS[post.stage] ?? post.stage,
         post.last_error ?? '',
+        post.preview_text ?? '',
       ]
       return fields.join(' ').toLowerCase().includes(q)
     })
@@ -54,7 +54,6 @@ export function useReview() {
     try {
       const result = await api<{ items: PostItem[] }>('/api/posts?stage=' + stage.value + '&limit=200')
       posts.value = result.items
-      // Filter out stale selections
       const reviewSet = new Set(result.items.map((item) => item.review_id).filter(Boolean) as string[])
       selectedReviewIds.value = selectedReviewIds.value.filter((id) => reviewSet.has(id))
     } catch (err) {
@@ -65,12 +64,25 @@ export function useReview() {
   }
 
   async function openDetail(postId: string) {
+    currentDetailId.value = postId
     detailOpen.value = true
     detailLoading.value = true
     try {
       detail.value = await api<PostDetail>('/api/posts/' + postId)
     } catch (err) {
       detail.value = null
+      message.error((err as Error).message)
+    } finally {
+      detailLoading.value = false
+    }
+  }
+
+  async function refreshDetail() {
+    if (!currentDetailId.value) return
+    detailLoading.value = true
+    try {
+      detail.value = await api<PostDetail>('/api/posts/' + currentDetailId.value)
+    } catch (err) {
       message.error((err as Error).message)
     } finally {
       detailLoading.value = false
@@ -111,6 +123,7 @@ export function useReview() {
     allSelected,
     loadPosts,
     openDetail,
+    refreshDetail,
     toggleSelectAll,
     toggleOneSelection,
   }
