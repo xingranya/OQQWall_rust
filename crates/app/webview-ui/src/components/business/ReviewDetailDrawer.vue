@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import {
+  NAlert,
   NButton,
   NDescriptions,
   NDescriptionsItem,
@@ -13,6 +14,7 @@ import {
   NImage,
   NInput,
   NInputNumber,
+  NModal,
   NSelect,
   NSpin,
   NTag,
@@ -25,11 +27,15 @@ const props = defineProps<{
   show: boolean
   loading: boolean
   detail: PostDetail | null
+  hasPrev?: boolean
+  hasNext?: boolean
 }>()
 
 const emit = defineEmits<{
   (e: 'update:show', v: boolean): void
   (e: 'refresh'): void
+  (e: 'prev'): void
+  (e: 'next'): void
 }>()
 
 const message = useMessage()
@@ -45,6 +51,11 @@ const actionForm = reactive({
   target_review_code: null as number | null,
 })
 
+const confirmState = reactive({
+  show: false,
+  action: 'approve',
+})
+
 const actionOptions = ACTIONS.map((k) => ({ label: ACTION_LABELS[k], value: k }))
 
 const updateWidth = () => {
@@ -55,7 +66,7 @@ onMounted(() => window.addEventListener('resize', updateWidth))
 onUnmounted(() => window.removeEventListener('resize', updateWidth))
 
 const isMobile = computed(() => windowWidth.value < 640)
-const drawerWidth = computed(() => (isMobile.value ? '100%' : 760))
+const drawerWidth = computed(() => (isMobile.value ? '100%' : 780))
 
 const visible = computed({
   get: () => props.show,
@@ -71,6 +82,7 @@ watch(
     actionForm.delay_ms = 180000
     actionForm.quick_reply_key = ''
     actionForm.target_review_code = null
+    confirmState.show = false
   },
 )
 
@@ -80,6 +92,15 @@ function formatTime(ms: number) {
 
 function renderImageUrl(blockRef: { reference_type: 'blob_id' | 'remote_url'; reference: string }) {
   return blockRef.reference_type === 'blob_id' ? '/api/blobs/' + blockRef.reference : blockRef.reference
+}
+
+async function copyText(value: string, label: string) {
+  try {
+    await navigator.clipboard.writeText(value)
+    message.success(`${label}已复制`)
+  } catch {
+    message.error(`复制${label}失败`)
+  }
 }
 
 const actionHelp = computed(() => {
@@ -164,17 +185,24 @@ function buildPayload(action: string) {
   return payload
 }
 
-async function handleExecute(actionOverride?: string) {
+function requestExecute(actionOverride?: string) {
+  if (!props.detail?.review_id) {
+    message.error('当前稿件无法操作（无 review_id）')
+    return
+  }
+  confirmState.action = actionOverride ?? actionForm.action
+  confirmState.show = true
+}
+
+async function confirmExecute() {
   if (!props.detail?.review_id) {
     message.error('当前稿件无法操作（无 review_id）')
     return
   }
 
-  const action = actionOverride ?? actionForm.action
-
   let payload: Record<string, unknown>
   try {
-    payload = buildPayload(action)
+    payload = buildPayload(confirmState.action)
   } catch (error) {
     message.error((error as Error).message)
     return
@@ -186,9 +214,10 @@ async function handleExecute(actionOverride?: string) {
       method: 'POST',
       body: JSON.stringify(payload),
     })
-    message.success(`执行成功: ${ACTION_LABELS[action]}`)
+    message.success(`执行成功: ${ACTION_LABELS[confirmState.action]}`)
+    confirmState.show = false
     emit('refresh')
-    if (['approve', 'reject', 'delete', 'immediate'].includes(action)) {
+    if (['approve', 'reject', 'delete', 'immediate'].includes(confirmState.action)) {
       emit('update:show', false)
     }
   } catch (e) {
@@ -219,18 +248,30 @@ async function handleExecute(actionOverride?: string) {
           </div>
         </section>
 
+        <section class="utility-bar">
+          <div class="utility-group">
+            <n-button size="small" :disabled="!props.hasPrev" @click="emit('prev')">上一条</n-button>
+            <n-button size="small" :disabled="!props.hasNext" @click="emit('next')">下一条</n-button>
+            <n-button size="small" @click="emit('refresh')">刷新详情</n-button>
+          </div>
+          <div class="utility-group">
+            <n-button size="small" @click="copyText(detail.post_id, '稿件 ID')">复制稿件 ID</n-button>
+            <n-button size="small" @click="copyText(detail.session_id, '会话 ID')">复制会话 ID</n-button>
+          </div>
+        </section>
+
         <section class="action-panel">
           <div class="action-panel-head">
             <div>
               <span class="panel-kicker">审核操作</span>
-              <h3>常用操作可直接执行，其他操作按需填写参数。</h3>
+              <h3>常用操作可直接发起，提交前会再次确认。</h3>
             </div>
             <div class="quick-actions">
-              <n-button type="primary" @click="handleExecute('approve')" :loading="submitting">通过</n-button>
-              <n-button type="warning" ghost @click="handleExecute('reject')" :loading="submitting">拒绝</n-button>
-              <n-button type="error" ghost @click="handleExecute('delete')" :loading="submitting">删除</n-button>
-              <n-button ghost @click="handleExecute('immediate')" :loading="submitting">立即发送</n-button>
-              <n-button ghost @click="handleExecute('rerender')" :loading="submitting">重渲染</n-button>
+              <n-button type="primary" @click="requestExecute('approve')" :loading="submitting">通过</n-button>
+              <n-button type="warning" ghost @click="requestExecute('reject')" :loading="submitting">拒绝</n-button>
+              <n-button type="error" ghost @click="requestExecute('delete')" :loading="submitting">删除</n-button>
+              <n-button ghost @click="requestExecute('immediate')" :loading="submitting">立即发送</n-button>
+              <n-button ghost @click="requestExecute('rerender')" :loading="submitting">重渲染</n-button>
             </div>
           </div>
 
@@ -247,7 +288,7 @@ async function handleExecute(actionOverride?: string) {
                 v-model:value="actionForm.comment"
                 type="textarea"
                 :autosize="{ minRows: 3, maxRows: 5 }"
-                placeholder="请输入拒绝原因或拉黑说明"
+                placeholder="请输入处理说明"
               />
             </n-form-item>
 
@@ -275,7 +316,7 @@ async function handleExecute(actionOverride?: string) {
               <n-input-number v-model:value="actionForm.target_review_code" :min="1" style="width: 100%" />
             </n-form-item>
 
-            <n-button type="primary" block :loading="submitting" @click="handleExecute()">
+            <n-button type="primary" block :loading="submitting" @click="requestExecute()">
               执行当前动作
             </n-button>
           </n-form>
@@ -339,6 +380,21 @@ async function handleExecute(actionOverride?: string) {
       <n-empty v-else description="暂无数据" />
     </n-drawer-content>
   </n-drawer>
+
+  <n-modal v-model:show="confirmState.show" preset="card" class="confirm-modal" :mask-closable="false">
+    <div class="confirm-head">
+      <span class="confirm-kicker">确认操作</span>
+      <h3>{{ ACTION_LABELS[confirmState.action] }} #{{ props.detail?.review_code ?? props.detail?.external_code ?? '-' }}</h3>
+    </div>
+    <p class="confirm-meta">确认后会立即提交到后端处理。</p>
+    <n-alert type="warning" :bordered="false">
+      请确认当前稿件和操作类型无误。
+    </n-alert>
+    <div class="confirm-actions">
+      <n-button @click="confirmState.show = false">取消</n-button>
+      <n-button type="primary" :loading="submitting" @click="confirmExecute">确认执行</n-button>
+    </div>
+  </n-modal>
 </template>
 
 <style scoped>
@@ -356,6 +412,7 @@ async function handleExecute(actionOverride?: string) {
 }
 
 .detail-hero,
+.utility-bar,
 .action-panel,
 .info-panel,
 .section {
@@ -369,30 +426,34 @@ async function handleExecute(actionOverride?: string) {
   justify-content: space-between;
   gap: 18px;
   padding: 24px;
-  background: linear-gradient(135deg, #1f8f6a, #274f5a 70%, #1e2328);
-  color: #fff7ea;
+  background: linear-gradient(135deg, rgba(31, 143, 106, 0.16), rgba(53, 94, 123, 0.12));
+  border: 1px solid rgba(31, 143, 106, 0.12);
+  color: #261d17;
 }
 
 .detail-kicker,
 .panel-kicker,
-.section-kicker {
+.section-kicker,
+.confirm-kicker {
   display: inline-block;
   margin-bottom: 10px;
   font-size: 11px;
   letter-spacing: 0.14em;
   text-transform: uppercase;
+  color: rgba(38, 29, 23, 0.46);
 }
 
 .detail-hero h2 {
   margin: 0;
   font-family: Georgia, "Times New Roman", serif;
-  font-size: clamp(34px, 6vw, 52px);
+  font-size: clamp(34px, 6vw, 50px);
   line-height: 1;
+  color: #261d17;
 }
 
 .detail-hero p {
   margin: 10px 0 0;
-  color: rgba(255, 247, 234, 0.76);
+  color: rgba(38, 29, 23, 0.72);
 }
 
 .hero-tags {
@@ -402,10 +463,27 @@ async function handleExecute(actionOverride?: string) {
   justify-content: flex-end;
 }
 
+.utility-bar {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  background: rgba(255, 250, 242, 0.92);
+  border: 1px solid rgba(75, 62, 53, 0.1);
+  box-shadow: var(--app-shadow-soft);
+}
+
+.utility-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .action-panel {
   padding: 22px;
-  background: rgba(255, 248, 238, 0.96);
-  box-shadow: 0 20px 36px rgba(17, 14, 12, 0.1);
+  background: rgba(255, 250, 242, 0.96);
+  border: 1px solid rgba(75, 62, 53, 0.1);
+  box-shadow: var(--app-shadow-soft);
 }
 
 .action-panel-head {
@@ -418,7 +496,7 @@ async function handleExecute(actionOverride?: string) {
 .action-panel-head h3 {
   margin: 0;
   font-size: 22px;
-  line-height: 1.25;
+  line-height: 1.3;
   color: #261d17;
 }
 
@@ -442,14 +520,16 @@ async function handleExecute(actionOverride?: string) {
 }
 
 .info-panel {
-  background: rgba(255, 248, 238, 0.92);
-  box-shadow: 0 18px 32px rgba(17, 14, 12, 0.08);
+  background: rgba(255, 250, 242, 0.94);
+  border: 1px solid rgba(75, 62, 53, 0.1);
+  box-shadow: var(--app-shadow-soft);
 }
 
 .section {
   padding: 22px;
-  background: rgba(255, 248, 238, 0.92);
-  box-shadow: 0 18px 32px rgba(17, 14, 12, 0.08);
+  background: rgba(255, 250, 242, 0.94);
+  border: 1px solid rgba(75, 62, 53, 0.1);
+  box-shadow: var(--app-shadow-soft);
 }
 
 .section-head {
@@ -475,7 +555,7 @@ async function handleExecute(actionOverride?: string) {
 }
 
 .block-item {
-  background: rgba(28, 26, 24, 0.04);
+  background: rgba(28, 26, 24, 0.03);
   border: 1px solid rgba(28, 26, 24, 0.08);
   padding: 14px;
   border-radius: 18px;
@@ -517,9 +597,32 @@ async function handleExecute(actionOverride?: string) {
   font-family: "Fira Code", "Cascadia Code", monospace;
 }
 
+.confirm-modal {
+  max-width: 520px;
+}
+
+.confirm-head h3 {
+  margin: 8px 0 6px;
+  color: #261d17;
+}
+
+.confirm-meta {
+  margin: 0 0 14px;
+  color: rgba(38, 29, 23, 0.62);
+  line-height: 1.7;
+}
+
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 16px;
+}
+
 @media (max-width: 760px) {
   .detail-hero,
-  .action-panel-head {
+  .action-panel-head,
+  .utility-bar {
     flex-direction: column;
   }
 

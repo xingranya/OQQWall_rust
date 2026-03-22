@@ -149,9 +149,9 @@ onMounted(() => {
   gap: 16px;
   padding: 24px;
   border-radius: 28px;
-  background: linear-gradient(180deg, rgba(255, 250, 242, 0.08), rgba(255, 250, 242, 0.04));
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  backdrop-filter: blur(14px);
+  background: rgba(255, 250, 242, 0.88);
+  border: 1px solid var(--app-border-strong);
+  box-shadow: var(--app-shadow-soft);
 }
 
 .hero-kicker,
@@ -161,7 +161,7 @@ onMounted(() => {
   font-size: 11px;
   letter-spacing: 0.14em;
   text-transform: uppercase;
-  color: rgba(246, 236, 218, 0.6);
+  color: rgba(38, 29, 23, 0.46);
 }
 
 .stats-hero h1 {
@@ -170,13 +170,13 @@ onMounted(() => {
   font-family: Georgia, "Times New Roman", serif;
   font-size: clamp(28px, 3.4vw, 42px);
   line-height: 1.1;
-  color: #fff6e9;
+  color: #261d17;
 }
 
 .stats-hero p {
   max-width: 38rem;
   margin: 14px 0 0;
-  color: rgba(246, 236, 218, 0.72);
+  color: rgba(38, 29, 23, 0.62);
   line-height: 1.7;
 }
 
@@ -188,9 +188,9 @@ onMounted(() => {
 }
 
 .refresh-btn {
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  background: rgba(255, 250, 242, 0.08);
-  color: #fff3e1;
+  border: 1px solid rgba(75, 62, 53, 0.12);
+  background: rgba(255, 250, 242, 0.88);
+  color: #261d17;
   padding: 8px 14px;
   border-radius: 999px;
   cursor: pointer;
@@ -201,8 +201,8 @@ onMounted(() => {
   display: flex;
   justify-content: center;
   border-radius: 28px;
-  background: rgba(255, 250, 242, 0.06);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 250, 242, 0.88);
+  border: 1px solid var(--app-border-strong);
 }
 
 .dashboard {
@@ -214,14 +214,14 @@ onMounted(() => {
 .stat-card {
   height: 100%;
   border-radius: 24px;
-  background: rgba(255, 248, 238, 0.94);
-  box-shadow: 0 18px 34px rgba(12, 10, 8, 0.12);
+  background: rgba(255, 250, 242, 0.96);
+  box-shadow: var(--app-shadow-soft);
   transition: transform 0.18s ease, box-shadow 0.18s ease;
 }
 
 .stat-card:hover {
   transform: translateY(-3px);
-  box-shadow: 0 24px 40px rgba(12, 10, 8, 0.16);
+  box-shadow: 0 20px 34px rgba(22, 16, 11, 0.14);
 }
 
 .stat-label {
@@ -242,8 +242,9 @@ onMounted(() => {
 .distribution-panel {
   padding: 24px;
   border-radius: 28px;
-  background: rgba(255, 248, 238, 0.94);
-  box-shadow: 0 18px 34px rgba(12, 10, 8, 0.12);
+  background: rgba(255, 250, 242, 0.96);
+  border: 1px solid var(--app-border-strong);
+  box-shadow: var(--app-shadow-soft);
 }
 
 .panel-head {

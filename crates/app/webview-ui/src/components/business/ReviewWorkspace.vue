@@ -1,12 +1,15 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
+  NAlert,
   NButton,
   NButtonGroup,
   NCard,
+  NCheckbox,
   NEmpty,
   NImage,
   NInput,
+  NModal,
   NPopconfirm,
   NSelect,
   NSpace,
@@ -16,7 +19,7 @@ import {
   useMessage,
 } from 'naive-ui'
 import { api } from '../../api/client'
-import { ACTION_LABELS, ACTIONS, STAGE_LABELS } from '../../api/types'
+import { ACTION_LABELS, ACTIONS, STAGE_LABELS, type PostItem } from '../../api/types'
 import { useReview } from '../../composables/useReview'
 import ReviewDetailDrawer from './ReviewDetailDrawer.vue'
 
@@ -36,6 +39,20 @@ const batchLoading = ref(false)
 const groupFilter = ref('all')
 const sortMode = ref('newest')
 const autoRefresh = ref(true)
+const onlyError = ref(false)
+const onlyActionable = ref(false)
+const lastUpdatedAt = ref<number | null>(null)
+
+const confirmState = reactive({
+  show: false,
+  reviewId: '',
+  action: 'approve',
+  postLabel: '',
+  groupId: '',
+  senderId: '',
+  comment: '',
+})
+
 let refreshTimer: number | null = null
 
 function formatTime(ms: number) {
@@ -46,6 +63,11 @@ function formatTime(ms: number) {
     minute: '2-digit',
   })
 }
+
+const formattedUpdatedAt = computed(() => {
+  if (!lastUpdatedAt.value) return '尚未刷新'
+  return formatTime(lastUpdatedAt.value)
+})
 
 const groupOptions = computed(() => {
   const groups = [...new Set(review.posts.value.map((post) => post.group_id))].sort()
@@ -59,6 +81,12 @@ const visiblePosts = computed(() => {
   let items = [...review.filteredPosts.value]
   if (groupFilter.value !== 'all') {
     items = items.filter((post) => post.group_id === groupFilter.value)
+  }
+  if (onlyError.value) {
+    items = items.filter((post) => !!post.last_error)
+  }
+  if (onlyActionable.value) {
+    items = items.filter((post) => !!post.review_id)
   }
   switch (sortMode.value) {
     case 'oldest':
@@ -86,6 +114,12 @@ const summaryCards = computed(() => {
   ]
 })
 
+const detailIndex = computed(() => {
+  const currentPostId = review.detail.value?.post_id
+  if (!currentPostId) return -1
+  return visiblePosts.value.findIndex((post) => post.post_id === currentPostId)
+})
+
 function resetAutoRefresh() {
   if (refreshTimer !== null) {
     window.clearInterval(refreshTimer)
@@ -93,32 +127,57 @@ function resetAutoRefresh() {
   }
   if (autoRefresh.value) {
     refreshTimer = window.setInterval(() => {
-      review.loadPosts()
+      loadAll()
     }, 30000)
   }
 }
 
 watch(autoRefresh, resetAutoRefresh)
 
-async function handleQuickAction(reviewId: string, action: string) {
+async function loadAll() {
+  await review.loadPosts()
+  lastUpdatedAt.value = Date.now()
+}
+
+function handleResetFilters() {
+  review.stage.value = 'review_pending'
+  review.keyword.value = ''
+  groupFilter.value = 'all'
+  sortMode.value = 'newest'
+  onlyError.value = false
+  onlyActionable.value = false
+}
+
+function requestQuickAction(post: PostItem, action: string) {
+  if (!post.review_id) {
+    message.warning('当前稿件不可操作')
+    return
+  }
+  confirmState.show = true
+  confirmState.reviewId = post.review_id
+  confirmState.action = action
+  confirmState.postLabel = `#${post.internal_code ?? post.external_code ?? '-'}`
+  confirmState.groupId = post.group_id
+  confirmState.senderId = post.sender_id ?? '未知投稿人'
+  confirmState.comment = ''
+}
+
+async function confirmQuickAction() {
+  const payload: Record<string, unknown> = { action: confirmState.action }
+  if (confirmState.action === 'reject' && confirmState.comment.trim()) {
+    payload.comment = confirmState.comment.trim()
+  }
+
   review.actionLoading.value = true
   try {
-    const payload: Record<string, unknown> = { action }
-    if (action === 'comment' || action === 'reject') {
-      const text = prompt('请输入处理说明')
-      if (text === null) {
-        review.actionLoading.value = false
-        return
-      }
-      payload.comment = text
-    }
-
-    await api(`/api/reviews/${reviewId}/decision`, {
+    await api(`/api/reviews/${confirmState.reviewId}/decision`, {
       method: 'POST',
       body: JSON.stringify(payload),
     })
-    message.success(`执行成功: ${ACTION_LABELS[action]}`)
-    await review.loadPosts()
+    message.success(`执行成功: ${ACTION_LABELS[confirmState.action]}`)
+    confirmState.show = false
+    await loadAll()
+    await review.refreshDetail()
   } catch (e) {
     message.error((e as Error).message)
   } finally {
@@ -139,7 +198,7 @@ async function handleBatchAction() {
     })
     message.success('批量操作完成')
     review.selectedReviewIds.value = []
-    await review.loadPosts()
+    await loadAll()
     await review.refreshDetail()
   } catch (e) {
     message.error((e as Error).message)
@@ -149,12 +208,18 @@ async function handleBatchAction() {
 }
 
 async function handleDrawerRefresh() {
-  await review.loadPosts()
+  await loadAll()
   await review.refreshDetail()
 }
 
-onMounted(() => {
-  review.loadPosts()
+async function openAdjacentDetail(offset: number) {
+  const nextIndex = detailIndex.value + offset
+  if (nextIndex < 0 || nextIndex >= visiblePosts.value.length) return
+  await review.openDetail(visiblePosts.value[nextIndex].post_id)
+}
+
+onMounted(async () => {
+  await loadAll()
   resetAutoRefresh()
 })
 
@@ -189,7 +254,7 @@ onBeforeUnmount(() => {
             v-model:value="review.stage.value"
             :options="stageOptions"
             class="stage-select"
-            @update:value="review.loadPosts"
+            @update:value="loadAll"
           />
           <n-select v-model:value="groupFilter" :options="groupOptions" class="group-select" />
           <n-select v-model:value="sortMode" :options="sortOptions" class="sort-select" />
@@ -210,15 +275,23 @@ onBeforeUnmount(() => {
             <n-tag :bordered="false" type="success" round v-if="review.selectedReviewIds.value.length > 0">
               已选 {{ review.selectedReviewIds.value.length }}
             </n-tag>
+            <n-tag :bordered="false" round>上次刷新 {{ formattedUpdatedAt }}</n-tag>
           </div>
 
-          <div class="toolbar-switch">
-            <span>自动刷新</span>
-            <n-switch v-model:value="autoRefresh" />
+          <div class="toolbar-flags">
+            <n-checkbox v-model:checked="onlyActionable">仅看可操作</n-checkbox>
+            <n-checkbox v-model:checked="onlyError">仅看异常</n-checkbox>
+            <div class="toolbar-switch">
+              <span>自动刷新</span>
+              <n-switch v-model:value="autoRefresh" />
+            </div>
           </div>
 
-          <n-button size="small" @click="review.loadPosts" :loading="review.loading.value">刷新</n-button>
-          <n-button size="small" @click="review.toggleSelectAll">{{ review.allSelected.value ? '取消' : '全选' }}</n-button>
+          <div class="toolbar-buttons">
+            <n-button size="small" @click="handleResetFilters">重置筛选</n-button>
+            <n-button size="small" @click="loadAll" :loading="review.loading.value">刷新</n-button>
+            <n-button size="small" @click="review.toggleSelectAll">{{ review.allSelected.value ? '取消全选' : '全选' }}</n-button>
+          </div>
         </div>
       </div>
 
@@ -294,9 +367,9 @@ onBeforeUnmount(() => {
               <n-space justify="space-between" align="center" size="small" v-if="post.review_id">
                 <span class="action-tip">点击卡片查看详情</span>
                 <n-button-group size="tiny">
-                  <n-button type="primary" ghost @click.stop="handleQuickAction(post.review_id, 'approve')">通过</n-button>
-                  <n-button type="warning" ghost @click.stop="handleQuickAction(post.review_id, 'reject')">拒绝</n-button>
-                  <n-button type="error" ghost @click.stop="handleQuickAction(post.review_id, 'delete')">删除</n-button>
+                  <n-button type="primary" ghost @click.stop="requestQuickAction(post, 'approve')">通过</n-button>
+                  <n-button type="warning" ghost @click.stop="requestQuickAction(post, 'reject')">拒绝</n-button>
+                  <n-button type="error" ghost @click.stop="requestQuickAction(post, 'delete')">删除</n-button>
                 </n-button-group>
               </n-space>
               <div v-else class="no-action">当前阶段暂无可执行动作</div>
@@ -310,8 +383,35 @@ onBeforeUnmount(() => {
       v-model:show="review.detailOpen.value"
       :detail="review.detail.value"
       :loading="review.detailLoading.value"
+      :has-prev="detailIndex > 0"
+      :has-next="detailIndex >= 0 && detailIndex < visiblePosts.length - 1"
       @refresh="handleDrawerRefresh"
+      @prev="openAdjacentDetail(-1)"
+      @next="openAdjacentDetail(1)"
     />
+
+    <n-modal v-model:show="confirmState.show" preset="card" class="confirm-modal" :mask-closable="false">
+      <div class="confirm-head">
+        <span class="confirm-kicker">确认操作</span>
+        <h3>{{ ACTION_LABELS[confirmState.action] }} {{ confirmState.postLabel }}</h3>
+      </div>
+      <p class="confirm-meta">分组：{{ confirmState.groupId }} · 投稿人：{{ confirmState.senderId }}</p>
+      <n-input
+        v-if="confirmState.action === 'reject'"
+        v-model:value="confirmState.comment"
+        type="textarea"
+        :autosize="{ minRows: 3, maxRows: 5 }"
+        placeholder="可填写拒绝说明"
+        style="margin-bottom: 14px"
+      />
+      <n-alert type="warning" :bordered="false">
+        操作确认后会立即提交到后端处理。
+      </n-alert>
+      <div class="confirm-actions">
+        <n-button @click="confirmState.show = false">取消</n-button>
+        <n-button type="primary" :loading="review.actionLoading.value" @click="confirmQuickAction">确认执行</n-button>
+      </div>
+    </n-modal>
   </div>
 </template>
 
@@ -325,24 +425,24 @@ onBeforeUnmount(() => {
 
 .hero-panel {
   display: grid;
-  grid-template-columns: minmax(0, 1.25fr) minmax(280px, 420px);
+  grid-template-columns: minmax(0, 1.1fr) minmax(300px, 400px);
   gap: 18px;
   align-items: stretch;
 }
 
 .hero-copy,
 .hero-metrics {
-  border-radius: 28px;
+  border-radius: 26px;
   padding: 24px;
-  background: linear-gradient(180deg, rgba(255, 250, 242, 0.08), rgba(255, 250, 242, 0.04));
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  backdrop-filter: blur(14px);
+  background: rgba(255, 250, 242, 0.88);
+  border: 1px solid var(--app-border-strong);
+  box-shadow: var(--app-shadow-soft);
 }
 
 .hero-kicker {
   display: inline-block;
-  margin-bottom: 14px;
-  color: rgba(246, 236, 218, 0.62);
+  margin-bottom: 12px;
+  color: rgba(38, 29, 23, 0.46);
   letter-spacing: 0.14em;
   text-transform: uppercase;
   font-size: 11px;
@@ -352,16 +452,16 @@ onBeforeUnmount(() => {
   margin: 0;
   max-width: 12ch;
   font-family: Georgia, "Times New Roman", serif;
-  font-size: clamp(28px, 3.4vw, 42px);
-  line-height: 1.1;
-  color: #fff6e9;
+  font-size: clamp(28px, 3.2vw, 40px);
+  line-height: 1.12;
+  color: #261d17;
 }
 
 .hero-copy p {
   max-width: 42rem;
   margin: 14px 0 0;
-  color: rgba(246, 236, 218, 0.72);
-  line-height: 1.7;
+  color: rgba(38, 29, 23, 0.64);
+  line-height: 1.72;
 }
 
 .hero-metrics {
@@ -373,10 +473,10 @@ onBeforeUnmount(() => {
 
 .metric-card {
   padding: 16px 18px;
-  border-radius: 22px;
-  background: rgba(255, 250, 242, 0.06);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  min-height: 128px;
+  border-radius: 20px;
+  background: rgba(244, 237, 226, 0.8);
+  border: 1px solid rgba(75, 62, 53, 0.08);
+  min-height: 126px;
 }
 
 .metric-card span,
@@ -385,7 +485,7 @@ onBeforeUnmount(() => {
 }
 
 .metric-card span {
-  color: rgba(246, 236, 218, 0.66);
+  color: rgba(38, 29, 23, 0.58);
   font-size: 12px;
 }
 
@@ -394,30 +494,30 @@ onBeforeUnmount(() => {
   margin: 12px 0 8px;
   font-size: 30px;
   line-height: 1;
-  color: #fff5e5;
+  color: #261d17;
 }
 
 .metric-card small {
-  color: rgba(246, 236, 218, 0.52);
+  color: rgba(38, 29, 23, 0.54);
   line-height: 1.6;
 }
 
 .metric-card[data-tone="success"] {
-  box-shadow: inset 0 0 0 1px rgba(31, 143, 106, 0.18);
+  box-shadow: inset 0 0 0 1px rgba(31, 143, 106, 0.14);
 }
 
 .metric-card[data-tone="error"] {
-  box-shadow: inset 0 0 0 1px rgba(184, 77, 58, 0.18);
+  box-shadow: inset 0 0 0 1px rgba(184, 77, 58, 0.14);
 }
 
 .metric-card[data-tone="warning"] {
-  box-shadow: inset 0 0 0 1px rgba(200, 122, 42, 0.18);
+  box-shadow: inset 0 0 0 1px rgba(200, 122, 42, 0.14);
 }
 
 .toolbar-card {
   flex-shrink: 0;
-  border-radius: 28px;
-  background: rgba(255, 248, 238, 0.92);
+  border-radius: 26px;
+  background: rgba(255, 250, 242, 0.94);
   box-shadow: var(--app-shadow);
 }
 
@@ -434,11 +534,10 @@ onBeforeUnmount(() => {
 }
 
 .toolbar-actions {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 14px;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
 }
 
 .toolbar-tags {
@@ -447,12 +546,24 @@ onBeforeUnmount(() => {
   gap: 8px;
 }
 
+.toolbar-flags {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  color: rgba(38, 29, 23, 0.72);
+}
+
 .toolbar-switch {
   display: inline-flex;
   align-items: center;
   gap: 10px;
-  color: rgba(42, 33, 27, 0.72);
+  color: rgba(38, 29, 23, 0.72);
   font-size: 13px;
+}
+
+.toolbar-buttons {
+  display: flex;
+  gap: 8px;
 }
 
 .stage-select,
@@ -468,9 +579,9 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 12px;
   padding: 14px 16px;
-  border-radius: 20px;
-  background: linear-gradient(90deg, rgba(31, 143, 106, 0.1), rgba(53, 94, 123, 0.06));
-  border: 1px solid rgba(31, 143, 106, 0.14);
+  border-radius: 18px;
+  background: linear-gradient(90deg, rgba(31, 143, 106, 0.08), rgba(53, 94, 123, 0.04));
+  border: 1px solid rgba(31, 143, 106, 0.12);
   color: #2a211b;
   font-size: 13px;
 }
@@ -502,23 +613,23 @@ onBeforeUnmount(() => {
   padding: 60px;
   display: flex;
   justify-content: center;
-  border-radius: 28px;
-  background: rgba(255, 250, 242, 0.06);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 24px;
+  background: rgba(255, 250, 242, 0.88);
+  border: 1px solid var(--app-border-strong);
 }
 
 .post-card {
   height: 100%;
-  border-radius: 24px;
+  border-radius: 22px;
   overflow: hidden;
-  background: rgba(255, 248, 238, 0.94);
-  box-shadow: 0 18px 34px rgba(12, 10, 8, 0.12);
+  background: rgba(255, 250, 242, 0.96);
+  box-shadow: var(--app-shadow-soft);
   transition: transform 0.18s ease, box-shadow 0.18s ease;
 }
 
 .post-card:hover {
   transform: translateY(-3px);
-  box-shadow: 0 24px 40px rgba(12, 10, 8, 0.16);
+  box-shadow: 0 20px 34px rgba(22, 16, 11, 0.14);
 }
 
 .card-header {
@@ -557,11 +668,11 @@ onBeforeUnmount(() => {
 
 .preview-area {
   margin-bottom: 12px;
-  border-radius: 18px;
+  border-radius: 16px;
   overflow: hidden;
   background:
-    linear-gradient(160deg, rgba(28, 26, 24, 0.08), rgba(28, 26, 24, 0.02)),
-    linear-gradient(135deg, rgba(31, 143, 106, 0.08), rgba(200, 122, 42, 0.06));
+    linear-gradient(160deg, rgba(28, 26, 24, 0.05), rgba(28, 26, 24, 0.01)),
+    linear-gradient(135deg, rgba(31, 143, 106, 0.06), rgba(200, 122, 42, 0.05));
   border: 1px solid rgba(32, 24, 18, 0.06);
 }
 
@@ -630,8 +741,41 @@ onBeforeUnmount(() => {
   font-size: 12px;
 }
 
+.confirm-modal {
+  max-width: 520px;
+}
+
+.confirm-head h3 {
+  margin: 8px 0 6px;
+  color: #261d17;
+}
+
+.confirm-kicker {
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: rgba(38, 29, 23, 0.46);
+}
+
+.confirm-meta {
+  margin: 0 0 14px;
+  color: rgba(38, 29, 23, 0.62);
+  line-height: 1.7;
+}
+
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 16px;
+}
+
 @media (max-width: 1180px) {
   .hero-panel {
+    grid-template-columns: 1fr;
+  }
+
+  .toolbar-actions {
     grid-template-columns: 1fr;
   }
 
@@ -664,14 +808,11 @@ onBeforeUnmount(() => {
     grid-template-columns: 1fr;
   }
 
-  .toolbar-actions,
+  .toolbar-flags,
+  .toolbar-buttons,
   .batch-bar {
     flex-direction: column;
     align-items: stretch;
-  }
-
-  .toolbar-switch {
-    justify-content: space-between;
   }
 
   .grid-container {

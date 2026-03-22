@@ -207,14 +207,14 @@ function handleUserSelect(key: string) {
   font-family: Georgia, "Times New Roman", serif;
   font-size: 24px;
   letter-spacing: 0.08em;
-  color: #fff6e9;
+  color: var(--app-text-on-dark);
 }
 
 .brand-subtitle {
   font-size: 11px;
   letter-spacing: 0.2em;
   text-transform: uppercase;
-  color: var(--app-text-muted);
+  color: var(--app-text-on-dark-muted);
 }
 
 .scope-panel {
@@ -230,7 +230,7 @@ function handleUserSelect(key: string) {
   align-items: center;
   justify-content: space-between;
   margin-bottom: 10px;
-  color: var(--app-text-muted);
+  color: var(--app-text-on-dark-muted);
   font-size: 12px;
 }
 
@@ -238,14 +238,14 @@ function handleUserSelect(key: string) {
   display: block;
   font-size: 18px;
   font-weight: 700;
-  color: #fff6e9;
+  color: var(--app-text-on-dark);
 }
 
 .scope-panel p {
   margin: 10px 0 0;
   line-height: 1.6;
   font-size: 13px;
-  color: var(--app-text-muted);
+  color: var(--app-text-on-dark-muted);
 }
 
 .nav-menu {
@@ -263,11 +263,11 @@ function handleUserSelect(key: string) {
   background: rgba(255, 250, 242, 0.04);
   font-size: 12px;
   line-height: 1.7;
-  color: var(--app-text-muted);
+  color: var(--app-text-on-dark-muted);
 }
 
 .main-layout {
-  background: transparent;
+  background: linear-gradient(180deg, rgba(249, 246, 239, 0.92), rgba(243, 237, 227, 0.92));
 }
 
 .header {
@@ -287,7 +287,7 @@ function handleUserSelect(key: string) {
 
 .eyebrow {
   margin: 0;
-  color: rgba(246, 236, 218, 0.54);
+  color: rgba(38, 29, 23, 0.48);
   text-transform: uppercase;
   letter-spacing: 0.16em;
   font-size: 11px;
@@ -305,11 +305,11 @@ function handleUserSelect(key: string) {
   font-size: clamp(28px, 3vw, 40px);
   font-weight: 700;
   letter-spacing: 0.02em;
-  color: #fff6e9;
+  color: #261d17;
 }
 
 .header-text span {
-  color: var(--app-text-muted);
+  color: rgba(38, 29, 23, 0.58);
   font-size: 14px;
 }
 
@@ -323,8 +323,9 @@ function handleUserSelect(key: string) {
   min-width: 180px;
   padding: 12px 14px;
   border-radius: 18px;
-  background: rgba(255, 250, 242, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(255, 250, 242, 0.86);
+  border: 1px solid rgba(75, 62, 53, 0.1);
+  box-shadow: var(--app-shadow-soft);
 }
 
 .header-badge-label {
@@ -333,12 +334,12 @@ function handleUserSelect(key: string) {
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.12em;
-  color: rgba(246, 236, 218, 0.54);
+  color: rgba(38, 29, 23, 0.46);
 }
 
 .header-badge strong {
   font-size: 14px;
-  color: #fff6e9;
+  color: #261d17;
 }
 
 .user-profile {
@@ -348,14 +349,15 @@ function handleUserSelect(key: string) {
   cursor: pointer;
   padding: 10px 14px;
   border-radius: 18px;
-  background: rgba(255, 250, 242, 0.07);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 250, 242, 0.9);
+  border: 1px solid rgba(75, 62, 53, 0.1);
+  box-shadow: var(--app-shadow-soft);
   transition: transform 0.2s ease, background-color 0.2s ease;
 }
 
 .user-profile:hover {
   transform: translateY(-1px);
-  background-color: rgba(255, 250, 242, 0.1);
+  background-color: rgba(255, 250, 242, 0.98);
 }
 
 .user-copy {
@@ -367,17 +369,18 @@ function handleUserSelect(key: string) {
 .username {
   font-size: 14px;
   font-weight: 700;
-  color: #fff6e9;
+  color: #261d17;
 }
 
 .user-role {
   font-size: 12px;
-  color: rgba(246, 236, 218, 0.62);
+  color: rgba(38, 29, 23, 0.58);
 }
 
 .content-shell {
   min-height: calc(100vh - 104px);
   padding: 8px 26px 28px;
+  color: #261d17;
 }
 
 @media (max-width: 960px) {
