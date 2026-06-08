@@ -9,6 +9,8 @@ if [[ ! -d res ]]; then
   exit 1
 fi
 
+bash ./scripts/verify_webview_dist.sh
+
 cargo build -r -p OQQWall_RUST
 
 BIN_PATH="target/release/OQQWall_RUST"

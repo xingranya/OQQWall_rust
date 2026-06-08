@@ -30,7 +30,7 @@ jobs:
 
       - name: 校验 WebView 前端产物
         run: |
-          test -f crates/app/webview-ui/dist/index.html
+          bash ./scripts/verify_webview_dist.sh
 
       - name: 构建固定工具链镜像
         run: |

@@ -1167,7 +1167,13 @@ async fn webview_static(
 }
 
 fn serve_static_path(req_path: &str) -> axum::response::Response {
-    let asset = find_asset(&req_path).or_else(|| find_asset("/index.html"));
+    let asset = find_asset(req_path).or_else(|| {
+        if req_path.starts_with("/assets/") {
+            None
+        } else {
+            find_asset("/index.html")
+        }
+    });
     if let Some(asset) = asset {
         let mut headers = HeaderMap::new();
         headers.insert(
