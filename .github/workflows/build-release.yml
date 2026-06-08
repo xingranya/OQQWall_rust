@@ -18,13 +18,6 @@ jobs:
         with:
           submodules: recursive
 
-      - name: 安装 Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: npm
-          cache-dependency-path: crates/app/webview-ui/package-lock.json
-
       - name: 缓存 Cargo 依赖
         uses: actions/cache@v4
         with:
@@ -35,11 +28,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: 构建 WebView 前端
-        working-directory: crates/app/webview-ui
+      - name: 校验 WebView 前端产物
         run: |
-          npm ci
-          npm run build
+          test -f crates/app/webview-ui/dist/index.html
 
       - name: 构建固定工具链镜像
         run: |
