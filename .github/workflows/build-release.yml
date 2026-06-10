@@ -24,7 +24,6 @@ jobs:
       - name: 检出仓库
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.release_tag || github.ref }}
           submodules: recursive
 
       - name: 解析发布标签
@@ -44,6 +43,13 @@ jobs:
             exit 1
           fi
           echo "tag_name=$release_tag" >> "$GITHUB_OUTPUT"
+
+      - name: 切换到发布标签
+        if: ${{ steps.release.outputs.tag_name != '' }}
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ steps.release.outputs.tag_name }}
+          submodules: recursive
 
       - name: 安装 Bun
         uses: oven-sh/setup-bun@v2
