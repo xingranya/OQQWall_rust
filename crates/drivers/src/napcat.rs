@@ -4106,8 +4106,21 @@ async fn parse_inbound_event(
                         .await
                         {
                             Ok(png) => {
-                                send_private_image_with_text(out_tx, &user_id, &png, &confirm_text)
+                                if let Err(err) = send_private_image_with_text(
+                                    out_tx,
+                                    &user_id,
+                                    &png,
+                                    &confirm_text,
+                                )
+                                .await
+                                {
+                                    send_private_text(
+                                        out_tx,
+                                        &user_id,
+                                        &format!("消息记录预览发送失败：{}\n{}", err, confirm_text),
+                                    )
                                     .await;
+                                }
                             }
                             Err(err) => {
                                 send_private_text(
@@ -8368,7 +8381,8 @@ fn parse_private_command_parts(raw_trimmed: &str) -> Option<(&str, &str)> {
     let trimmed = raw_trimmed.trim();
     let body = trimmed
         .strip_prefix('#')
-        .or_else(|| trimmed.strip_prefix('＃'))?
+        .or_else(|| trimmed.strip_prefix('＃'))
+        .or_else(|| trimmed.strip_prefix('﹟'))?
         .trim_start();
     if body.is_empty() {
         return None;
@@ -9665,14 +9679,15 @@ async fn send_private_image_with_text(
     user_id: &str,
     bytes: &[u8],
     text: &str,
-) {
+) -> Result<(), String> {
+    let image_file = persist_submission_preview_png(bytes)?;
     send_private_segments(
         out_tx,
         user_id,
         vec![
             serde_json::json!({
                 "type": "image",
-                "data": { "file": format!("base64://{}", STANDARD.encode(bytes)) }
+                "data": { "file": image_file }
             }),
             serde_json::json!({
                 "type": "text",
@@ -9681,6 +9696,16 @@ async fn send_private_image_with_text(
         ],
     )
     .await;
+    Ok(())
+}
+
+fn persist_submission_preview_png(bytes: &[u8]) -> Result<String, String> {
+    let blob_id = derive_blob_id(&[bytes]);
+    let dir = blob_root().join("submission_preview");
+    fs::create_dir_all(&dir).map_err(|err| format!("创建预览图片目录失败: {}", err))?;
+    let path = dir.join(format!("{}.png", id128_hex(blob_id.0)));
+    fs::write(&path, bytes).map_err(|err| format!("写入预览图片失败: {}", err))?;
+    Ok(file_uri_from_path(&path))
 }
 
 async fn send_private_segments(out_tx: &mpsc::Sender<String>, user_id: &str, message: Vec<Value>) {
@@ -9893,6 +9918,73 @@ mod tests {
         parse_audit_command(text, has_reply, &test_runtime())
     }
 
+    async fn next_private_payload(out_rx: &mut mpsc::Receiver<String>) -> Value {
+        let payload = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
+            .await
+            .expect("private payload timeout")
+            .expect("private payload");
+        serde_json::from_str(&payload).expect("private payload json")
+    }
+
+    async fn assert_private_text_contains(out_rx: &mut mpsc::Receiver<String>, expected: &str) {
+        let payload = next_private_payload(out_rx).await;
+        assert_eq!(
+            payload.get("action").and_then(Value::as_str),
+            Some("send_private_msg")
+        );
+        let message = payload
+            .get("params")
+            .and_then(|params| params.get("message"))
+            .and_then(Value::as_array)
+            .expect("message array");
+        assert_eq!(message.len(), 1);
+        assert_eq!(message[0].get("type").and_then(Value::as_str), Some("text"));
+        let text = message[0]
+            .get("data")
+            .and_then(|data| data.get("text"))
+            .and_then(Value::as_str)
+            .expect("text");
+        assert!(text.contains(expected), "payload text: {}", text);
+    }
+
+    async fn assert_private_image_with_text_contains(
+        out_rx: &mut mpsc::Receiver<String>,
+        expected: &str,
+    ) {
+        let payload = next_private_payload(out_rx).await;
+        assert_eq!(
+            payload.get("action").and_then(Value::as_str),
+            Some("send_private_msg")
+        );
+        let message = payload
+            .get("params")
+            .and_then(|params| params.get("message"))
+            .and_then(Value::as_array)
+            .expect("message array");
+        assert_eq!(message.len(), 2);
+        assert_eq!(
+            message[0].get("type").and_then(Value::as_str),
+            Some("image")
+        );
+        let file = message[0]
+            .get("data")
+            .and_then(|data| data.get("file"))
+            .and_then(Value::as_str)
+            .expect("image file");
+        assert!(
+            file.starts_with("file://"),
+            "preview image should use file URI, got: {}",
+            file
+        );
+        assert_eq!(message[1].get("type").and_then(Value::as_str), Some("text"));
+        let text = message[1]
+            .get("data")
+            .and_then(|data| data.get("text"))
+            .and_then(Value::as_str)
+            .expect("text");
+        assert!(text.contains(expected), "payload text: {}", text);
+    }
+
     fn test_agent_context() -> AgentCommandTemplateContext {
         AgentCommandTemplateContext {
             command_name: "test".to_string(),
@@ -9963,6 +10055,14 @@ mod tests {
             Some(PrivateSubmissionCommand::Resume)
         );
         assert_eq!(
+            parse_builtin_private_submission_command("＃　结束投稿"),
+            Some(PrivateSubmissionCommand::Finish)
+        );
+        assert_eq!(
+            parse_builtin_private_submission_command("﹟确认"),
+            Some(PrivateSubmissionCommand::Confirm)
+        );
+        assert_eq!(
             parse_builtin_private_submission_command("#追加 继续写"),
             Some(PrivateSubmissionCommand::Resume)
         );
@@ -9970,6 +10070,14 @@ mod tests {
         assert_eq!(
             parse_private_agent_command_line("＃续写 继续写"),
             Some(("续写".to_string(), "继续写".to_string()))
+        );
+        assert_eq!(
+            parse_private_agent_command_line("＃投稿"),
+            Some(("投稿".to_string(), "".to_string()))
+        );
+        assert_eq!(
+            parse_private_agent_command_line("﹟投稿"),
+            Some(("投稿".to_string(), "".to_string()))
         );
     }
 
@@ -10745,7 +10853,9 @@ mod tests {
     #[tokio::test]
     async fn private_preview_image_and_confirm_text_share_one_message() {
         let (out_tx, mut out_rx) = mpsc::channel(1);
-        send_private_image_with_text(&out_tx, "20002", &[1, 2, 3], "收到共 2 条消息。").await;
+        send_private_image_with_text(&out_tx, "20002", &[1, 2, 3], "收到共 2 条消息。")
+            .await
+            .expect("send private image");
 
         let payload = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
             .await
@@ -10774,6 +10884,90 @@ mod tests {
                 .and_then(Value::as_str),
             Some("收到共 2 条消息。")
         );
+    }
+
+    #[tokio::test]
+    async fn private_submission_finish_sends_processing_and_preview_image() {
+        let runtime = test_runtime();
+        let state = Arc::new(Mutex::new(NapCatState::default()));
+        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let account_id = "10001";
+        let user_id = "20002";
+
+        let start_payload = serde_json::json!({
+            "post_type": "message",
+            "message_type": "private",
+            "self_id": account_id,
+            "user_id": user_id,
+            "message_id": "m-start",
+            "time": 1000,
+            "raw_message": "#开始投稿",
+            "message": [{"type": "text", "data": {"text": "#开始投稿"}}]
+        });
+        assert!(
+            parse_inbound_event(
+                &runtime,
+                &state,
+                &cmd_tx,
+                &out_tx,
+                account_id,
+                &start_payload
+            )
+            .await
+            .is_none()
+        );
+        assert_private_text_contains(&mut out_rx, "投稿会话已开始").await;
+
+        let content_payload = serde_json::json!({
+            "post_type": "message",
+            "message_type": "private",
+            "self_id": account_id,
+            "user_id": user_id,
+            "message_id": "m-content",
+            "time": 1001,
+            "raw_message": "匿名测试内容",
+            "message": [{"type": "text", "data": {"text": "匿名测试内容"}}],
+            "sender": {"nickname": "投稿人"}
+        });
+        assert!(
+            parse_inbound_event(
+                &runtime,
+                &state,
+                &cmd_tx,
+                &out_tx,
+                account_id,
+                &content_payload
+            )
+            .await
+            .is_none()
+        );
+        assert_private_text_contains(&mut out_rx, "已收到第 1 条消息").await;
+
+        let finish_payload = serde_json::json!({
+            "post_type": "message",
+            "message_type": "private",
+            "self_id": account_id,
+            "user_id": user_id,
+            "message_id": "m-finish",
+            "time": 1002,
+            "raw_message": "#结束投稿",
+            "message": [{"type": "text", "data": {"text": "#结束投稿"}}]
+        });
+        assert!(
+            parse_inbound_event(
+                &runtime,
+                &state,
+                &cmd_tx,
+                &out_tx,
+                account_id,
+                &finish_payload
+            )
+            .await
+            .is_none()
+        );
+        assert_private_text_contains(&mut out_rx, "处理中...").await;
+        assert_private_image_with_text_contains(&mut out_rx, "收到共 1 条消息").await;
     }
 
     #[tokio::test]
